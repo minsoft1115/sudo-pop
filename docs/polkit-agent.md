@@ -994,8 +994,19 @@ tests/scenarios.sh --with-password   위 + 사람이 비밀번호를 넣는 한 
 
 ### 시나리오 (`tests/scenarios.sh`)
 
-Hyprland 와 실제 polkitd 를 시험 장비로 쓴다. 세션을 원래대로 돌려놓고 끝난다 —
-중간에 실패하거나 끊겨도 마찬가지다.
+Hyprland 와 실제 polkitd 를 시험 장비로 쓴다. 세션을 원래대로 돌려놓고 끝나며 —
+중간에 실패하거나 끊겨도 마찬가지다 — **무엇을 되돌렸는지 찍는다.** 조용히 실패하면
+세션이 인증을 못 하는 채로 남기 때문이다.
+
+```
+되돌리기
+  sudo-pop-agent: active
+  omarchy.polkit: false
+  faillock: 3건 정리
+```
+
+**faillock 도 치운다.** 가짜 쿠키로 띄운 창을 닫으면 헬퍼가 실패로 세므로 한 번 돌 때마다
+서너 건이 쌓인다. 공유 카운터라(§9) 남겨 두면 진짜로 필요할 때의 여유가 줄어든다.
 
 `hl.dsp.send_shortcut` 으로 **Esc 를 창에 주입**할 수 있어서, 사용자가 취소하는 경로까지
 자동으로 돈다 (비밀번호가 필요 없다). `hyprctl clients` 로 창 규칙(floating·pin·크기)을

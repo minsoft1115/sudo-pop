@@ -50,8 +50,23 @@ cleanup() {
   [ -n "$AGENT" ] && kill "$AGENT" 2>/dev/null
   for p in $(agent_children); do kill "$p" 2>/dev/null; done
   if [ "$KEEP" = 0 ]; then
-    [ "$had_unit" = yes ] && systemctl --user start sudo-pop-agent.service 2>/dev/null
-    [ "$had_omarchy" = yes ] && omarchy-plugin-enable omarchy.polkit >/dev/null 2>&1
+    # 되돌리기는 눈에 보여야 한다. 조용히 실패하면 세션이 인증 못 하는 채로 남는다.
+    printf '\n\033[1m되돌리기\033[0m\n'
+    if [ "$had_unit" = yes ]; then
+      "$BIN" --init >/dev/null 2>&1
+      printf '  sudo-pop-agent: %s\n' "$(systemctl --user is-active sudo-pop-agent.service 2>&1)"
+    fi
+    if [ "$had_omarchy" = yes ]; then
+      omarchy-plugin-enable omarchy.polkit >/dev/null 2>&1
+    else
+      omarchy-plugin-disable omarchy.polkit >/dev/null 2>&1
+    fi
+    printf '  omarchy.polkit: %s\n' \
+      "$(omarchy-plugin-list --json 2>/dev/null | jq -r '.[]|select(.id=="omarchy.polkit")|.enabled')"
+    # 시나리오가 태운 실패는 시나리오가 치운다. 공유 카운터라 남겨 두면
+    # 다음에 진짜로 필요할 때의 여유가 줄어든다.
+    before=$(faillock 2>/dev/null | grep -c "^20" || echo 0)
+    faillock --reset 2>/dev/null && printf '  faillock: %s건 정리\n' "$before"
   fi
   rm -rf "$WORK"
 }
