@@ -22,6 +22,10 @@ use eframe::egui;
 /// Palette file relative to the state directory.
 const PALETTE: &str = "omarchy/current/theme/colors.toml";
 
+/// The shell config, alongside colors.toml. Its `[polkit]` section is the
+/// exact palette the system polkit dialog uses.
+const SHELL: &str = "omarchy/current/theme/shell.toml";
+
 /// The subset of the palette this window uses.
 pub struct Theme {
     pub dark: bool,
@@ -40,7 +44,7 @@ pub fn load() -> Option<Theme> {
     // A palette without a usable background is not worth half-applying.
     let background = color(&keys, "background")?;
 
-    Some(Theme {
+    let mut theme = Theme {
         dark: keys.get("mode").map(|m| m != "light").unwrap_or(true),
         background,
         surface: pick(
@@ -53,15 +57,118 @@ pub fn load() -> Option<Theme> {
             .unwrap_or(egui::Color32::WHITE),
         accent: pick(&keys, &["accent", "blue"]).unwrap_or(egui::Color32::LIGHT_BLUE),
         warning: pick(&keys, &["red", "orange", "yellow"]).unwrap_or(egui::Color32::LIGHT_RED),
+    };
+
+    // The shell's own polkit palette wins where it exists, so our window matches
+    // the system dialog -- most of all the failure color (`text-error`), which
+    // we then don't have to choose ourselves.
+    if let Some(polkit) = load_polkit() {
+        if let Some(c) = polkit.background {
+            theme.background = c;
+        }
+        if let Some(c) = polkit.text {
+            theme.text = c;
+        }
+        if let Some(c) = polkit.text_error {
+            theme.warning = c;
+        }
+        if let Some(c) = polkit.accent {
+            theme.accent = c;
+        }
+    }
+
+    Some(theme)
+}
+
+/// The subset of `[polkit]` we map onto our window. Any field may be absent,
+/// in which case the colors.toml value stays.
+struct Polkit {
+    background: Option<egui::Color32>,
+    text: Option<egui::Color32>,
+    text_error: Option<egui::Color32>,
+    accent: Option<egui::Color32>,
+}
+
+/// Read shell.toml and pull its `[polkit]` colors, or `None` if the file or the
+/// section is missing.
+fn load_polkit() -> Option<Polkit> {
+    let text = std::fs::read_to_string(shell_path()?).ok()?;
+    polkit_overlay(&parse_sections(&text))
+}
+
+/// Map a parsed shell.toml to the polkit colors, resolving `section.key`
+/// references (e.g. `border = "hyprland.active-border"`) to their hex.
+fn polkit_overlay(
+    sections: &HashMap<String, HashMap<String, String>>,
+) -> Option<Polkit> {
+    let p = sections.get("polkit")?;
+    let color = |key: &str| p.get(key).and_then(|raw| resolve(sections, raw, 3));
+    Some(Polkit {
+        background: color("background"),
+        text: color("text"),
+        text_error: color("text-error"),
+        // The border is usually the accent; either one gives the field outline.
+        accent: color("accent").or_else(|| color("border")),
     })
 }
 
+/// Resolve a shell.toml color: a `#hex`, or a `section.key` pointer into another
+/// part of the file. One hop covers the polkit section; `depth` bounds any loop.
+fn resolve(
+    sections: &HashMap<String, HashMap<String, String>>,
+    raw: &str,
+    depth: u8,
+) -> Option<egui::Color32> {
+    if raw.starts_with('#') {
+        return parse_hex(raw);
+    }
+    if depth == 0 {
+        return None;
+    }
+    let (section, key) = raw.split_once('.')?;
+    let next = sections.get(section)?.get(key)?;
+    resolve(sections, next, depth - 1)
+}
+
+fn state_dir() -> Option<PathBuf> {
+    match std::env::var_os("XDG_STATE_HOME") {
+        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        _ => Some(PathBuf::from(std::env::var_os("HOME")?).join(".local/state")),
+    }
+}
+
 fn palette_path() -> Option<PathBuf> {
-    let state = match std::env::var_os("XDG_STATE_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var_os("HOME")?).join(".local/state"),
-    };
-    Some(state.join(PALETTE))
+    Some(state_dir()?.join(PALETTE))
+}
+
+fn shell_path() -> Option<PathBuf> {
+    Some(state_dir()?.join(SHELL))
+}
+
+/// Group `key = "value"` lines by their `[section]` header. Comments, blank
+/// lines, and keys before any section are ignored.
+fn parse_sections(text: &str) -> HashMap<String, HashMap<String, String>> {
+    let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut section = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            section = name.trim().to_string();
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let value = value.trim().trim_matches('"');
+            if !value.is_empty() {
+                out.entry(section.clone())
+                    .or_default()
+                    .insert(key.trim().to_string(), value.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Collect `key = "value"` pairs. Anything else on a line is ignored.
@@ -202,5 +309,67 @@ red = "#f7768e"
     fn light_mode_is_honoured() {
         let keys = parse("mode = \"light\"\nbackground = \"#ffffff\"\n");
         assert_eq!(keys.get("mode").map(String::as_str), Some("light"));
+    }
+
+    const SHELL_SAMPLE: &str = r##"
+[hyprland]
+active-border = "#7aa2f7"
+
+[polkit]
+# the system polkit palette
+background       = "#1a1b26"
+background-alpha = 1.0
+text             = "#a9b1d6"
+text-error       = "#f7768e"
+border           = "hyprland.active-border"
+accent           = "#7aa2f7"
+"##;
+
+    #[test]
+    fn sections_are_grouped_by_header() {
+        let s = parse_sections(SHELL_SAMPLE);
+        assert_eq!(s["hyprland"]["active-border"], "#7aa2f7");
+        assert_eq!(s["polkit"]["text-error"], "#f7768e");
+        // comments and blank lines do not become keys
+        assert!(!s["polkit"].contains_key("#"));
+    }
+
+    #[test]
+    fn the_polkit_overlay_maps_colors() {
+        let p = polkit_overlay(&parse_sections(SHELL_SAMPLE)).unwrap();
+        assert_eq!(p.background, parse_hex("#1a1b26"));
+        assert_eq!(p.text, parse_hex("#a9b1d6"));
+        assert_eq!(p.text_error, parse_hex("#f7768e"), "the failure color comes from the theme");
+        assert_eq!(p.accent, parse_hex("#7aa2f7"));
+    }
+
+    #[test]
+    fn a_border_reference_resolves_to_another_section() {
+        // accent absent, so the border reference is what fills the accent slot.
+        let text = "[hyprland]\nactive-border = \"#010203\"\n[polkit]\nborder = \"hyprland.active-border\"\n";
+        let p = polkit_overlay(&parse_sections(text)).unwrap();
+        assert_eq!(p.accent, parse_hex("#010203"));
+    }
+
+    #[test]
+    fn no_polkit_section_means_no_overlay() {
+        assert!(polkit_overlay(&parse_sections("[bar]\ntext = \"#fff\"\n")).is_none());
+    }
+
+    /// A no-op off Omarchy; where the real shell.toml exists it proves the file
+    /// on this machine actually maps to usable colors -- comments, references,
+    /// alpha companions and all.
+    #[test]
+    fn a_present_shell_toml_polkit_section_resolves() {
+        let Some(path) = shell_path() else { return };
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let sections = parse_sections(&text);
+        if sections.contains_key("polkit") {
+            let p = polkit_overlay(&sections).expect("a [polkit] section must map");
+            assert!(
+                p.background.is_some() && p.text_error.is_some(),
+                "[polkit] is present but background/text-error did not resolve"
+            );
+        }
     }
 }

@@ -17,7 +17,7 @@ disk mounts · NetworkManager · systemctl ─┘
 
 <p align="center">
   <img src="screenshots/sudo-pop.png" width="440"
-       alt="the sudo-pop window, showing 'pacman -Syu' above the password field">
+       alt="the sudo-pop window, showing 'sudo pacman -Syu' above the password field">
 </p>
 
 Option-free commands route to `run0`; anything with an option or a `VAR=value`
@@ -29,11 +29,11 @@ polkit's own generic wording does not.
 
 ---
 
-## What it does that the shell's own agent cannot
+## How it differs from the shell's own agent
 
 Omarchy ships its own polkit agent, `omarchy.polkit` — a QML service that runs
-inside the shell process. Replacing it is a real choice, so here is what changes.
-Everything below is measured, not claimed:
+inside the shell process. Replacing it is a real choice, so here is what changes —
+all of it measured on this machine, not asserted:
 
 | | sudo-pop | omarchy.polkit |
 |---|---|---|
@@ -43,14 +43,11 @@ Everything below is measured, not claimed:
 | Refuses callers that aren't polkit | ✓ | ✗ — neither reference agent checks |
 | Attempts-left warning · refuses a locked account | ✓ | ✗ |
 | `sudo` and polkit prompts in one window | ✓ | sudo untouched |
-| Fingerprint · theme colors | ✗ | ✓ (fingerprint is broken on Arch anyway¹) |
+| Theme colors, matched to the system dialog | ✓ | ✓ |
+| Fingerprint | ✗ | ✓ |
 
 Two of these — refusing non-polkit callers, and naming the command behind a
-`run0` request — are things **no existing agent does**, not only omarchy's.
-
-¹ omarchy's fingerprint mode reads `/etc/pam.d/polkit-1`, which Arch does not
-ship; the file lives at `/usr/lib/pam.d/polkit-1`. So on this platform the one
-thing it has that sudo-pop doesn't never actually turns on.
+`run0` request — are things neither the shell's agent nor hyprpolkitagent does.
 
 ---
 
@@ -110,9 +107,9 @@ sudo-pop --init
 ```
 
 You gain the hardening, the screen-share exclusion, and the command line of
-whatever is asking; you give up that dialog's theme colors (and its fingerprint
-path, which doesn't work on Arch anyway). `--init` tells you which agent holds the
-seat whenever you run it.
+whatever is asking; the theme colors carry over, since sudo-pop reads the shell's
+own `[polkit]` palette. You give up its fingerprint path. `--init` tells you which
+agent holds the seat whenever you run it.
 
 ## Uninstall
 

@@ -95,6 +95,7 @@ faillock 카운터는 **sudo·polkit·로그인이 공유한다.** polkit 에서
 - 이벤트 루프는 프로세스당 하나만 만들 수 있다. 창이 메인 스레드를 갖고 대화가 옆 스레드로 간다
 - 자체 타임아웃 30초. **폴킷 호출자는 25초에 포기한다** — 그 뒤는 백스톱일 뿐이다
 - 창에 띄우는 것은 polkit 의 `message` 가 아니라 **`polkit.subject-pid` 의 cmdline** 이다
+- 테마 색은 `colors.toml` 에 더해 **`shell.toml` 의 `[polkit]` 섹션**을 읽어 시스템 창과 맞춘다 (실패색 `text-error` 포함)
 
 ### 2-7. 라우팅
 
@@ -188,5 +189,4 @@ tests/scenarios.sh --with-password    위 + 사람이 비밀번호를 넣는 한
 | 지문 (`pam_fprintd`) | 이 머신에 `fprintd` 가 없다. PAM 파일은 `/etc` 와 `/usr/lib` 둘 다 봐야 한다 |
 | 신원 선택 UI | 관리자가 여럿인 환경에서만 의미가 있다 |
 | 레이어셸 서피스 | 전체화면 위 동작이 문제가 될 때 (`rationale.md` §2-4) |
-| `[polkit]` 테마 색 | `shell.toml` 의 그 섹션을 읽으면 시스템 창과 색이 맞는다 |
 | polkitd 재시작 재등록 | 코드는 있으나 실측하지 않았다 |
