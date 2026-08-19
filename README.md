@@ -15,7 +15,7 @@ and a masked input field](screenshots/sudo-pop.png)
 
 ## What it guarantees
 
-| | |
+| Area | Guarantee |
 |---|---|
 | the terminal | stdin, stdout and stderr reach the command untouched — `pacman`'s `[Y/n]` and a full-screen `vim` work as they always did |
 | core dumps | a crash cannot leave the password on disk |
@@ -23,7 +23,8 @@ and a masked input field](screenshots/sudo-pop.png)
 | screen sharing | the window is excluded from shares and recordings |
 | logs | no log, no command line and no environment variable ever holds it |
 
-Each of those was measured rather than assumed — `docs/rationale.md` §6.
+Each of those was measured, not assumed — `docs/rationale.md` §2 for the
+terminal, §6 for the hardening, §10 for the screen-share exclusion.
 
 Screenshot tools use the same protocol as screen sharing, so the window captures
 as a black rectangle. The image above was taken with `no_screen_share` turned off
@@ -33,7 +34,7 @@ in `~/.config/minsoft1115/hypr/sudo-pop.lua`.
 
 ## Requirements
 
-| | |
+| Component | Notes |
 |---|---|
 | Hyprland | 0.56+. The window rules assume the Lua config |
 | sudo | with askpass (`-A`). Verified on 1.9.17 |
@@ -112,7 +113,7 @@ already open (`unalias sudo`, or open a new one).
 
 ### Using the window
 
-| Key | |
+| Key | What it does |
 |---|---|
 | Enter | submit. An empty box is ignored and the window stays |
 | Esc | cancel |
@@ -183,10 +184,13 @@ situation entirely.
 
 ### The limits
 
-| | |
-|---|---|
-| **Unchanged** | Malware running as your user can replace the alias, the binary and `SUDO_ASKPASS` — but it could already alias `sudo`, shadow it on PATH, or fake the prompt from a shell function. No new path opens here. |
-| **One thing worse** | Phishing. A terminal prompt at least appears where you just typed; a popup gives that up, and a look-alike window needs no privileges. The command on the top line is the answer to it — a cue, not a guarantee. |
+**Unchanged.** Malware running as your user can replace the alias, the binary
+and `SUDO_ASKPASS` — but it could already alias `sudo`, shadow it on PATH, or
+fake the prompt from a shell function. No new path opens here.
+
+**One thing worse: phishing.** A terminal prompt at least appears where you just
+typed; a popup gives that up, and a look-alike window needs no privileges. The
+command on the top line is the answer to it — a cue, not a guarantee.
 
 ---
 
@@ -211,7 +215,7 @@ The account may be locked. Check with `faillock --user "$USER"` and wait out
 
 ## Documentation
 
-| File | |
+| File | Contents |
 |---|---|
 | `docs/architecture.html` | structure and flow diagrams |
 | `docs/plan.md` | implementation spec |
