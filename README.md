@@ -24,9 +24,6 @@ and a masked input field](screenshots/sudo-pop.png)
 | sudo | with askpass (`-A`). Verified on 1.9.17 |
 | Rust | to build. `mise.toml` pins the toolchain |
 
-The Wayland and OpenGL libraries (`wayland`, `libxkbcommon`, `mesa`,
-`libglvnd`) are already present on most desktop installs.
-
 ---
 
 ## Install
@@ -67,16 +64,13 @@ source ~/.bashrc                                               # or open a new s
 
 </details>
 
-What `--init` writes:
+`--init` is idempotent, and writes only these:
 
 | Path | Contents |
 |---|---|
 | `~/.config/minsoft1115/bash/sudo-pop.sh` | `alias sudo='sudo-pop'` |
-| `~/.config/minsoft1115/hypr/sudo-pop.lua` | window rules (float, center, dim_around, excluded from screen sharing) |
+| `~/.config/minsoft1115/hypr/sudo-pop.lua` | the popup's window rules |
 | `~/.config/hypr/hyprland.lua` | a marker block that `require`s the file above |
-
-It is idempotent — a second run adds nothing twice, and `.bashrc` is not touched
-at all when the snippet loader block is already there.
 
 ## Uninstall
 
@@ -94,73 +88,12 @@ rm ~/.local/bin/sudo-pop
 **The order matters.** Deleting the binary first leaves the alias pointing at
 nothing; `--uninstall` handles that case too, removing the files itself.
 
-Removed: the installed files, the marker block in `hyprland.lua`, the runtime
-symlink. Left alone: the shared snippet loader, and the alias in shells that are
+The shared snippet loader is left alone, and so is the alias in shells that are
 already open (`unalias sudo`, or open a new one).
 
 ---
 
 ## Things worth knowing
-
-### The escape hatch — read this first
-
-If the alias survives but the binary does not, `sudo` becomes "command not
-found".
-
-```bash
-/usr/bin/sudo whoami
-```
-
-An absolute path goes around aliases, shell functions and PATH alike. `\sudo`
-and `command sudo` are weaker — a backslash does not suppress functions, and
-`command` still searches PATH. Run `--uninit` before deleting the binary.
-
-### The alias only expands in interactive shells
-
-**The real sudo runs** in shell scripts, `sh -c`, Makefile recipes,
-`xargs sudo`, systemd units and cron. sudo-pop only changes what a person types.
-
-### It steps aside when it cannot draw
-
-Any one of these falls back to the ordinary terminal prompt:
-
-- neither `WAYLAND_DISPLAY` nor `DISPLAY` is set (SSH, a console TTY)
-- the arguments already contain `-n`, `-S` or `-A`
-- `XDG_RUNTIME_DIR` is missing, or preparing it failed
-
-**Logging in over SSH does not lock you out of sudo.**
-
-### faillock — a cancel also counts as one failure
-
-PAM's behaviour, not sudo-pop's: by the time askpass runs the authentication
-conversation has already started, so Esc costs exactly what a wrong password
-costs — one failure.
-
-| | PAM default | this machine (Arch + Omarchy) |
-|---|---|---|
-| `deny` — failures before lockout | 3 | 10 |
-| `fail_interval` — window they must land in | 900s | 900s |
-| `unlock_time` — how long the lockout lasts | 600s | 120s |
-| `passwd_tries` — sudo's own retries | 3 | 10 |
-
-```bash
-grep faillock /etc/pam.d/system-auth /etc/security/faillock.conf
-sudo -l | grep passwd_tries
-faillock --user "$USER"     # only rows with V in the Valid column count
-```
-
-`deny` and `unlock_time` are read at run time, so sudo-pop follows yours. On top
-of them:
-
-- **at most 3 popups per `sudo` command** — sudo retries askpass `passwd_tries`
-  times on its own, enough for one command to spend the whole budget. No effect
-  where `passwd_tries` is already 3 or less.
-- **the window warns** once 3 or fewer failures remain.
-- **no popup at all when the account is locked** — a doomed attempt cannot cost
-  more.
-
-**One successful authentication clears the record.** While locked, waiting out
-`unlock_time` is the only cure.
 
 ### Using the window
 
@@ -171,32 +104,71 @@ of them:
 | (left alone) | cancels itself after 90 seconds |
 
 The top line is the command about to run, so an unexpected one stands out. When
-it cannot be determined (`sudo -v` and friends) that line is omitted.
+it cannot be determined (`sudo -v` and friends) that line is omitted. The
+window's own wording is English.
 
-The field takes 256 characters. The window's wording is English — CJK glyphs
-would mean loading a CJK font, and instant startup is the point of this tool.
+### It follows your Omarchy theme
 
-### Colors and font follow the desktop
+Colors come from the current theme, the font from `fc-match monospace`. Each
+popup is a fresh process, so switching either shows up on the **very next
+popup** — nothing to reload. Outside Omarchy, or when a palette cannot be read,
+it falls back to sensible defaults.
 
-| | |
-|---|---|
-| colors | the current Omarchy theme, `~/.local/state/omarchy/current/theme/colors.toml` |
-| font | whatever `fc-match monospace` reports, so `omarchy-font-set` applies as-is |
-| font size | fixed here. Omarchy has no global size, and the terminal's is wrong for this window |
+### The alias only expands in interactive shells
 
-Each popup is a fresh process, so a theme or font change shows up on the **very
-next popup**. Anything unreadable falls back to defaults without complaining.
+**The real sudo runs** in shell scripts, `sh -c`, Makefile recipes,
+`xargs sudo`, systemd units and cron. sudo-pop only changes what a person types.
 
-### You cannot screenshot the window
+### It falls back to the terminal when it cannot draw
 
-`no_screen_share` is on, and screenshot tools such as `grim` use the same
-protocol, so the window comes out as **a black rectangle**. That is not a bug —
-it is the proof that the password window stays out of recordings and shared
-screens.
+Any one of these skips the popup and uses the ordinary terminal prompt:
 
-The image at the top of this README was taken with that rule turned off in
-`~/.config/minsoft1115/hypr/sudo-pop.lua` (`hyprctl reload`, capture, put it
-back).
+- neither `WAYLAND_DISPLAY` nor `DISPLAY` is set (SSH, a console TTY)
+- the arguments already contain `-n`, `-S` or `-A`
+- `XDG_RUNTIME_DIR` is missing, or preparing it failed
+
+**Logging in over SSH does not lock you out of sudo.**
+
+### The window stays out of screen shares
+
+`no_screen_share` keeps it out of screen sharing and recording. Screenshot tools
+use the same protocol, so the window captures as a black rectangle — the image
+at the top of this README was taken with that rule turned off in
+`~/.config/minsoft1115/hypr/sudo-pop.lua`.
+
+### faillock — a cancel costs one failure
+
+PAM's behaviour, not sudo-pop's: by the time the popup appears the
+authentication conversation has already started, so Esc costs exactly what a
+wrong password costs. Enough failures in a row and PAM locks the account for a
+while.
+
+The thresholds are your PAM configuration's — sudo-pop reads `deny` and
+`unlock_time` at run time and follows them. On top of them:
+
+- **at most 3 popups per `sudo` command**, where sudo on its own retries up to
+  `passwd_tries` times and can spend the whole budget
+- **the window warns** when few failures remain
+- **no popup at all when the account is already locked**
+
+**One successful authentication clears the record.**
+
+```bash
+faillock --user "$USER"     # only rows with V in the Valid column count
+```
+
+### If sudo ever stops working
+
+Deleting the binary while the alias is still installed leaves `sudo` as "command
+not found". An absolute path always works:
+
+```bash
+/usr/bin/sudo whoami
+```
+
+It goes around aliases, shell functions and PATH alike, where `\sudo` and
+`command sudo` do not. Running `--uninit` before deleting the binary avoids the
+situation entirely.
 
 ### What it protects, and what it does not
 
@@ -205,23 +177,22 @@ back).
 | **Unchanged** | Malware running as your user can replace the alias, the binary and `SUDO_ASKPASS` — but it could already alias `sudo`, shadow it on PATH, or fake the prompt from a shell function. No new path opens here. |
 | **One thing worse** | Phishing. A terminal prompt at least appears where you just typed; a popup gives that up, and a look-alike window needs no privileges. The command on the top line is the answer to it — a cue, not a guarantee. |
 
-What it does protect is careless leakage, measured rather than assumed:
+What it does protect is careless leakage:
 
-- no core dump can hold the password — `PR_SET_DUMPABLE=0` and `RLIMIT_CORE=0`;
-  aborting the release binary leaves no `coredumpctl` entry
-- the buffer is locked into RAM, out of swap and hibernation images — `VmLck` is
-  non-zero while the window is open
-- the window is excluded from screen sharing and recording (above)
-- no log, no command line, no environment variable — the password goes straight
-  into the pipe sudo reads
+- a crash cannot leave the password in a core dump
+- the buffer is locked into RAM, out of swap and hibernation images
+- the window is excluded from screen sharing and recording
+- no log, no command line and no environment variable ever holds it
+
+Each of those was measured rather than assumed — `docs/rationale.md` §6.
 
 ---
 
 ## Troubleshooting
 
 **The popup does not appear and the terminal asks instead**
-One of the conditions for stepping aside was met. `SUDO_POP_DEBUG=1 sudo true`
-prints which one, on stderr. It never touches stdout, so leaving it on is safe.
+One of the conditions for falling back was met. `SUDO_POP_DEBUG=1 sudo true`
+prints which one, on stderr.
 
 **The window opens in a corner, or the background is not dimmed**
 The Hyprland rules did not apply. Check `~/.config/hypr/hyprland.lua` for the
@@ -231,7 +202,7 @@ The Hyprland rules did not apply. Check `~/.config/hypr/hyprland.lua` for the
 The binary is not on PATH. Use `/usr/bin/sudo` meanwhile.
 
 **The password is right but keeps failing**
-The account may be locked. `faillock --user "$USER"`, then wait out
+The account may be locked. Check with `faillock --user "$USER"` and wait out
 `unlock_time`.
 
 ---
@@ -244,8 +215,8 @@ The account may be locked. `faillock --user "$USER"`, then wait out
 | `docs/plan.md` | implementation spec |
 | `docs/rationale.md` | design decisions, each with the measurement that settled it |
 
-**These three are in Korean.** They are the author's working record, not usage
-instructions — this README covers everything needed to use the tool.
+**These three are in Korean**, and they are the author's working record — this
+README covers everything needed to use the tool.
 
 ---
 
@@ -258,7 +229,7 @@ cargo fmt
 ```
 
 `SUDO_POP_DEBUG=1` reports fallback decisions, hardening results and the retry
-counter on stderr.
+counter on stderr. It never touches stdout, so leaving it on is safe.
 
 ---
 
