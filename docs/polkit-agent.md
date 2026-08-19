@@ -655,6 +655,40 @@ uwsm 을 안 쓰는 환경에서는 이 타깃이 안 켜질 수 있으므로, `
 
 ---
 
+### 6-1. 설치 실측 — 스파이크 5 기록
+
+`--init` / `--uninit` 을 만들어 돌렸다.
+
+```
+$ sudo-pop --init
+wrote ~/.config/minsoft1115/hypr/sudo-pop.lua
+added the window rules to ~/.config/hypr/hyprland.lua
+reloaded Hyprland
+wrote ~/.config/systemd/user/sudo-pop-agent.service
+
+omarchy.polkit (the Omarchy shell's own agent) already holds this session's polkit seat.
+The unit is installed but not enabled. To switch:
+  omarchy plugin disable omarchy.polkit
+  sudo-pop --init
+```
+
+| 확인된 것 | |
+|---|---|
+| 충돌 시 | 유닛은 깔되 **enable 하지 않는다.** `systemctl --user is-enabled` 가 `disabled` |
+| 감지 순서 | `omarchy.polkit` 이 1순위. 프로세스 목록에 안 보이므로 플러그인 목록을 본다 (§6) |
+| 멱등성 | 두 번째 `--init` 은 `already current` 만 찍고 파일을 안 건드린다 |
+| 왕복 | `--uninit` 뒤 `hyprland.lua` 에서 **마커 4줄만** 빠진다 |
+
+**셸 스니펫은 없앴다.** 옛 `--init` 은 `~/.bashrc` 의 로더 블록과 `alias sudo='sudo-pop'` 을
+다뤘는데, 에이전트는 사용자가 부르는 것이 아니라 polkitd 가 부른다. `~/.bashrc` 는 이제 우리
+일이 아니고, omarchy-setup 의 bash 단계와 겹칠 일도 없다.
+
+**`ExecStart` 는 `--init` 을 실행한 바이너리의 절대 경로가 박힌다.** 개발 트리에서 그대로
+`--init` 하면 `cargo build` 가 도는 동안 에이전트가 죽거나 옛 코드로 돈다. 상시로 쓸 것이면
+`~/.local/bin` 에 복사한 뒤 그쪽에서 `--init` 한다.
+
+---
+
 ## 7. 기존 기능은 어떻게 되나 — 스마트 라우터
 
 sudo 래퍼는 **남긴다.** `sudo -E`, `-v`, `-k`, `sudoers` 의 `NOPASSWD`·`env_keep` 처럼

@@ -23,6 +23,7 @@ use zbus::{Connection, Proxy, connection};
 
 mod agent;
 mod font;
+mod init;
 mod gui;
 mod harden;
 mod helper;
@@ -217,8 +218,11 @@ async fn unregister(conn: &Connection, session: &str) -> zbus::Result<()> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The child that draws the window and talks to the helper. Checked before
     // anything else so it never touches the bus.
-    if std::env::args().nth(1).as_deref() == Some("--agent-prompt") {
-        prompt::run();
+    match std::env::args().nth(1).as_deref() {
+        Some("--agent-prompt") => prompt::run(),
+        Some("--init") => init::run(false),
+        Some("--uninit") => init::run(true),
+        _ => {}
     }
     async_io::block_on(run())
 }
