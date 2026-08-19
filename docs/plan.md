@@ -505,7 +505,7 @@ zeroize = "1"
 sudo-pop/
 ├── Cargo.toml
 ├── mise.toml                  rust 툴체인 고정
-├── install.sh                 curl | bash 설치 스크립트 (빌드 → 설치 → --init)
+├── install.sh                 curl | bash 설치 스크립트 (빌드 → 설치 → --init, --uninstall 로 역순 제거)
 ├── README.md                  영문
 ├── README.ko.md               한글
 ├── docs/

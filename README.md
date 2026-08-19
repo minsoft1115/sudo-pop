@@ -112,12 +112,24 @@ there, `.bashrc` is not touched at all.
 ## Uninstall
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/minsoft1115/sudo-pop/main/install.sh | bash -s -- --uninstall
+```
+
+Or by hand — **in this order**:
+
+```bash
 sudo-pop --uninit
 rm ~/.local/bin/sudo-pop
 ```
 
-This removes the files it installed and the marker block in `hyprland.lua`. The
-snippet loader block is left alone — it is shared with other tools.
+Either way this removes the files it installed, the marker block in
+`hyprland.lua` and the runtime symlink. The snippet loader block is left alone —
+it is shared with other tools. The alias stays in the shell you are already in
+until you `unalias sudo` or open a new one.
+
+**The order matters.** Deleting the binary first leaves the alias pointing at
+nothing, and `sudo` becomes "command not found". If that already happened,
+`--uninstall` handles it: with no binary to ask, it removes those files itself.
 
 ---
 

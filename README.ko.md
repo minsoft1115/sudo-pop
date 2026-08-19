@@ -106,12 +106,23 @@ source ~/.bashrc
 ## 제거
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/minsoft1115/sudo-pop/main/install.sh | bash -s -- --uninstall
+```
+
+직접 지우려면 **이 순서로**:
+
+```bash
 sudo-pop --uninit
 rm ~/.local/bin/sudo-pop
 ```
 
-설치한 파일과 `hyprland.lua` 의 마커 블록을 지운다. 스니펫 로더 블록은
-다른 도구와 공유하는 것이라 남겨둔다.
+어느 쪽이든 설치한 파일과 `hyprland.lua` 의 마커 블록, 런타임 심볼릭 링크를
+지운다. 스니펫 로더 블록은 다른 도구와 공유하는 것이라 남겨둔다. 이미 열려 있는
+셸의 alias 는 `unalias sudo` 하거나 새 셸을 열 때까지 남는다.
+
+**순서가 중요하다.** 바이너리를 먼저 지우면 alias 가 가리킬 대상이 없어져
+`sudo` 가 "command not found" 가 된다. 이미 그렇게 됐다면 `--uninstall` 이
+처리한다 — 물어볼 바이너리가 없으면 파일을 직접 지운다.
 
 ---
 
