@@ -150,14 +150,21 @@ fn a_silent_socket_falls_back_to_the_fork_helper() {
     let listener = UnixListener::bind(&socket).expect("cannot bind the test socket");
 
     let served = std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            // Read the preamble, then drop the connection without prompting.
-            let mut buf = [0u8; 256];
-            let _ = stream.read(&mut buf);
-            String::from_utf8_lossy(&buf).trim_end_matches('\0').to_owned()
-        } else {
-            String::new()
+        let Ok((mut stream, _)) = listener.accept() else {
+            return String::new();
+        };
+        // The preamble is two lines and may arrive in more than one write, so
+        // read until both are here rather than trusting one read.
+        let mut seen = Vec::new();
+        let mut chunk = [0u8; 64];
+        while seen.iter().filter(|&&b| b == b'\n').count() < 2 {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => seen.extend_from_slice(&chunk[..n]),
+            }
         }
+        // Then drop the connection without ever prompting.
+        String::from_utf8_lossy(&seen).into_owned()
     });
 
     let outcome = {
