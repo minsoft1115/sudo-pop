@@ -11,6 +11,10 @@ exclude = ["old"]
 [dependencies]
 zbus = "5"
 libc = "0.2"
+async-io = "2"
+async-lock = "3"
+async-process = "2"
+futures-lite = "2"
 zeroize = "1"
 eframe = { version = "0.36.1", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
 
