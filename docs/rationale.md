@@ -338,15 +338,31 @@ auth  [default=die]  pam_faillock.so authfail deny=10 unlock_time=120
 
 `fail_interval` 은 어디에도 명시돼 있지 않으므로 기본값 **900초(15분)** 이 적용된다.
 
-| 파라미터 | 값 | 의미 |
-|---|---|---|
-| `fail_interval` | 900초 | 이 창 안에 누적된 실패를 센다 |
-| `deny` | 10 | 누적이 10이면 잠근다 |
-| `unlock_time` | 120초 | 잠긴 뒤 해제까지 |
-| `passwd_tries` | 10 | sudo 가 askpass 를 재호출하는 최대 횟수 |
+| 파라미터 | 이 머신 | 상류 기본값 | 의미 |
+|---|---|---|---|
+| `fail_interval` | 900초 | 900초 | 이 창 안에 누적된 실패를 센다 |
+| `deny` | 10 | **3** | 누적이 이만큼이면 잠근다 |
+| `unlock_time` | 120초 | **600초** | 잠긴 뒤 해제까지 |
+| `passwd_tries` | 10 | **3** | sudo 가 askpass 를 재호출하는 최대 횟수 |
 
-`passwd_tries=10` 은 배포판 기본값으로 sudoers 에 설정돼 있다. **`deny=10` 과
-정확히 같은 숫자**라는 점이 문제의 핵심이다. 그리고 판정 창이 15분으로 넓다.
+상류 기본값 출처: `deny`·`unlock_time`·`fail_interval` 은 `faillock.conf(5)`,
+`passwd_tries` 는 `sudoers(5)` ("The default is 3").
+
+**네 값 중 셋이 이 머신에서 상류 기본값과 다르다.** 그러므로 §7 이하의 모든 수치는
+이 머신 기준으로 읽어야 하고, 그대로 일반화하면 안 된다. 각 값의 출처:
+
+- `deny=10 unlock_time=120` — `/etc/pam.d/system-auth`. 이 파일은 **pambase 패키지
+  그대로**다(`pacman -Qkk` 무변경). 즉 Arch 기준으로는 stock 이지만 상류 PAM
+  기본값은 아니다.
+- `/etc/security/faillock.conf` 에도 `deny = 10` 이 있는데 이쪽은 **로컬 수정본**이다
+  (`pacman -Qkk pam` 이 체크섬 불일치를 보고).
+- `passwd_tries=10` — `sudo -n -l` 로 관측했다. Arch 기본 sudoers 에는 이 항목이
+  없으므로 Omarchy 나 로컬 추가로 보이지만, `/etc/sudoers` 가 root 전용이라
+  출처는 확정하지 못했다. (초판에 "배포판 기본값" 이라고 적었던 것은 오류다.)
+
+이 머신에서 문제의 핵심은 **`passwd_tries` 와 `deny` 가 정확히 같은 숫자 10** 이라는
+점이다. 그리고 판정 창이 15분으로 넓다. 상류 기본값(3/3)에서는 한 명령이 한도를
+정확히 채우는 이 관계가 그대로 유지되면서 절대량만 작아진다.
 
 ### 7-2. 취소 비용 — 1건, 0 으로는 만들 수 없다
 
