@@ -283,6 +283,44 @@ Authority.RegisterAuthenticationAgent(
 소유자 이름은 캐시하지 말고 `NameOwnerChanged` 로 따라간다. polkitd 가 재시작하면 고유
 이름이 바뀌고, 그때 §6 의 재등록도 같이 걸린다.
 
+**실측(스파이크 1).** 진짜 요청의 `sender` 는 `:1.12` 로 왔고, 시작할 때
+`GetNameOwner("org.freedesktop.PolicyKit1")` 로 얻은 값과 **같았다.** 비교 한 줄로 성립한다.
+
+### 3-5. 실제로 오는 값 — 스파이크 1 기록
+
+`omarchy.polkit` 을 잠깐 내리고 우리 스텁으로 `run0 true` 를 받아 본 결과다.
+
+```
+sender     : :1.12                     ← polkitd 의 고유 이름과 일치
+action_id  : org.freedesktop.systemd1.manage-units
+message    : Authentication is required to start transient unit
+             'run-p1592228-i1586931.service'.
+icon_name  : (빈 문자열)
+cookie     : 71자
+details    : { "polkit.caller-pid": "1", "polkit.subject-pid": "1592228" }
+identity   : unix-user { uid }
+```
+
+여기서 나오는 것이 셋이다.
+
+**1. `message` 를 그대로 띄우면 안 된다.** run0 의 문구에는 **무엇을 실행하는지가 없다** —
+유닛 이름은 난수다. 사용자가 "지금 무엇에 비밀번호를 주는가" 를 판단할 근거가 화면에
+하나도 없게 된다.
+
+**2. 대신 `polkit.subject-pid` 가 온다.** 그 pid 의 `/proc/<pid>/cmdline` 을 읽으면 실행될
+명령을 복원할 수 있다. `old/src/askpass/invocation.rs` 가 이미 그 일을 한다 — 지금은 부모
+프로세스를 보지만, **보는 대상을 `subject-pid` 로 바꾸면 그대로 살아난다.**
+읽기 전에 그 pid 가 아직 살아 있는지와 **소유자가 우리 uid 인지**는 확인한다.
+
+> Omarchy 다이얼로그는 `command_line`·`cmdline` 키를 찾아본다. **run0 은 그 키를 안 보낸다** —
+> 그래서 그쪽 창에는 유닛 이름만 뜬다. 우리는 `subject-pid` 로 한 단계 더 간다.
+
+**3. `icon_name` 은 비어 있고 `identities` 는 하나뿐이다.** 아이콘 자리는 없어도 되는 설계로
+두고, 신원 선택 UI 를 후순위로 둔 판단(§8-1)은 이 관측과 맞는다.
+
+거절했을 때 `run0` 은 `Failed to start transient service unit: Access denied` 로 즉시
+끝났다(exit 1). 매달리지 않는다. 비밀번호를 묻지 않았으므로 faillock 도 건드리지 않았다.
+
 ---
 
 ## 4. 구조 — 비밀번호는 데몬을 통과하지 않는다
@@ -589,6 +627,7 @@ polkit 에 대응이 없는 것들이 있고, 스크립트가 부르는 sudo 도
 | 대상 환경 | **Omarchy 4.0+ / Hyprland 0.56+ 전용.** 버전 분기와 폴백을 두지 않는다 (§2-3) |
 | **발신자 검증** | **필수.** 폴킷이 부른 것만 받는다 (§3-4). 참고 구현 둘 다 안 하는 부분이다 |
 | **시도 횟수 경계** | **쿠키 단위.** 데몬 메모리에서 세고, 파일 카운터는 sudo 경로에 남긴다 (§4-1) |
+| 창에 무엇을 띄우나 | polkit 의 `message` 가 아니라 **`polkit.subject-pid` 의 cmdline** 을 앞세운다 (§3-5) |
 | 창 서피스 | 지금의 xdg_toplevel + Hyprland 창 규칙 그대로. 레이어셸은 후순위 (§2-4) |
 | 덮개·테마 | Omarchy 것을 그대로 쓴다 — `omarchy-hw-laptop-closed`, `shell.toml` 의 `[polkit]` (§2-3) |
 
@@ -689,13 +728,8 @@ polkit 에 대응이 없는 것들이 있고, 스크립트가 부르는 sudo 도
 | `old/src/askpass/theme.rs` | 206 | `colors.toml` 만 읽는다. **`shell.toml` 의 `[polkit]` 섹션을 더한다** (§2-3) — 그러면 에러 색·스크림·테두리를 시스템과 맞출 수 있다 |
 | `old/src/askpass/font.rs` | 78 | `fc-match monospace` 로 Omarchy 폰트를 싣고 **8MB 넘으면 건너뛴다**. polkit 이 현지화 메시지를 보내므로 **CJK 폴백을 하나 더** 붙여야 한다 (§9) |
 | `old/src/init.rs` | 355 | **systemd 유닛 설치의 본보기.** `add_block`/`remove_block`(마커 사이만 정확히 넣고 빼기), `write_snippet`, `reload_hyprland` 가 있다. §6 의 유닛 설치도 같은 규약을 따른다 |
+| `old/src/askpass/invocation.rs` | 125 | **살린다.** `/proc/<pid>/cmdline` 을 읽어 실행될 명령을 창에 띄우는 코드. 보는 대상만 부모 프로세스 → `polkit.subject-pid` 로 바꾼다 (§3-5). polkit 의 `message` 에는 명령이 없으므로, 이 한 줄이 창에서 가장 중요한 정보가 된다 |
 | `old/src/main.rs` | 41 | 모드 분기. `--agent`·`--agent-prompt` 를 여기 더하되 **sudo 로 넘기지 않도록** 한다 (지금은 `--init`·`--uninit` 외 전부 sudo 행이다) |
-
-### 대체되는 것
-
-| | |
-|---|---|
-| `old/src/askpass/invocation.rs` (125) | `/proc/<ppid>/cmdline` 을 읽어 **실행될 명령**을 창에 띄운다. 에이전트에서는 부모가 sudo 가 아니라 우리 데몬이라 이 경로가 없다. 대신 polkit 이 주는 `message`·`action_id` 를 쓴다. **읽을 가치는 있다** — "무엇이 묻는지 보여준다" 가 왜 한 줄을 쓸 값어치인지가 주석에 있다 |
 
 ### 문서에서 볼 곳
 
