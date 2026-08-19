@@ -53,6 +53,36 @@ The Wayland and OpenGL libraries (`wayland`, `libxkbcommon`, `mesa`,
 ## Install
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/minsoft1115/sudo-pop/main/install.sh | bash
+```
+
+That fetches the source, builds it, puts the binary in `~/.local/bin` and runs
+`sudo-pop --init`. Everything it writes lives under `$HOME`, so **do not run it
+as root** — it refuses if you try. Re-running it upgrades in place.
+
+It needs `cargo` (or `mise`, which picks up the pinned toolchain from
+`mise.toml`) and a C linker. There are no prebuilt binaries.
+
+Options, either as flags after `-s --` or as environment variables:
+
+| Flag | Variable | Default |
+|---|---|---|
+| `--prefix DIR` | `SUDO_POP_PREFIX` | `~/.local/bin` |
+| `--ref REF` | `SUDO_POP_REF` | `main` |
+| `--no-init` | `SUDO_POP_NO_INIT=1` | runs `--init` |
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/minsoft1115/sudo-pop/main/install.sh \
+  | bash -s -- --prefix ~/bin --no-init
+```
+
+Running `./install.sh` from inside a checkout builds that checkout instead of
+downloading one — `--ref` is then ignored.
+
+<details>
+<summary>By hand</summary>
+
+```bash
 # 1. build
 cargo build --release
 
@@ -65,6 +95,8 @@ sudo-pop --init
 # 4. open a new shell, or
 source ~/.bashrc
 ```
+
+</details>
 
 What `--init` writes:
 

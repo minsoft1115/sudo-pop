@@ -505,7 +505,9 @@ zeroize = "1"
 sudo-pop/
 ├── Cargo.toml
 ├── mise.toml                  rust 툴체인 고정
-├── README.md                  한글
+├── install.sh                 curl | bash 설치 스크립트 (빌드 → 설치 → --init)
+├── README.md                  영문
+├── README.ko.md               한글
 ├── docs/
 │   ├── plan.md                이 문서 (구현 사양)
 │   ├── rationale.md           설계 근거·실측 기록

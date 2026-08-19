@@ -47,6 +47,36 @@ Wayland·OpenGL 라이브러리는 데스크톱 환경이면 대개 이미 있�
 ## 설치
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/minsoft1115/sudo-pop/main/install.sh | bash
+```
+
+소스를 받아 빌드한 뒤 `~/.local/bin` 에 설치하고 `sudo-pop --init` 까지 실행한다.
+쓰는 것이 전부 `$HOME` 아래이므로 **root 로 실행하지 말 것** — 시도하면 거부한다.
+다시 실행하면 그대로 업그레이드된다.
+
+`cargo` 가 필요하다(또는 `mise`. `mise.toml` 의 고정된 툴체인을 쓴다). C 링커도
+있어야 한다. 미리 빌드된 바이너리는 제공하지 않는다.
+
+옵션은 `-s --` 뒤에 플래그로 주거나 환경변수로 준다:
+
+| 플래그 | 환경변수 | 기본값 |
+|---|---|---|
+| `--prefix DIR` | `SUDO_POP_PREFIX` | `~/.local/bin` |
+| `--ref REF` | `SUDO_POP_REF` | `main` |
+| `--no-init` | `SUDO_POP_NO_INIT=1` | `--init` 실행 |
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/minsoft1115/sudo-pop/main/install.sh \
+  | bash -s -- --prefix ~/bin --no-init
+```
+
+체크아웃 안에서 `./install.sh` 를 실행하면 내려받지 않고 그 체크아웃을 빌드한다.
+이때 `--ref` 는 무시된다.
+
+<details>
+<summary>수동 설치</summary>
+
+```bash
 # 1. 빌드
 cargo build --release
 
@@ -59,6 +89,8 @@ sudo-pop --init
 # 4. 새 셸을 열거나
 source ~/.bashrc
 ```
+
+</details>
 
 `--init` 이 하는 일:
 
