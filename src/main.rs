@@ -36,9 +36,47 @@ type Identity = (String, HashMap<String, OwnedValue>);
 /// over from the sudo path: one authentication request is one command.
 const MAX_ATTEMPTS: u32 = 3;
 
+/// Set when one request has been handled end to end, so a spike run can stop
+/// holding the seat by itself instead of waiting for Ctrl-C.
+static HANDLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 struct Agent {
     /// Unique bus name polkitd owns. Anything else calling us is not polkit.
     polkitd: String,
+    /// Quit after the first handled request.
+    once: bool,
+}
+
+/// Turn terminal echo off for one read, and back on afterwards whatever
+/// happens. Without this a password typed at the prompt stays in the scrollback
+/// -- which is exactly the kind of leak this tool exists to prevent.
+struct EchoOff(Option<libc::termios>);
+
+impl EchoOff {
+    fn new() -> Self {
+        // SAFETY: tcgetattr/tcsetattr on fd 0 with a fully owned struct.
+        unsafe {
+            let mut term: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut term) != 0 {
+                return EchoOff(None);
+            }
+            let saved = term;
+            term.c_lflag &= !libc::ECHO;
+            if libc::tcsetattr(0, libc::TCSAFLUSH, &term) != 0 {
+                return EchoOff(None);
+            }
+            EchoOff(Some(saved))
+        }
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        if let Some(saved) = self.0 {
+            // SAFETY: restoring the struct we read a moment ago.
+            unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, &saved) };
+        }
+    }
 }
 
 /// Spike-only conversation: the terminal. The real one is a window.
@@ -49,8 +87,17 @@ impl Conversation for Terminal {
         use std::io::Write;
         print!("  [{}] {prompt} ", if echo { "echo" } else { "hidden" });
         let _ = std::io::stdout().flush();
+
+        // Only a password field hides its input; PAM_PROMPT_ECHO_ON is meant
+        // to be seen.
+        let _guard = (!echo).then(EchoOff::new);
+
         let mut line = String::new();
-        match std::io::stdin().read_line(&mut line) {
+        let read = std::io::stdin().read_line(&mut line);
+        if !echo {
+            println!();
+        }
+        match read {
             Ok(0) | Err(_) => None,
             Ok(_) => Some(line.trim_end_matches('\n').to_string()),
         }
@@ -61,6 +108,16 @@ impl Conversation for Terminal {
     fn error(&mut self, text: &str) {
         println!("  error: {text}");
     }
+}
+
+/// Wall clock, for lining our log up against what the caller saw.
+fn stamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let secs = now % 86400;
+    format!("{:02}:{:02}:{:02}", (secs / 3600 + 9) % 24, (secs / 60) % 60, secs % 60)
 }
 
 /// Account name for a uid, for the helper preamble.
@@ -117,7 +174,8 @@ impl Agent {
         cookie: String,
         identities: Vec<Identity>,
     ) -> zbus::fdo::Result<()> {
-        println!("\n== BeginAuthentication ==");
+        let started = std::time::Instant::now();
+        println!("\n== BeginAuthentication ==  {}", stamp());
         println!("  sender     : {:?}", header.sender());
         println!("  action_id  : {action_id}");
         println!("  message    : {message}");
@@ -146,27 +204,33 @@ impl Agent {
         println!("  chosen     : {name} (uid {uid})");
 
         let mut conv = Terminal;
+        let finish = |outcome: &str| {
+            println!("  {outcome}  ({} 초 경과, {})", started.elapsed().as_secs_f32().round(), stamp());
+            if self.once {
+                HANDLED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        };
         for attempt in 1..=MAX_ATTEMPTS {
             println!("  -- attempt {attempt}/{MAX_ATTEMPTS} --");
             match helper::authenticate(&name, &cookie, &mut conv) {
                 Outcome::Success => {
-                    println!("  SUCCESS");
+                    finish("SUCCESS");
                     return Ok(());
                 }
                 Outcome::Cancelled => {
-                    println!("  cancelled by the user");
+                    finish("cancelled by the user");
                     // Cancelling ends the request normally: an error would have
                     // polkitd hand it straight back to us.
                     return Ok(());
                 }
                 Outcome::RefusedWithoutPrompt => {
-                    println!("  refused before any prompt (locked account or broken stack)");
+                    finish("refused before any prompt (locked account or broken stack)");
                     return Ok(());
                 }
                 Outcome::Failed => continue,
             }
         }
-        println!("  out of attempts");
+        finish("out of attempts");
         Err(zbus::fdo::Error::Failed("authentication failed".into()))
     }
 
@@ -250,7 +314,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("session id  : {session}  (found by {how})");
 
     let conn = connection::Builder::system()?
-        .serve_at(AGENT_PATH, Agent { polkitd: owner.clone() })?
+        .serve_at(
+            AGENT_PATH,
+            Agent {
+                polkitd: owner.clone(),
+                once: std::env::var_os("SUDO_POP_SPIKE_ONCE").is_some(),
+            },
+        )?
         .build()?;
     println!("agent object: {AGENT_PATH}");
     if let Some(me) = conn.unique_name() {
@@ -268,11 +338,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &(&subject, locale.as_str(), AGENT_PATH),
     ) {
         Ok(()) => {
-            println!("\nREGISTERED. holding the seat; every request will be refused.");
-            println!("Ctrl-C to stop.");
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(3600));
+            println!("\nREGISTERED. this session's prompts come here now.");
+            if std::env::var_os("SUDO_POP_SPIKE_ONCE").is_some() {
+                println!("(stopping after the first request)");
+            } else {
+                println!("Ctrl-C to stop.");
             }
+
+            while !HANDLED.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+
+            // Give the seat back rather than leaving polkitd to notice we left.
+            match authority.call::<_, _, ()>("UnregisterAuthenticationAgent", &(&subject, AGENT_PATH)) {
+                Ok(()) => println!("unregistered"),
+                Err(e) => println!("unregister failed: {e}"),
+            }
+            Ok(())
         }
         Err(e) => {
             println!("\nREFUSED: {e}");

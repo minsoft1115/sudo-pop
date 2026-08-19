@@ -343,6 +343,41 @@ out of attempts                      → Error.Failed → run0: "Access denied"
 | 발신자 거절 | `busctl` 로 폴킷이 아닌 곳에서 직접 부르니 **창을 띄우기 전에 `Access denied`** (§3-4) |
 | `details` 키 순서 | 실행마다 다르다. 맵이므로 당연하지만 **순서에 의존해 파싱하지 말 것** |
 
+**성공 경로도 확인했다** (사람이 직접 입력).
+
+```
+== BeginAuthentication ==  20:39:47
+  SUCCESS  (2 초 경과, 20:39:49)
+unregistered
+run0 exit=0        ← 인증만 통과한 게 아니라 명령이 실제로 실행됐다
+```
+
+`AuthenticationAgentResponse2` 를 **우리는 한 번도 부르지 않았다.** 헬퍼가 root 로 보냈고
+polkitd 가 그것으로 허가했다 — §3-2 의 전제가 실물로 확인됐다.
+
+#### 호출자는 25초만 기다린다
+
+첫 시도는 실패했는데, 이유가 프로토콜이 아니라 **시간**이었다. 답이 늦으면 이렇게 끝난다.
+
+```
+run0: Failed to start transient service unit: Connection timed out
+→ 호출자가 포기하기까지 25초        (일부러 늦게 답해 실측)
+```
+
+거절과 구별된다 — 거절은 `Access denied` 다. 25초는 sd-bus 의 기본 메서드 타임아웃이고,
+**우리가 늘릴 수 없는 값이다.** 포기한 뒤 polkitd 는 `CancelAuthentication` 을 보내 온다
+(그것도 실물로 받았다).
+
+여기서 두 가지가 따라 나온다.
+
+- **창의 타임아웃을 90초로 두는 것은 의미가 없다** (`old/src/askpass/gui.rs` 의 `TIMEOUT`).
+  25초가 지나면 사용자가 무엇을 입력하든 호출자는 이미 떠났다. 창은 `CancelAuthentication`
+  을 받는 즉시 닫고, 자체 타임아웃은 그보다 조금 길게만 둔다
+- **`CancelAuthentication` 이 성공 뒤에 올 수 있다.** 처리는 멱등이어야 한다 — 첫 시도에서
+  `SUCCESS` 다음에 취소가 도착했고, 그때 아무 일도 일어나지 않아야 맞다
+- sudo 경로에는 이 제한이 없다. sudo 는 askpass 를 기다린다. **같은 창인데 경로에 따라
+  주어진 시간이 다르다**는 사실을 UI 가 알고 있어야 한다
+
 **faillock 산수를 바로잡는다.** 오답 3회가 `SVC polkit-1` 로 공용 tally 에 쌓였고,
 `unlock_time=120` 은 **잠긴 뒤 풀리기까지의 시간이지 실패가 쌓이는 창이 아니다.** 실측에서
 3분이 지나도 항목이 `V`(유효)로 남아 있었다. 즉 테스트로 태운 실패는 한참 남고,
@@ -658,6 +693,7 @@ polkit 에 대응이 없는 것들이 있고, 스크립트가 부르는 sudo 도
 | **발신자 검증** | **필수.** 폴킷이 부른 것만 받는다 (§3-4). 참고 구현 둘 다 안 하는 부분이다 |
 | **시도 횟수 경계** | **쿠키 단위.** 데몬 메모리에서 세고, 파일 카운터는 sudo 경로에 남긴다 (§4-1) |
 | 창에 무엇을 띄우나 | polkit 의 `message` 가 아니라 **`polkit.subject-pid` 의 cmdline** 을 앞세운다 (§3-5) |
+| 창 타임아웃 | polkit 경로는 **호출자가 25초에 포기한다** (§3-6). 90초 타임아웃은 그 뒤에 의미가 없다 |
 | 창 서피스 | 지금의 xdg_toplevel + Hyprland 창 규칙 그대로. 레이어셸은 후순위 (§2-4) |
 | 덮개·테마 | Omarchy 것을 그대로 쓴다 — `omarchy-hw-laptop-closed`, `shell.toml` 의 `[polkit]` (§2-3) |
 
