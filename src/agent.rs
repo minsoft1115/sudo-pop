@@ -63,6 +63,14 @@ fn tracing() -> bool {
     std::env::var_os("SUDO_POP_DEBUG").is_some_and(|v| !v.is_empty())
 }
 
+/// A child exit code that ends the request without a D-Bus error. Success and
+/// cancellation (and a refusal before any prompt, which the child also reports
+/// as cancelled) return normally; anything else becomes an error, and an error
+/// makes polkitd re-issue the request -- the reopen-forever trap of §3-3.
+fn is_ok_exit(code: i32) -> bool {
+    matches!(code, prompt::EXIT_SUCCESS | prompt::EXIT_CANCELLED)
+}
+
 /// Send a signal through a pidfd. Immune to pid reuse: after the child exits
 /// this fails with ESRCH rather than reaching a recycled pid.
 fn pidfd_signal(pidfd: i32, sig: i32) {
@@ -156,13 +164,13 @@ impl Agent {
             crate::HANDLED.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
-        match code {
-            prompt::EXIT_SUCCESS => Ok(()),
-            // Cancelled, or refused before any prompt. Both end the request
-            // normally: an error would have polkitd hand it straight back and
-            // the window would reopen forever.
-            prompt::EXIT_CANCELLED => Ok(()),
-            _ => Err(zbus::fdo::Error::Failed("authentication failed".into())),
+        if is_ok_exit(code) {
+            // Success, cancel, or a refusal before any prompt all end the
+            // request normally. An error would have polkitd hand it straight
+            // back and the window would reopen forever.
+            Ok(())
+        } else {
+            Err(zbus::fdo::Error::Failed("authentication failed".into()))
         }
     }
 
@@ -263,5 +271,26 @@ impl Agent {
             unsafe { libc::close(fd) };
         }
         code
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_polkitd_owner_passes_the_sender_check() {
+        let agent = Agent::new(":1.12".to_owned(), false);
+        assert!(agent.is_polkitd(Some(":1.12")));
+        assert!(!agent.is_polkitd(Some(":1.99")), "a different name is not polkit");
+        assert!(!agent.is_polkitd(None), "no sender is not polkit");
+    }
+
+    #[test]
+    fn success_and_cancel_end_without_an_error() {
+        assert!(is_ok_exit(prompt::EXIT_SUCCESS));
+        assert!(is_ok_exit(prompt::EXIT_CANCELLED));
+        assert!(!is_ok_exit(prompt::EXIT_FAILED), "a real failure is a D-Bus error");
+        assert!(!is_ok_exit(42), "an unexpected code is a D-Bus error");
     }
 }

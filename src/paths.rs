@@ -101,3 +101,98 @@ pub fn basename(path: &OsString) -> &std::ffi::OsStr {
         .file_name()
         .unwrap_or(path.as_os_str())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Point XDG_RUNTIME_DIR at a fresh empty dir for the duration of `f`, then
+    /// restore it. Serialized against the other env-touching tests.
+    fn with_runtime_dir<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("sudo-pop-paths-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        // SAFETY: the block is serialized by TEST_ENV_LOCK.
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &base) };
+        let out = f(&base);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
+            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
+        }
+        let _ = fs::remove_dir_all(&base);
+        out
+    }
+
+    fn make_dir(path: &std::path::Path, mode: u32) {
+        fs::create_dir(path).unwrap();
+        // set_permissions bypasses umask so the mode is exactly what we asked.
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn basename_takes_the_last_component() {
+        assert_eq!(basename(&OsString::from("/a/b/askpass")), std::ffi::OsStr::new("askpass"));
+        assert_eq!(basename(&OsString::from("sudo-pop")), std::ffi::OsStr::new("sudo-pop"));
+        assert_eq!(basename(&OsString::from("/a/b/")), std::ffi::OsStr::new("b"));
+    }
+
+    #[test]
+    fn a_missing_private_dir_is_created_0700() {
+        with_runtime_dir(|base| {
+            let dir = ensure_private_dir().unwrap();
+            assert_eq!(dir, base.join(RUNTIME_SUBDIR));
+            let mode = fs::symlink_metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        });
+    }
+
+    #[test]
+    fn a_0700_dir_we_own_is_accepted() {
+        with_runtime_dir(|base| {
+            make_dir(&base.join(RUNTIME_SUBDIR), 0o700);
+            assert!(ensure_private_dir().is_ok());
+        });
+    }
+
+    #[test]
+    fn a_group_or_world_reachable_dir_is_refused() {
+        with_runtime_dir(|base| {
+            make_dir(&base.join(RUNTIME_SUBDIR), 0o755);
+            assert!(ensure_private_dir().is_err(), "0755 must be refused");
+        });
+    }
+
+    #[test]
+    fn a_symlink_in_place_of_the_dir_is_refused() {
+        with_runtime_dir(|base| {
+            let target = base.join("elsewhere");
+            fs::create_dir(&target).unwrap();
+            symlink(&target, base.join(RUNTIME_SUBDIR)).unwrap();
+            assert!(ensure_private_dir().is_err(), "a symlink must be refused");
+        });
+    }
+
+    #[test]
+    fn the_askpass_link_points_at_this_binary_and_is_reused() {
+        with_runtime_dir(|_| {
+            let link = ensure_askpass_symlink().unwrap();
+            assert_eq!(fs::read_link(&link).unwrap(), std::env::current_exe().unwrap());
+            let again = ensure_askpass_symlink().unwrap();
+            assert_eq!(link, again, "a correct link is reused, not recreated");
+        });
+    }
+
+    #[test]
+    fn a_wrong_askpass_link_is_replaced() {
+        with_runtime_dir(|base| {
+            make_dir(&base.join(RUNTIME_SUBDIR), 0o700);
+            let link = base.join(RUNTIME_SUBDIR).join(ASKPASS_LINK);
+            symlink("/nonexistent/target", &link).unwrap();
+            let fixed = ensure_askpass_symlink().unwrap();
+            assert_eq!(fs::read_link(&fixed).unwrap(), std::env::current_exe().unwrap());
+        });
+    }
+}

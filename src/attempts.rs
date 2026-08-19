@@ -104,6 +104,28 @@ impl Budget {
     pub fn is_locked(&self) -> bool {
         self.remaining == 0
     }
+
+    /// The window warning shown as the budget runs low, or `None` while there
+    /// is still room -- or when the account is already locked, which `refusal`
+    /// speaks to instead.
+    pub fn warning(&self) -> Option<String> {
+        (self.remaining > 0 && self.remaining < WARN_BELOW).then(|| {
+            format!("{} attempt(s) left before the account locks", self.remaining)
+        })
+    }
+
+    /// The message to show instead of a prompt when the account is locked, or
+    /// `None` when it is not. Both prompt paths refuse rather than ask, so this
+    /// is the one place that decides the wording.
+    pub fn refusal(&self) -> Option<String> {
+        if !self.is_locked() {
+            return None;
+        }
+        Some(match self.unlock_in {
+            Some(secs) => format!("account locked, {secs}s to go"),
+            None => "account is locked out".to_owned(),
+        })
+    }
 }
 
 /// Read the current failure budget, or `None` if it cannot be determined.
@@ -133,38 +155,51 @@ pub fn budget() -> Option<Budget> {
 
 /// Look up a pam_faillock setting, preferring faillock.conf over the pam stack.
 fn read_setting(key: &str) -> Option<u32> {
-    // faillock.conf spells it `deny = 10`.
-    if let Ok(text) = fs::read_to_string("/etc/security/faillock.conf") {
-        for line in text.lines() {
-            let line = line.trim();
-            if line.starts_with('#') {
-                continue;
-            }
-            if let Some(value) = line
-                .strip_prefix(key)
-                .and_then(|v| v.trim().strip_prefix('='))
-                .and_then(|v| v.trim().parse().ok())
-            {
-                return Some(value);
-            }
+    if let Ok(text) = fs::read_to_string("/etc/security/faillock.conf")
+        && let Some(value) = parse_conf_setting(&text, key)
+    {
+        return Some(value);
+    }
+    for file in ["/etc/pam.d/system-auth", "/etc/pam.d/sudo"] {
+        if let Ok(text) = fs::read_to_string(file)
+            && let Some(value) = parse_pam_setting(&text, key)
+        {
+            return Some(value);
         }
     }
+    None
+}
 
-    // The pam stack spells it `deny=10` on the module line.
-    let needle = format!("{key}=");
-    for file in ["/etc/pam.d/system-auth", "/etc/pam.d/sudo"] {
-        let Ok(text) = fs::read_to_string(file) else {
+/// `key = value`, faillock.conf style. Comments and other keys are ignored.
+fn parse_conf_setting(text: &str, key: &str) -> Option<u32> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
             continue;
-        };
-        for line in text.lines() {
-            if line.trim_start().starts_with('#') || !line.contains("pam_faillock") {
-                continue;
-            }
-            if let Some(rest) = line.split(&needle).nth(1) {
-                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-                if let Ok(n) = digits.parse() {
-                    return Some(n);
-                }
+        }
+        if let Some(value) = line
+            .strip_prefix(key)
+            .and_then(|v| v.trim().strip_prefix('='))
+            .and_then(|v| v.trim().parse().ok())
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// `key=value` glued onto a pam_faillock module line. Only that module's lines
+/// count, so a `deny=` on some other module is not mistaken for ours.
+fn parse_pam_setting(text: &str, key: &str) -> Option<u32> {
+    let needle = format!("{key}=");
+    for line in text.lines() {
+        if line.trim_start().starts_with('#') || !line.contains("pam_faillock") {
+            continue;
+        }
+        if let Some(rest) = line.split(&needle).nth(1) {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(n) = digits.parse() {
+                return Some(n);
             }
         }
     }
@@ -186,7 +221,17 @@ fn failure_tally(user: &str) -> Option<(u32, Option<u64>)> {
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout);
+    let (valid, newest_row) = parse_tally(&text);
+    let newest = newest_row.and_then(|(date, time)| parse_stamp(&date, &time));
+    Some((valid, newest))
+}
 
+/// Count the still-valid failures and pick out the newest one's raw date/time.
+///
+/// `faillock` lists entries oldest-first and flips the Valid column from `V` to
+/// `I` once past `fail_interval`. Only `V` rows count toward the budget, and the
+/// newest of them -- the last one listed -- carries the time for the countdown.
+fn parse_tally(text: &str) -> (u32, Option<(String, String)>) {
     let mut valid = 0;
     let mut newest = None;
     for line in text.lines() {
@@ -196,11 +241,9 @@ fn failure_tally(user: &str) -> Option<(u32, Option<u64>)> {
             continue;
         }
         valid += 1;
-        if let Some(at) = parse_stamp(fields[0], fields[1]) {
-            newest = Some(newest.map_or(at, |prev: u64| prev.max(at)));
-        }
+        newest = Some((fields[0].to_owned(), fields[1].to_owned()));
     }
-    Some((valid, newest))
+    (valid, newest)
 }
 
 /// Turn faillock's local "YYYY-MM-DD HH:MM:SS" into a unix timestamp.
@@ -228,5 +271,122 @@ fn current_user() -> Option<String> {
             .to_str()
             .ok()
             .map(str::to_owned)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_runtime_dir<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("sudo-pop-attempts-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sudo-pop")).unwrap();
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        // SAFETY: the whole block is serialized by TEST_ENV_LOCK.
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
+        let out = f();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
+            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
+        }
+        let _ = fs::remove_dir_all(&dir);
+        out
+    }
+
+    #[test]
+    fn the_counter_counts_submissions_and_resets() {
+        with_runtime_dir(|| {
+            reset();
+            assert_eq!(used(), 0);
+            record();
+            assert_eq!(used(), 1);
+            record();
+            assert_eq!(used(), 2);
+            reset();
+            assert_eq!(used(), 0);
+        });
+    }
+
+    #[test]
+    fn a_stale_counter_is_ignored() {
+        with_runtime_dir(|| {
+            let path = counter_path().unwrap();
+            let old = now_secs().saturating_sub(STALE_AFTER_SECS + 5);
+            write_private(&path, &format!("{old} 3\n")).unwrap();
+            assert_eq!(used(), 0, "a stale count must not gate a fresh command");
+        });
+    }
+
+    #[test]
+    fn deny_is_read_from_faillock_conf() {
+        let conf = "# faillock\ndeny = 10\nunlock_time = 120\n";
+        assert_eq!(parse_conf_setting(conf, "deny"), Some(10));
+        assert_eq!(parse_conf_setting(conf, "unlock_time"), Some(120));
+        assert_eq!(parse_conf_setting(conf, "audit"), None);
+        // a commented-out setting does not count
+        assert_eq!(parse_conf_setting("# deny = 3\n", "deny"), None);
+        // a longer key that merely starts with ours is not a match
+        assert_eq!(parse_conf_setting("denyfoo = 3\n", "deny"), None);
+    }
+
+    #[test]
+    fn deny_is_read_from_a_pam_faillock_line() {
+        let pam = "auth  required  pam_faillock.so  preauth deny=10 unlock_time=120\n";
+        assert_eq!(parse_pam_setting(pam, "deny"), Some(10));
+        assert_eq!(parse_pam_setting(pam, "unlock_time"), Some(120));
+        // only pam_faillock lines are consulted
+        assert_eq!(parse_pam_setting("auth required pam_unix.so deny=3\n", "deny"), None);
+        assert_eq!(parse_pam_setting("# pam_faillock.so deny=3\n", "deny"), None);
+    }
+
+    #[test]
+    fn the_tally_counts_only_valid_rows() {
+        let out = "\
+lmh:
+When                Type  Source   Valid
+2026-08-19 12:00:01 RHOST host     V
+2026-08-19 12:00:02 RHOST host     I
+2026-08-19 12:00:03 RHOST host     V
+";
+        let (valid, newest) = parse_tally(out);
+        assert_eq!(valid, 2, "the I row must not count toward the budget");
+        assert_eq!(
+            newest,
+            Some(("2026-08-19".to_owned(), "12:00:03".to_owned())),
+            "newest is the last valid row"
+        );
+    }
+
+    #[test]
+    fn a_tally_with_no_valid_rows_is_zero() {
+        assert_eq!(parse_tally("lmh:\nWhen Type Source Valid\n"), (0, None));
+        assert_eq!(parse_tally(""), (0, None));
+    }
+
+    #[test]
+    fn a_warning_shows_only_in_the_low_band() {
+        let b = |remaining| Budget { remaining, unlock_in: None };
+        assert_eq!(b(10).warning(), None);
+        assert_eq!(b(4).warning(), None);
+        assert_eq!(
+            b(3).warning().as_deref(),
+            Some("3 attempt(s) left before the account locks")
+        );
+        assert_eq!(b(0).warning(), None, "a locked account warns via refusal, not here");
+    }
+
+    #[test]
+    fn refusal_speaks_only_when_locked() {
+        assert_eq!(Budget { remaining: 1, unlock_in: None }.refusal(), None);
+        assert_eq!(
+            Budget { remaining: 0, unlock_in: None }.refusal().as_deref(),
+            Some("account is locked out")
+        );
+        assert_eq!(
+            Budget { remaining: 0, unlock_in: Some(90) }.refusal().as_deref(),
+            Some("account locked, 90s to go")
+        );
     }
 }

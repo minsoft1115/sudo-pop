@@ -86,25 +86,13 @@ pub fn run() -> ! {
     // cross-cookie cap: each request re-reads it, so repeated requests cannot
     // hand out three fresh attempts each once the account is close to locking.
     let budget = attempts::budget();
-    if let Some(budget) = &budget
-        && budget.is_locked()
-    {
+    if let Some(reason) = budget.as_ref().and_then(attempts::Budget::refusal) {
         // Report as cancelled, not failed: a failure has polkitd re-issue the
         // request and the window would reopen forever (see helper.rs, §3-3).
-        match budget.unlock_in {
-            Some(secs) => eprintln!("sudo-pop: account locked, {secs}s to go"),
-            None => eprintln!("sudo-pop: account is locked out"),
-        }
+        eprintln!("sudo-pop: {reason}");
         std::process::exit(EXIT_CANCELLED);
     }
-    let warning = budget.and_then(|budget| {
-        (budget.remaining < attempts::WARN_BELOW).then(|| {
-            format!(
-                "{} attempt(s) left before the account locks",
-                budget.remaining
-            )
-        })
-    });
+    let warning = budget.and_then(|budget| budget.warning());
 
     let (to_ui_tx, to_ui_rx) = channel::<ToUi>();
     let (from_ui_tx, from_ui_rx) = channel::<FromUi>();

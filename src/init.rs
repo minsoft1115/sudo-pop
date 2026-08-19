@@ -295,12 +295,18 @@ fn omarchy_polkit_enabled() -> bool {
     let Ok(out) = Command::new("omarchy-plugin-list").arg("--json").output() else {
         return false;
     };
-    let text = String::from_utf8_lossy(&out.stdout);
-    let Some(at) = text.find("omarchy.polkit") else {
+    polkit_enabled_in(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Whether the omarchy.polkit plugin is `enabled` in the plugin-list JSON.
+///
+/// Scans only as far as the end of that one plugin's object, so a later
+/// plugin's `enabled:true` cannot be read as ours.
+fn polkit_enabled_in(json: &str) -> bool {
+    let Some(at) = json.find("omarchy.polkit") else {
         return false;
     };
-    // Look only as far as the end of that plugin's object.
-    let rest = &text[at..];
+    let rest = &json[at..];
     let scope = rest.find('}').map(|end| &rest[..end]).unwrap_or(rest);
     scope.contains("\"enabled\": true") || scope.contains("\"enabled\":true")
 }
@@ -345,10 +351,22 @@ fn write_snippet(path: &Path, contents: &str) -> io::Result<()> {
 /// Append a marker-delimited block unless it is already there.
 fn add_block(path: &Path, begin: &str, end: &str, body: &str) -> io::Result<bool> {
     let existing = read_or_empty(path)?;
-    if existing.contains(begin) {
-        return Ok(false);
+    match insert_block(&existing, begin, end, body) {
+        Some(out) => {
+            fs::write(path, out)?;
+            Ok(true)
+        }
+        None => Ok(false),
     }
-    let mut out = existing;
+}
+
+/// The content with the block appended, or `None` if the begin marker is
+/// already present (so a second `--init` never appends a duplicate).
+fn insert_block(existing: &str, begin: &str, end: &str, body: &str) -> Option<String> {
+    if existing.contains(begin) {
+        return None;
+    }
+    let mut out = existing.to_owned();
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
@@ -359,32 +377,43 @@ fn add_block(path: &Path, begin: &str, end: &str, body: &str) -> io::Result<bool
     out.push('\n');
     out.push_str(end);
     out.push('\n');
-    fs::write(path, out)?;
-    Ok(true)
+    Some(out)
 }
 
 /// Delete a marker-delimited block, markers included.
-///
-/// A begin without a matching end is left untouched rather than guessed at:
-/// better a stray line than eating the rest of someone's config.
 fn remove_block(path: &Path, begin: &str, end: &str) -> io::Result<bool> {
     let existing = read_or_empty(path)?;
-    let Some(start) = existing.find(begin) else {
-        return Ok(false);
-    };
-    let Some(stop) = existing[start..].find(end) else {
-        return Err(io::Error::other(format!(
+    match strip_block(&existing, begin, end) {
+        Ok(Some(out)) => {
+            fs::write(path, out)?;
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(_) => Err(io::Error::other(format!(
             "{} has {begin} without {end}; not touching it",
             path.display()
-        )));
+        ))),
+    }
+}
+
+/// The content with the block removed, `Ok(None)` if there is no begin marker,
+/// or `Err` if a begin has no matching end.
+///
+/// A begin without a matching end is refused rather than guessed at: better a
+/// stray line than eating the rest of someone's config.
+fn strip_block(existing: &str, begin: &str, end: &str) -> io::Result<Option<String>> {
+    let Some(start) = existing.find(begin) else {
+        return Ok(None);
+    };
+    let Some(stop) = existing[start..].find(end) else {
+        return Err(io::Error::other("begin marker without a matching end"));
     };
     let mut out = String::with_capacity(existing.len());
     out.push_str(existing[..start].trim_end_matches('\n'));
     let tail = &existing[start + stop + end.len()..];
     out.push('\n');
     out.push_str(tail.trim_start_matches('\n'));
-    fs::write(path, out)?;
-    Ok(true)
+    Ok(Some(out))
 }
 
 fn read_or_empty(path: &Path) -> io::Result<String> {
@@ -407,5 +436,66 @@ fn reload_hyprland() {
             String::from_utf8_lossy(&out.stderr).trim()
         ),
         Err(e) => eprintln!("sudo-pop: cannot run hyprctl: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const B: &str = "-- x:begin";
+    const E: &str = "-- x:end";
+    const BODY: &str = "the body";
+
+    #[test]
+    fn a_block_is_appended_then_left_alone() {
+        let out = insert_block("line1\nline2\n", B, E, BODY).unwrap();
+        assert!(out.starts_with("line1\nline2\n"), "existing content is kept");
+        assert!(out.contains(B) && out.contains(BODY) && out.contains(E));
+        // Idempotent: a second insert finds the marker and does nothing.
+        assert_eq!(insert_block(&out, B, E, BODY), None);
+    }
+
+    #[test]
+    fn a_block_is_appended_to_empty_content() {
+        let out = insert_block("", B, E, BODY).unwrap();
+        assert!(out.contains(B) && out.contains(E));
+    }
+
+    #[test]
+    fn a_block_is_removed_and_the_rest_survives() {
+        let with = insert_block("keep me\n", B, E, BODY).unwrap();
+        let back = strip_block(&with, B, E).unwrap().unwrap();
+        assert!(back.contains("keep me"));
+        assert!(!back.contains(B) && !back.contains(BODY) && !back.contains(E));
+    }
+
+    #[test]
+    fn removing_an_absent_block_is_a_no_op() {
+        assert_eq!(strip_block("nothing here\n", B, E).unwrap(), None);
+    }
+
+    #[test]
+    fn a_begin_without_an_end_is_refused() {
+        // Better a stray marker line than eating the rest of the file.
+        assert!(strip_block("before\n-- x:begin\nbody with no end\n", B, E).is_err());
+    }
+
+    #[test]
+    fn polkit_enabled_is_read_only_from_its_own_object() {
+        assert!(polkit_enabled_in(
+            r#"[{"id":"omarchy.polkit","kinds":["service"],"enabled":true}]"#
+        ));
+        assert!(polkit_enabled_in(
+            r#"[{"id":"omarchy.polkit", "enabled": true}]"#
+        ));
+        assert!(!polkit_enabled_in(
+            r#"[{"id":"omarchy.polkit","enabled":false}]"#
+        ));
+        assert!(!polkit_enabled_in(r#"[{"id":"omarchy.bar","enabled":true}]"#));
+        // A different plugin being enabled must not be read as ours.
+        assert!(!polkit_enabled_in(
+            r#"[{"id":"omarchy.polkit","enabled":false},{"id":"x","enabled":true}]"#
+        ));
     }
 }
