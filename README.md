@@ -3,16 +3,31 @@
 **English** · [한국어](README.ko.md)
 
 A single Rust binary that asks for your `sudo` password in a GUI popup on
-Hyprland/Wayland. Only the prompt leaves the terminal — stdin, stdout and stderr
-reach the real command untouched, so `pacman`'s `[Y/n]` and a full-screen `vim`
-work as they always did.
+Hyprland/Wayland. Only the password prompt leaves the terminal.
 
 ![The sudo-pop window: pacman -Syu on the top line, sudo's own prompt below it,
 and a masked input field](screenshots/sudo-pop.png)
 
 > **A convenience tool, not a security tool.** It changes where the prompt
-> appears, not how safe your password is — see [what it protects, and what it
-> does not](#what-it-protects-and-what-it-does-not).
+> appears, not how safe your password is — see [the limits](#the-limits).
+
+---
+
+## What it guarantees
+
+| | |
+|---|---|
+| the terminal | stdin, stdout and stderr reach the command untouched — `pacman`'s `[Y/n]` and a full-screen `vim` work as they always did |
+| core dumps | a crash cannot leave the password on disk |
+| swap | the buffer is locked into RAM, so it never reaches swap or a hibernation image |
+| screen sharing | the window is excluded from shares and recordings |
+| logs | no log, no command line and no environment variable ever holds it |
+
+Each of those was measured rather than assumed — `docs/rationale.md` §6.
+
+Screenshot tools use the same protocol as screen sharing, so the window captures
+as a black rectangle. The image above was taken with `no_screen_share` turned off
+in `~/.config/minsoft1115/hypr/sudo-pop.lua`.
 
 ---
 
@@ -129,29 +144,25 @@ Any one of these skips the popup and uses the ordinary terminal prompt:
 
 **Logging in over SSH does not lock you out of sudo.**
 
-### The window stays out of screen shares
+### The window warns before the account locks
 
-`no_screen_share` keeps it out of screen sharing and recording. Screenshot tools
-use the same protocol, so the window captures as a black rectangle — the image
-at the top of this README was taken with that rule turned off in
-`~/.config/minsoft1115/hypr/sudo-pop.lua`.
+PAM counts failed sudo authentications and locks the account once enough of them
+pile up. That is true with or without sudo-pop; what sudo-pop adds is a view of
+it, and a cap.
 
-### faillock — a cancel costs one failure
+- **when 3 or fewer attempts remain, the window says so**
+- **at most 3 popups per `sudo` command** — sudo on its own retries up to
+  `passwd_tries` times, enough for one command to spend the whole budget
+- **when the account is already locked it says so**, instead of asking for a
+  password that cannot work
 
-PAM's behaviour, not sudo-pop's: by the time the popup appears the
-authentication conversation has already started, so Esc costs exactly what a
-wrong password costs. Enough failures in a row and PAM locks the account for a
-while.
+Thresholds come from your PAM configuration; `deny` and `unlock_time` are read
+at run time. **One successful authentication clears the record.**
 
-The thresholds are your PAM configuration's — sudo-pop reads `deny` and
-`unlock_time` at run time and follows them. On top of them:
-
-- **at most 3 popups per `sudo` command**, where sudo on its own retries up to
-  `passwd_tries` times and can spend the whole budget
-- **the window warns** when few failures remain
-- **no popup at all when the account is already locked**
-
-**One successful authentication clears the record.**
+> [!NOTE]
+> **Esc costs one attempt as well.** The authentication conversation has already
+> started by the time the popup appears, so cancelling inside it is recorded
+> like any other attempt.
 
 ```bash
 faillock --user "$USER"     # only rows with V in the Valid column count
@@ -170,21 +181,12 @@ It goes around aliases, shell functions and PATH alike, where `\sudo` and
 `command sudo` do not. Running `--uninit` before deleting the binary avoids the
 situation entirely.
 
-### What it protects, and what it does not
+### The limits
 
 | | |
 |---|---|
 | **Unchanged** | Malware running as your user can replace the alias, the binary and `SUDO_ASKPASS` — but it could already alias `sudo`, shadow it on PATH, or fake the prompt from a shell function. No new path opens here. |
 | **One thing worse** | Phishing. A terminal prompt at least appears where you just typed; a popup gives that up, and a look-alike window needs no privileges. The command on the top line is the answer to it — a cue, not a guarantee. |
-
-What it does protect is careless leakage:
-
-- a crash cannot leave the password in a core dump
-- the buffer is locked into RAM, out of swap and hibernation images
-- the window is excluded from screen sharing and recording
-- no log, no command line and no environment variable ever holds it
-
-Each of those was measured rather than assumed — `docs/rationale.md` §6.
 
 ---
 
