@@ -4,11 +4,13 @@
 //! wiped by hand rather than by `Drop` -- under `panic = "abort"` destructors
 //! never run.
 //!
-//! Where it goes afterwards is the caller's business: in agent mode it is
-//! written straight to the polkit helper, never formatted into a `String` or a
-//! `println!` buffer that nothing zeroizes.
+//! Where it goes afterwards depends on the path: the agent writes it straight
+//! to the polkit helper, and askpass writes it to the descriptor sudo is
+//! reading. Neither ever formats it into a `String` or a `println!` buffer that
+//! nothing zeroizes.
 
 use std::io;
+use std::os::unix::io::RawFd;
 
 use zeroize::Zeroize;
 
@@ -82,6 +84,70 @@ impl Drop for Secret {
         // SAFETY: mirrors the mlock in `new`, on the same allocation.
         unsafe { libc::munlock(self.0.as_ptr().cast(), CAPACITY) };
     }
+}
+
+/// The saved write end of the pipe sudo is reading.
+///
+/// Constructing this is what makes stdout safe: the original descriptor is
+/// duplicated out of the way and fd 1 is pointed at /dev/null.
+pub struct PasswordChannel {
+    fd: RawFd,
+}
+
+impl PasswordChannel {
+    /// Move the real stdout aside and blank fd 1.
+    pub fn take() -> io::Result<Self> {
+        // SAFETY: plain descriptor manipulation, single-threaded at this point.
+        let saved = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        if saved < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
+        if devnull < 0 {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(saved) };
+            return Err(e);
+        }
+
+        let rc = unsafe { libc::dup2(devnull, libc::STDOUT_FILENO) };
+        unsafe { libc::close(devnull) };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(saved) };
+            return Err(e);
+        }
+
+        Ok(PasswordChannel { fd: saved })
+    }
+
+    /// Send the password to sudo, then let the caller wipe it.
+    ///
+    /// Written as two raw writes rather than one formatted line: joining the
+    /// password and the newline would allocate a second copy that nothing
+    /// zeroizes. `println!` is avoided for the same reason — its buffer would
+    /// keep a copy too.
+    pub fn send(&self, secret: &Secret) -> io::Result<()> {
+        write_all(self.fd, secret.0.as_bytes())?;
+        write_all(self.fd, b"\n")
+    }
+}
+
+/// Write every byte, retrying short writes and EINTR.
+fn write_all(fd: RawFd, mut buf: &[u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        // SAFETY: buf is a valid slice for the length passed.
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        buf = &buf[n as usize..];
+    }
+    Ok(())
 }
 
 #[cfg(test)]

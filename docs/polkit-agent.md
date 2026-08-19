@@ -689,6 +689,24 @@ The unit is installed but not enabled. To switch:
 
 ---
 
+### 6-2. 화면 공유 제외가 실측됐다
+
+`--init` 이 창 규칙을 깔고 나니 `grim` 으로 찍은 스크린샷에서 창 자리가 **검은 사각형**으로
+나온다. 규칙이 없던 3단계 스모크 테스트에서는 내용이 그대로 찍혔다.
+
+```
+창 규칙 없음  → 스크린샷에 "sleep 300 / Password:" 가 보인다
+창 규칙 설치  → 같은 자리에 검은 사각형
+```
+
+`no_screen_share` 가 wlr-screencopy 를 막는 것이고, 사용자 눈에는 정상으로 보인다. §2-2 에서
+"우리만 가진 것" 으로 센 항목이 실물로 확인됐다 — Omarchy 의 레이어 서피스에는 이 규칙을
+걸 방법이 없다.
+
+개발 중에 창 내용을 봐야 하면 규칙을 잠깐 빼야 한다는 뜻이기도 하다.
+
+---
+
 ## 7. 기존 기능은 어떻게 되나 — 스마트 라우터
 
 sudo 래퍼는 **남긴다.** `sudo -E`, `-v`, `-k`, `sudoers` 의 `NOPASSWD`·`env_keep` 처럼
@@ -716,6 +734,27 @@ polkit 에 대응이 없는 것들이 있고, 스크립트가 부르는 sudo 도
 
 **이 갈림길은 에이전트가 실제로 도는 것을 본 뒤에 켠다** (§8 의 5단계 이후). 에이전트 없이
 켜면 흔한 경우가 팝업을 잃고 터미널 프롬프트(`pkttyagent`)로 떨어진다.
+
+### 7-1. 구현됨 — 스파이크 6 기록
+
+```
+$ SUDO_POP_DEBUG=1 sudo-pop -n true
+sudo-pop: caller passed -A/-n/-S, leaving arguments untouched   → 평범한 sudo
+
+$ SUDO_POP_DEBUG=1 sudo-pop true
+sudo-pop: plain command, routing to run0                        → polkit → 우리 에이전트 창
+```
+
+판정은 `plain_command()` 하나다 — `command_start()` 가 0 이고 첫 인자가 `NAME=값` 이 아니면
+run0. 단위 테스트로 굳혔다 (옵션·환경 할당·`--`·`-name=x` 같은 헷갈리는 인자까지).
+
+폴백 순서도 그대로다: 인자 없음 → sudo, `-A`/`-n`/`-S` → sudo, `SUDO_POP_RUN0=0` → sudo,
+디스플레이 없음 → sudo, 런타임 디렉터리·심볼릭 링크 실패 → sudo. **run0 이 없거나 exec 에
+실패해도 sudo 로 떨어진다** — 팝업을 못 띄우는 것보다 sudo 를 못 쓰는 것이 훨씬 큰 문제다.
+
+askpass 모드도 돌아왔다. 창 코드는 에이전트와 **같은 것을 쓴다** (§5) — 대화가 한 번뿐이고
+답이 헬퍼 대신 sudo 가 읽는 fd 로 간다는 것만 다르다. 잠긴 계정이면 묻지 않고, 남은 시도가
+적으면 창에 경고를 띄운다.
 
 ---
 

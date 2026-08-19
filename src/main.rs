@@ -1,11 +1,17 @@
 //! sudo-pop — the password prompt for polkit, on Omarchy.
 //!
-//! Two modes, one binary:
+//! One binary, four modes, chosen by how it was invoked:
 //!
 //! ```text
-//! --agent-prompt   the child that draws one window and talks to the helper
-//! (anything else)  the agent: register with polkit, hand requests to children
+//! basename(argv[0]) == "askpass"   askpass mode (sudo calls us through a symlink)
+//! --agent                          the agent: register with polkit, hand requests on
+//! --agent-prompt                   the child that draws one window for the agent
+//! --init / --uninit                install mode
+//! anything else                    wrapper mode: sudo <args> arrives here
 //! ```
+//!
+//! The askpass check reads argv[0] rather than `current_exe`, because sudo
+//! reaches us through a symlink and `current_exe` resolves it away.
 //!
 //! The split is not decoration. winit allows one event loop per process, so a
 //! long-lived daemon cannot draw; and a long-lived process is exactly where a
@@ -22,15 +28,20 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, Proxy, connection};
 
 mod agent;
+mod askpass;
+mod attempts;
 mod font;
 mod init;
 mod gui;
 mod harden;
 mod helper;
 mod invocation;
+mod paths;
 mod prompt;
 mod secret;
+mod sudo_args;
 mod theme;
+mod wrapper;
 
 use agent::{Agent, Identity};
 
@@ -43,12 +54,6 @@ const LOGIND_PATH: &str = "/org/freedesktop/login1";
 const LOGIND_IFACE: &str = "org.freedesktop.login1.Manager";
 
 const AGENT_PATH: &str = "/org/minsoft1115/sudo_pop/AuthenticationAgent";
-
-/// Prompts allowed for one cookie, out of the ten faillock would give.
-///
-/// A child is spawned per cookie and owns the retry loop, so this is per
-/// request without the daemon keeping any state.
-pub const MAX_ATTEMPTS: u32 = 3;
 
 /// Set when one request has been handled end to end, so a spike run can stop
 /// holding the seat by itself.
@@ -215,16 +220,29 @@ async fn unregister(conn: &Connection, session: &str) -> zbus::Result<()> {
         .await
 }
 
+/// Link basename that selects askpass mode. Must match `paths::ASKPASS_LINK`.
+const ASKPASS_ARGV0: &str = "askpass";
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // The child that draws the window and talks to the helper. Checked before
-    // anything else so it never touches the bus.
-    match std::env::args().nth(1).as_deref() {
+    // args_os throughout: command arguments may be non-UTF-8 paths and must
+    // reach sudo byte for byte.
+    let mut argv = std::env::args_os();
+    let argv0 = argv.next().unwrap_or_default();
+    let args: Vec<std::ffi::OsString> = argv.collect();
+
+    if paths::basename(&argv0) == std::ffi::OsStr::new(ASKPASS_ARGV0) {
+        // sudo passes the prompt it would have printed as the only argument.
+        askpass::run(args.into_iter().next());
+    }
+
+    match args.first().and_then(|a| a.to_str()) {
+        Some("--agent") => async_io::block_on(run()),
         Some("--agent-prompt") => prompt::run(),
         Some("--init") => init::run(false),
         Some("--uninit") => init::run(true),
-        _ => {}
+        // Everything else is a sudo command line.
+        _ => wrapper::run(&args),
     }
-    async_io::block_on(run())
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {

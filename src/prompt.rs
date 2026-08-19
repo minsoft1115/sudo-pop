@@ -14,7 +14,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use crate::gui::{self, FromUi, Subject, ToUi};
 use crate::helper::{self, Conversation, Outcome};
 use crate::secret::Secret;
-use crate::{MAX_ATTEMPTS, harden, invocation};
+use crate::attempts::MAX_ATTEMPTS;
+use crate::{harden, invocation};
 
 /// Exit codes. The daemon turns these back into a D-Bus answer, so the
 /// distinction between "failed" and "cancelled" matters: reporting a refusal

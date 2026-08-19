@@ -16,6 +16,37 @@ use std::os::unix::ffi::OsStringExt;
 /// Longest command shown before it is cut short.
 const MAX_DISPLAY_CHARS: usize = 120;
 
+/// The command sudo is about to run, read from our parent.
+///
+/// The askpass path has no polkit details to consult: sudo forks us and its own
+/// command line is `sudo -A <command>`. `/proc/<pid>/cmdline` stays world
+/// readable even for a setuid process, so no extra channel is needed.
+pub fn command_from_sudo() -> Option<String> {
+    // SAFETY: getppid cannot fail.
+    let parent = unsafe { libc::getppid() } as u32;
+    let raw = std::fs::read(format!("/proc/{parent}/cmdline")).ok()?;
+    let argv: Vec<OsString> = raw
+        .split(|&b| b == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| OsString::from_vec(part.to_vec()))
+        .collect();
+
+    // Only trust a parent that really is sudo; anything else means we are not
+    // in the flow this is meant to describe.
+    let program = argv.first()?;
+    if std::path::Path::new(program).file_name()? != std::ffi::OsStr::new("sudo") {
+        return None;
+    }
+
+    let start = crate::sudo_args::command_start(&argv[1..])? + 1;
+    let command = argv[start..]
+        .iter()
+        .map(|a| a.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!command.is_empty()).then(|| shorten(&command))
+}
+
 /// The command behind an authentication request, or `None` when it cannot be
 /// established. Showing nothing is better than showing a guess.
 pub fn command_of(pid: u32) -> Option<String> {

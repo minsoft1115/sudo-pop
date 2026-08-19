@@ -1,13 +1,14 @@
 //! Install mode: wiring the agent into the session.
 //!
-//! Two things get written, both under $HOME and both inside markers so they can
+//! Three things get written, all under $HOME and all inside markers so they can
 //! be found and taken back out exactly:
 //!
-//!   ~/.config/minsoft1115/hypr/sudo-pop.lua      window rules for the prompt
+//!   ~/.config/minsoft1115/hypr/sudo-pop.lua        window rules for the prompt
 //!   ~/.config/systemd/user/sudo-pop-agent.service  what starts the agent
+//!   ~/.config/minsoft1115/bash/sudo-pop.sh         alias sudo='sudo-pop'
 //!
-//! No shell snippet. The sudo wrapper needed an alias; an agent is called by
-//! polkitd, not by the user, so ~/.bashrc is not our business any more.
+//! The snippet directory is shared with other tools, and so is the loader block
+//! that sources it. --uninit removes our file and leaves the loader alone.
 //!
 //! Everything is idempotent. Running --init twice must not append a second copy
 //! of anything, because the usual way people find a problem is by running the
@@ -26,6 +27,18 @@ const HYPR_BLOCK_END: &str = "-- sudo-pop:end";
 const HYPR_BLOCK_BODY: &str = r#"require("minsoft1115.hypr.sudo-pop")"#;
 
 const UNIT_NAME: &str = "sudo-pop-agent.service";
+
+/// Shell snippet, compiled in so one binary is the whole installer.
+const SHELL_SNIPPET: &str = include_str!("../assets/sudo-pop.sh");
+
+/// Marker for the loader that sources every snippet in the bash directory.
+/// Shared with the other tools in this config, so --uninit leaves it alone.
+const BASH_LOADER_BEGIN: &str = "# minsoft1115-bash:begin";
+const BASH_LOADER_END: &str = "# minsoft1115-bash:end";
+const BASH_LOADER_BODY: &str = r#"for __minsoft1115_rc in "$HOME/.config/minsoft1115/bash"/*.sh; do
+  [ -r "$__minsoft1115_rc" ] && . "$__minsoft1115_rc"
+done
+unset __minsoft1115_rc"#;
 
 /// Agents that would already hold the seat. polkit allows exactly one per
 /// session, so ours cannot start while any of these runs.
@@ -46,7 +59,7 @@ fn unit_body(exe: &Path) -> String {
          \n\
          [Service]\n\
          Type=exec\n\
-         ExecStart={}\n\
+         ExecStart={} --agent\n\
          Restart=on-failure\n\
          RestartSec=2\n\
          \n\
@@ -83,8 +96,11 @@ impl Layout {
     fn unit(&self) -> PathBuf {
         self.config.join("systemd/user").join(UNIT_NAME)
     }
-    fn home(&self) -> &Path {
-        &self.home
+    fn shell_snippet(&self) -> PathBuf {
+        self.config.join("minsoft1115/bash/sudo-pop.sh")
+    }
+    fn rc_files(&self) -> [PathBuf; 2] {
+        [self.home.join(".bashrc"), self.home.join(".zshrc")]
     }
 }
 
@@ -114,7 +130,12 @@ pub fn run(uninstall: bool) -> ! {
 }
 
 fn install_all(layout: &Layout) -> io::Result<()> {
-    // Window rules first: the agent may be asked to draw the moment it starts.
+    // The alias, so `sudo` reaches the router (plain commands go to run0, the
+    // rest keep sudo's meaning and get their password from our own window).
+    write_snippet(&layout.shell_snippet(), SHELL_SNIPPET)?;
+    install_loader(layout)?;
+
+    // Window rules: the agent may be asked to draw the moment it starts.
     write_snippet(&layout.hypr_snippet(), HYPR_SNIPPET)?;
     let hypr = layout.hypr_config();
     if hypr.exists() {
@@ -165,12 +186,54 @@ fn install_all(layout: &Layout) -> io::Result<()> {
     if systemctl(&["enable", "--now", UNIT_NAME]) {
         println!("enabled and started {UNIT_NAME}");
     }
+    // enable --now leaves an already-running agent on the old binary.
+    if unit_active() {
+        systemctl(&["restart", UNIT_NAME]);
+    }
     println!("\nDone. Privileged prompts in this session now come from sudo-pop.");
-    let _ = layout.home();
+    println!("Open a new shell, or: source ~/.bashrc");
     Ok(())
 }
 
+/// Make sure some shell sources the snippet directory.
+///
+/// The loader block is usually already there from another tool, in which case
+/// dropping the snippet in is all it takes and no rc file is touched.
+fn install_loader(layout: &Layout) -> io::Result<()> {
+    let mut wired = false;
+    for rc in layout.rc_files() {
+        if !rc.exists() {
+            continue;
+        }
+        if add_block(&rc, BASH_LOADER_BEGIN, BASH_LOADER_END, BASH_LOADER_BODY)? {
+            println!("added the snippet loader to {}", rc.display());
+        } else {
+            println!("snippet loader already present in {}", rc.display());
+        }
+        wired = true;
+    }
+    if !wired {
+        println!("note: no ~/.bashrc or ~/.zshrc found — add this to your shell config:");
+        println!("  alias sudo='sudo-pop'");
+    }
+    Ok(())
+}
+
+fn unit_active() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", UNIT_NAME])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 fn uninstall_all(layout: &Layout) -> io::Result<()> {
+    let snippet = layout.shell_snippet();
+    match fs::remove_file(&snippet) {
+        Ok(()) => println!("removed {}", snippet.display()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
     systemctl(&["disable", "--now", UNIT_NAME]);
     let unit = layout.unit();
     match fs::remove_file(&unit) {
@@ -195,6 +258,7 @@ fn uninstall_all(layout: &Layout) -> io::Result<()> {
 
     println!("\nUninstalled. Whatever agent was there before takes over again;");
     println!("with none, polkit falls back to asking in the terminal.");
+    println!("The shared snippet loader was left in place — other tools use it.");
     Ok(())
 }
 
