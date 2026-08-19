@@ -21,29 +21,15 @@
 //! See docs/polkit-agent.md.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use futures_lite::StreamExt;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, Proxy, connection};
 
-mod agent;
-mod askpass;
-mod attempts;
-mod font;
-mod init;
-mod gui;
-mod harden;
-mod helper;
-mod invocation;
-mod paths;
-mod prompt;
-mod secret;
-mod sudo_args;
-mod theme;
-mod wrapper;
+use sudo_pop::{HANDLED, agent, init, prompt, wrapper, paths, askpass};
 
-use agent::{Agent, Identity};
+use agent::Agent;
 
 const POLKIT_SERVICE: &str = "org.freedesktop.PolicyKit1";
 const POLKIT_PATH: &str = "/org/freedesktop/PolicyKit1/Authority";
@@ -55,60 +41,8 @@ const LOGIND_IFACE: &str = "org.freedesktop.login1.Manager";
 
 const AGENT_PATH: &str = "/org/minsoft1115/sudo_pop/AuthenticationAgent";
 
-/// Set when one request has been handled end to end, so a spike run can stop
-/// holding the seat by itself.
-pub static HANDLED: AtomicBool = AtomicBool::new(false);
 
-/// Wall clock, for lining our log up against what the caller saw.
-pub fn stamp() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let secs = now % 86400;
-    format!(
-        "{:02}:{:02}:{:02}",
-        (secs / 3600 + 9) % 24,
-        (secs / 60) % 60,
-        secs % 60
-    )
-}
 
-/// Account name for a uid, for the helper preamble.
-fn username(uid: u32) -> Option<String> {
-    // SAFETY: getpwuid returns a pointer into a static buffer, read at once.
-    unsafe {
-        let pw = libc::getpwuid(uid);
-        if pw.is_null() {
-            return None;
-        }
-        std::ffi::CStr::from_ptr((*pw).pw_name)
-            .to_str()
-            .ok()
-            .map(str::to_owned)
-    }
-}
-
-/// The identity to authenticate: ours if polkit offers it, otherwise the first.
-pub fn choose_identity(identities: &[Identity]) -> Option<(u32, String)> {
-    // SAFETY: getuid cannot fail.
-    let me = unsafe { libc::getuid() };
-    let mut first = None;
-    for (kind, attrs) in identities {
-        if kind != "unix-user" {
-            continue;
-        }
-        let Some(uid) = attrs.get("uid").and_then(|v| u32::try_from(v).ok()) else {
-            continue;
-        };
-        let name = username(uid)?;
-        if uid == me {
-            return Some((uid, name));
-        }
-        first.get_or_insert((uid, name));
-    }
-    first
-}
 
 /// Ask a property of one object, as a string.
 async fn get_string(

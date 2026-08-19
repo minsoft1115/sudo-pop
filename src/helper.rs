@@ -25,6 +25,23 @@ const HELPERS: [&str; 2] = [
     "/usr/libexec/polkit-1/polkit-agent-helper-1",
 ];
 
+/// Both doors can be pointed elsewhere, which is how the protocol is tested
+/// without a real PAM stack -- and the only way to exercise the fork fallback
+/// on a kernel whose socket helper always works.
+fn socket_path() -> String {
+    std::env::var("SUDO_POP_HELPER_SOCKET").unwrap_or_else(|_| SOCKET.to_owned())
+}
+
+fn helper_binary() -> Option<String> {
+    if let Ok(path) = std::env::var("SUDO_POP_HELPER_BIN") {
+        return std::path::Path::new(&path).exists().then_some(path);
+    }
+    HELPERS
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|p| (*p).to_owned())
+}
+
 /// How one attempt ended.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Outcome {
@@ -57,7 +74,7 @@ struct Channel {
 
 impl Channel {
     fn socket(username: &str, cookie: &str) -> std::io::Result<Self> {
-        let stream = UnixStream::connect(SOCKET)?;
+        let stream = UnixStream::connect(socket_path())?;
         let reader = BufReader::new(stream.try_clone()?);
         let mut writer = stream;
         write!(writer, "{username}\n{cookie}\n")?;
@@ -70,9 +87,7 @@ impl Channel {
     }
 
     fn fork(username: &str, cookie: &str) -> std::io::Result<Self> {
-        let path = HELPERS
-            .iter()
-            .find(|p| std::path::Path::new(p).exists())
+        let path = helper_binary()
             .ok_or_else(|| std::io::Error::other("no polkit-agent-helper-1 on this system"))?;
 
         let mut child = Command::new(path)
@@ -179,7 +194,7 @@ fn attempt(channel: std::io::Result<Channel>, conv: &mut dyn Conversation) -> Ou
 /// another door: that is exactly how the socket helper fails on a kernel that
 /// cannot pass a pidfd.
 pub fn authenticate(username: &str, cookie: &str, conv: &mut dyn Conversation) -> Outcome {
-    let socket_reachable = std::path::Path::new(SOCKET).exists();
+    let socket_reachable = std::path::Path::new(&socket_path()).exists();
 
     if socket_reachable {
         match attempt(Channel::socket(username, cookie), conv) {

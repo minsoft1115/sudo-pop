@@ -964,3 +964,57 @@ askpass 모드도 돌아왔다. 창 코드는 에이전트와 **같은 것을 �
 
 루트의 `install.sh` 는 **`old/install.sh` 로 넘기는 한 줄짜리**다. `omarchy-setup` 이 이 파일을
 이름으로 부르기 때문이고, 새 빌드가 자리를 잡으면 지운다.
+
+---
+
+## 15. 시험
+
+세 층으로 나뉜다. 위로 갈수록 환경을 더 요구하고, 아래로 갈수록 자주 돌린다.
+
+```
+cargo test                  24 단위 + 9 통합 — 환경 없이 돈다
+tests/scenarios.sh          27 시나리오 — polkitd·버스·컴포지터가 필요하다
+tests/scenarios.sh --with-password   위 + 사람이 비밀번호를 넣는 한 케이스
+```
+
+### 단위·통합 (`cargo test`)
+
+`tests/fake-helper.sh` 가 `polkit-agent-helper-1` 행세를 한다. `SUDO_POP_HELPER_BIN` 과
+`SUDO_POP_HELPER_SOCKET` 으로 두 문을 다른 곳에 걸 수 있어서, **PAM 도 비밀번호도 root 도
+없이** 대화의 갈래를 전부 돌린다.
+
+| 잡는 것 | |
+|---|---|
+| 성공·오답·`ECHO_ON`·`TEXT_INFO`·`ERROR_MSG` | 줄 프로토콜의 각 태그 |
+| **프롬프트 전 `FAILURE` 는 실패가 아니라 거절** | 이걸 틀리면 창이 무한히 다시 뜬다 (§3-3) |
+| **창을 닫으면 취소** | 오답으로 세면 faillock 을 태운다 |
+| **소켓이 조용히 닫히면 fork 로 폴백** | 이 커널에서는 실물로 재현이 안 되는 경로다 (§3-6) |
+| 헬퍼에 사용자·쿠키가 전달되고, 쿠키는 argv 가 아니라 stdin 으로 | |
+| 라우팅 판정 — 옵션·환경 할당·`--`·`-name=x` | `sudo VAR=1` 이 run0 로 새면 변수가 사라진다 |
+
+### 시나리오 (`tests/scenarios.sh`)
+
+Hyprland 와 실제 polkitd 를 시험 장비로 쓴다. 세션을 원래대로 돌려놓고 끝난다 —
+중간에 실패하거나 끊겨도 마찬가지다.
+
+`hl.dsp.send_shortcut` 으로 **Esc 를 창에 주입**할 수 있어서, 사용자가 취소하는 경로까지
+자동으로 돈다 (비밀번호가 필요 없다). `hyprctl clients` 로 창 규칙(floating·pin·크기)을
+확인하고, `grim` + `identify` 로 화면 캡처 제외를 센다.
+
+보안 쪽에서 자동으로 확인하는 것:
+
+| | 어떻게 |
+|---|---|
+| 폴킷이 아닌 발신자는 거절되고 **창도 안 뜬다** | `busctl` 로 직접 호출 |
+| 쿠키가 argv 에 없다 | 자식의 `/proc/<pid>/cmdline` |
+| **자식의 `environ` 을 읽을 수 없다** | `PR_SET_DUMPABLE=0` 이면 `/proc` 항목이 잠긴다 |
+| 코어덤프 한도가 0 | `/proc/<pid>/limits` |
+| 비밀번호 버퍼가 메모리에 잠겨 있다 | `/proc/<pid>/status` 의 `VmLck` |
+| **화면 캡처에 안 찍힌다** | 같은 자리를 찍어 색 수를 센다 — 규칙을 빼면 **1101색**, 걸면 **4색** |
+| 요청이 겹쳐도 창은 하나 | 두 요청을 동시에 넣고 센다 |
+| `--uninit` 이 남의 것을 안 지운다 | 공유 로더 블록이 남아 있는지, `hyprland.lua` 의 다른 줄이 그대로인지 |
+
+### 사람이 있어야 하는 것
+
+성공 경로 하나뿐이다. `--with-password` 를 주면 **foot 창을 띄워** 거기서 입력받고,
+`run0` 이 실제로 명령을 실행했는지(`exit=0`)까지 본다.
