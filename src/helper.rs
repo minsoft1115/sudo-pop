@@ -232,3 +232,32 @@ pub fn authenticate(username: &str, cookie: &str, conv: &mut dyn Conversation) -
     }
     attempt(Channel::fork(username, cookie), conv)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tag_splits_off_its_body_on_the_first_space() {
+        assert_eq!(
+            split_tag("PAM_PROMPT_ECHO_OFF Password:"),
+            ("PAM_PROMPT_ECHO_OFF", "Password:")
+        );
+        assert_eq!(
+            split_tag("PAM_TEXT_INFO Place your finger"),
+            ("PAM_TEXT_INFO", "Place your finger")
+        );
+    }
+
+    #[test]
+    fn a_bare_tag_has_an_empty_body() {
+        assert_eq!(split_tag("SUCCESS"), ("SUCCESS", ""));
+        assert_eq!(split_tag("FAILURE"), ("FAILURE", ""));
+    }
+
+    #[test]
+    fn only_the_first_space_is_the_separator() {
+        // The protocol drops exactly one space; any extra belongs to the body.
+        assert_eq!(split_tag("PAM_ERROR_MSG  two spaces"), ("PAM_ERROR_MSG", " two spaces"));
+    }
+}

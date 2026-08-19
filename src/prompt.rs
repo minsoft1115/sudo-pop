@@ -53,6 +53,29 @@ impl Conversation for WindowConversation {
     }
 }
 
+/// Drive up to `MAX_ATTEMPTS` authentications, re-prompting after a wrong
+/// password and stopping on anything else. The cap is per cookie, so this is
+/// where "three tries then give up" for one request lives.
+///
+/// `authenticate` is a parameter so the loop can be tested without a helper, a
+/// window, or a password.
+fn run_attempts(
+    conv: &mut dyn Conversation,
+    mut authenticate: impl FnMut(&mut dyn Conversation) -> Outcome,
+) -> Outcome {
+    let mut last = Outcome::Failed;
+    for attempt in 1..=MAX_ATTEMPTS {
+        last = authenticate(conv);
+        match last {
+            // PAM already said its piece; this is the one word the window needs
+            // before asking again.
+            Outcome::Failed if attempt < MAX_ATTEMPTS => conv.error("Wrong"),
+            _ => break,
+        }
+    }
+    last
+}
+
 /// Entry point for prompt mode. Never returns.
 pub fn run() -> ! {
     harden::apply();
@@ -105,18 +128,9 @@ pub fn run() -> ! {
         if let Some(text) = warning {
             let _ = to_ui_tx.send(ToUi::Error(text));
         }
-        let mut last = Outcome::Failed;
-        for attempt in 1..=MAX_ATTEMPTS {
-            last = helper::authenticate(&username, &cookie, &mut conv);
-            match last {
-                Outcome::Failed if attempt < MAX_ATTEMPTS => {
-                    // PAM already said its piece; this is the one word the
-                    // window needs before asking again.
-                    conv.error("Wrong");
-                }
-                _ => break,
-            }
-        }
+        let last = run_attempts(&mut conv, |conv| {
+            helper::authenticate(&username, &cookie, conv)
+        });
         let _ = to_ui_tx.send(ToUi::Done);
         last
     });
@@ -141,4 +155,68 @@ pub fn run() -> ! {
         Outcome::Failed => EXIT_FAILED,
         Outcome::Cancelled | Outcome::RefusedWithoutPrompt => EXIT_CANCELLED,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records what the window was told; answers nothing (the scripted
+    /// `authenticate` never asks it to).
+    struct Rec {
+        errors: Vec<String>,
+    }
+    impl Conversation for Rec {
+        fn ask(&mut self, _prompt: &str, _echo: bool) -> Option<Secret> {
+            None
+        }
+        fn info(&mut self, _text: &str) {}
+        fn error(&mut self, text: &str) {
+            self.errors.push(text.to_owned());
+        }
+    }
+
+    /// Run the loop against a fixed list of outcomes, counting the attempts.
+    fn drive(outcomes: Vec<Outcome>) -> (Outcome, usize, Rec) {
+        let mut rec = Rec { errors: Vec::new() };
+        let mut it = outcomes.into_iter();
+        let mut calls = 0;
+        let last = run_attempts(&mut rec, |_conv| {
+            calls += 1;
+            it.next().expect("run_attempts asked more times than scripted")
+        });
+        (last, calls, rec)
+    }
+
+    #[test]
+    fn a_right_answer_stops_after_one_attempt() {
+        let (last, calls, rec) = drive(vec![Outcome::Success]);
+        assert_eq!(last, Outcome::Success);
+        assert_eq!(calls, 1);
+        assert!(rec.errors.is_empty(), "no retry, so no 'Wrong'");
+    }
+
+    #[test]
+    fn a_cancel_stops_immediately() {
+        let (last, calls, _) = drive(vec![Outcome::Cancelled]);
+        assert_eq!(last, Outcome::Cancelled);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn wrong_then_right_retries_once() {
+        let (last, calls, rec) = drive(vec![Outcome::Failed, Outcome::Success]);
+        assert_eq!(last, Outcome::Success);
+        assert_eq!(calls, 2);
+        assert_eq!(rec.errors, vec!["Wrong".to_owned()]);
+    }
+
+    #[test]
+    fn three_wrong_answers_stop_at_the_cap() {
+        let (last, calls, rec) = drive(vec![Outcome::Failed; MAX_ATTEMPTS as usize]);
+        assert_eq!(last, Outcome::Failed);
+        assert_eq!(calls, MAX_ATTEMPTS as usize, "no fourth prompt");
+        // "Wrong" between attempts, but not after the final one.
+        assert_eq!(rec.errors.len(), (MAX_ATTEMPTS - 1) as usize);
+    }
 }

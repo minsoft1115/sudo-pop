@@ -55,6 +55,26 @@ impl Agent {
         let expected = self.polkitd.lock().ok();
         matches!((sender, expected), (Some(s), Some(e)) if s == e.as_str())
     }
+
+    /// Remember a cookie cancelled before its request started, so the queued
+    /// begin_authentication can end without drawing. Bounded so a stream of
+    /// cancels for cookies that never begin cannot grow it without limit.
+    fn remember_cancelled(&self, cookie: String) {
+        if let Ok(mut set) = self.cancelled.lock() {
+            if set.len() > 256 {
+                set.clear();
+            }
+            set.insert(cookie);
+        }
+    }
+
+    /// Consume a pending cancel for `cookie`, returning whether there was one.
+    fn take_cancelled(&self, cookie: &str) -> bool {
+        self.cancelled
+            .lock()
+            .map(|mut set| set.remove(cookie))
+            .unwrap_or(false)
+    }
 }
 
 /// Per-request tracing goes to the journal, so it is off unless asked for.
@@ -134,12 +154,7 @@ impl Agent {
 
         // A cancel may have arrived while this waited its turn. If so, end it
         // now rather than opening a window for a request polkitd has dropped.
-        if self
-            .cancelled
-            .lock()
-            .map(|mut set| set.remove(&cookie))
-            .unwrap_or(false)
-        {
+        if self.take_cancelled(&cookie) {
             if tracing() {
                 println!("  cancelled before it started");
             }
@@ -149,9 +164,7 @@ impl Agent {
         let code = self.ask(&name, &cookie, subject_pid, &message).await;
 
         // Drop any late cancel marker so the set cannot grow without bound.
-        if let Ok(mut set) = self.cancelled.lock() {
-            set.remove(&cookie);
-        }
+        let _ = self.take_cancelled(&cookie);
 
         if tracing() {
             println!(
@@ -196,12 +209,7 @@ impl Agent {
         }
         // Not started yet (still queued) or already gone. Remember it so the
         // queued begin_authentication ends without a window when its turn comes.
-        if let Ok(mut set) = self.cancelled.lock() {
-            if set.len() > 256 {
-                set.clear();
-            }
-            set.insert(cookie);
-        }
+        self.remember_cancelled(cookie);
         if tracing() {
             println!("  nothing running yet; marked cancelled");
         }
@@ -292,5 +300,24 @@ mod tests {
         assert!(is_ok_exit(prompt::EXIT_CANCELLED));
         assert!(!is_ok_exit(prompt::EXIT_FAILED), "a real failure is a D-Bus error");
         assert!(!is_ok_exit(42), "an unexpected code is a D-Bus error");
+    }
+
+    #[test]
+    fn a_cancel_before_start_is_remembered_then_consumed_once() {
+        let agent = Agent::new(":1.12".to_owned(), false);
+        agent.remember_cancelled("c1".to_owned());
+        assert!(agent.take_cancelled("c1"), "the queued request sees the cancel");
+        assert!(!agent.take_cancelled("c1"), "and it is consumed, not sticky");
+        assert!(!agent.take_cancelled("never"), "an unknown cookie was not cancelled");
+    }
+
+    #[test]
+    fn the_cancelled_set_stays_bounded() {
+        let agent = Agent::new(":1.12".to_owned(), false);
+        for i in 0..300 {
+            agent.remember_cancelled(format!("c{i}"));
+        }
+        let len = agent.cancelled.lock().unwrap().len();
+        assert!(len <= 257, "the set must not grow without bound, was {len}");
     }
 }
