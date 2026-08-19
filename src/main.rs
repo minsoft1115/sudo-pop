@@ -16,6 +16,9 @@ use zbus::blocking::{Connection, Proxy, connection};
 use zbus::interface;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
+mod helper;
+use helper::{Conversation, Outcome};
+
 const POLKIT_SERVICE: &str = "org.freedesktop.PolicyKit1";
 const POLKIT_PATH: &str = "/org/freedesktop/PolicyKit1/Authority";
 const POLKIT_IFACE: &str = "org.freedesktop.PolicyKit1.Authority";
@@ -29,12 +32,80 @@ const AGENT_PATH: &str = "/org/minsoft1115/sudo_pop/AuthenticationAgent";
 /// An identity polkit will accept, as it comes off the wire.
 type Identity = (String, HashMap<String, OwnedValue>);
 
-struct Agent;
+/// Prompts allowed for one cookie, out of the ten faillock would give. Carried
+/// over from the sudo path: one authentication request is one command.
+const MAX_ATTEMPTS: u32 = 3;
+
+struct Agent {
+    /// Unique bus name polkitd owns. Anything else calling us is not polkit.
+    polkitd: String,
+}
+
+/// Spike-only conversation: the terminal. The real one is a window.
+struct Terminal;
+
+impl Conversation for Terminal {
+    fn ask(&mut self, prompt: &str, echo: bool) -> Option<String> {
+        use std::io::Write;
+        print!("  [{}] {prompt} ", if echo { "echo" } else { "hidden" });
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line.trim_end_matches('\n').to_string()),
+        }
+    }
+    fn info(&mut self, text: &str) {
+        println!("  info : {text}");
+    }
+    fn error(&mut self, text: &str) {
+        println!("  error: {text}");
+    }
+}
+
+/// Account name for a uid, for the helper preamble.
+fn username(uid: u32) -> Option<String> {
+    // SAFETY: getpwuid returns a pointer into a static buffer, read at once.
+    unsafe {
+        let pw = libc::getpwuid(uid);
+        if pw.is_null() {
+            return None;
+        }
+        std::ffi::CStr::from_ptr((*pw).pw_name)
+            .to_str()
+            .ok()
+            .map(str::to_owned)
+    }
+}
+
+/// The identity to authenticate: ours if polkit offers it, otherwise the first.
+fn choose_identity(identities: &[Identity]) -> Option<(u32, String)> {
+    // SAFETY: getuid cannot fail.
+    let me = unsafe { libc_getuid() };
+    let mut first = None;
+    for (kind, attrs) in identities {
+        if kind != "unix-user" {
+            continue;
+        }
+        let Some(uid) = attrs.get("uid").and_then(|v| u32::try_from(v).ok()) else {
+            continue;
+        };
+        let name = username(uid)?;
+        if uid == me {
+            return Some((uid, name));
+        }
+        first.get_or_insert((uid, name));
+    }
+    first
+}
 
 #[interface(name = "org.freedesktop.PolicyKit1.AuthenticationAgent")]
 impl Agent {
-    /// Log everything and refuse. A spike must not be able to authenticate
-    /// anything, and refusing is also the honest answer while there is no UI.
+    /// Log what came in, check who sent it, then run the helper conversation.
+    ///
+    /// Spike 2 asks on the terminal rather than in a window. Everything else --
+    /// sender check, identity choice, retry budget, how the request ends -- is
+    /// what the real agent does.
     #[allow(clippy::too_many_arguments)]
     fn begin_authentication(
         &self,
@@ -56,7 +127,47 @@ impl Agent {
         for (kind, attrs) in &identities {
             println!("  identity   : {kind} {:?}", attrs.keys().collect::<Vec<_>>());
         }
-        Err(zbus::fdo::Error::Failed("spike: no UI yet".into()))
+
+        // Only polkit may ask us to prompt. Without this check any process on
+        // the bus can put an attacker-worded dialog on screen, learn whether
+        // the password was right, and burn the shared faillock budget.
+        match header.sender() {
+            Some(sender) if sender.as_str() == self.polkitd => {}
+            other => {
+                println!("  REJECTED: sender {other:?} is not polkitd ({})", self.polkitd);
+                return Err(zbus::fdo::Error::AccessDenied("not polkit".into()));
+            }
+        }
+
+        let Some((uid, name)) = choose_identity(&identities) else {
+            println!("  no usable identity");
+            return Err(zbus::fdo::Error::Failed("no usable identity".into()));
+        };
+        println!("  chosen     : {name} (uid {uid})");
+
+        let mut conv = Terminal;
+        for attempt in 1..=MAX_ATTEMPTS {
+            println!("  -- attempt {attempt}/{MAX_ATTEMPTS} --");
+            match helper::authenticate(&name, &cookie, &mut conv) {
+                Outcome::Success => {
+                    println!("  SUCCESS");
+                    return Ok(());
+                }
+                Outcome::Cancelled => {
+                    println!("  cancelled by the user");
+                    // Cancelling ends the request normally: an error would have
+                    // polkitd hand it straight back to us.
+                    return Ok(());
+                }
+                Outcome::RefusedWithoutPrompt => {
+                    println!("  refused before any prompt (locked account or broken stack)");
+                    return Ok(());
+                }
+                Outcome::Failed => continue,
+            }
+        }
+        println!("  out of attempts");
+        Err(zbus::fdo::Error::Failed("authentication failed".into()))
     }
 
     fn cancel_authentication(&self, cookie: String) {
@@ -139,9 +250,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("session id  : {session}  (found by {how})");
 
     let conn = connection::Builder::system()?
-        .serve_at(AGENT_PATH, Agent)?
+        .serve_at(AGENT_PATH, Agent { polkitd: owner.clone() })?
         .build()?;
     println!("agent object: {AGENT_PATH}");
+    if let Some(me) = conn.unique_name() {
+        println!("our bus name: {me}");
+    }
 
     let authority = Proxy::new(&conn, POLKIT_SERVICE, ObjectPath::try_from(POLKIT_PATH)?, POLKIT_IFACE)?;
     let mut subject_details: HashMap<&str, Value> = HashMap::new();

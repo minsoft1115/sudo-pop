@@ -321,6 +321,36 @@ identity   : unix-user { uid }
 거절했을 때 `run0` 은 `Failed to start transient service unit: Access denied` 로 즉시
 끝났다(exit 1). 매달리지 않는다. 비밀번호를 묻지 않았으므로 faillock 도 건드리지 않았다.
 
+### 3-6. 헬퍼 왕복 — 스파이크 2 기록
+
+터미널에서 묻는 스텁으로 `run0 true` 를 끝까지 돌려 봤다. **오답만 넣었다** — 성공 경로는
+사람이 직접 쳐야 해서 남겨 뒀다.
+
+```
+chosen : lmh (uid 1000)
+-- attempt 1/3 --  [hidden] Password:
+-- attempt 2/3 --  [hidden] Password:
+-- attempt 3/3 --  [hidden] Password:
+out of attempts                      → Error.Failed → run0: "Access denied"
+```
+
+| 확인된 것 | |
+|---|---|
+| 소켓 헬퍼 | `/run/polkit/agent-helper.socket` 에 `사용자이름\n쿠키\n` 을 보내니 **프롬프트가 왔다.** 이 커널은 pidfd 를 주므로 fork 폴백까지 가지 않았다 — 폴백은 그대로 두되, **이 머신에서는 검증되지 않은 경로**다 |
+| 줄 프로토콜 | `PAM_PROMPT_ECHO_OFF Password:` → 답 → `FAILURE`. 태그와 본문 사이 공백 하나 규칙대로 |
+| 신원 | `unix-user` 의 `uid` → `getpwuid` → `lmh`. 현재 사용자 우선(§3-2)이 그대로 맞았다 |
+| 재시도 | 헬퍼는 시도마다 죽는다. 새로 띄우면 다시 묻는다. **3회에서 정확히 멈춘다** (§4-1) |
+| 발신자 거절 | `busctl` 로 폴킷이 아닌 곳에서 직접 부르니 **창을 띄우기 전에 `Access denied`** (§3-4) |
+| `details` 키 순서 | 실행마다 다르다. 맵이므로 당연하지만 **순서에 의존해 파싱하지 말 것** |
+
+**faillock 산수를 바로잡는다.** 오답 3회가 `SVC polkit-1` 로 공용 tally 에 쌓였고,
+`unlock_time=120` 은 **잠긴 뒤 풀리기까지의 시간이지 실패가 쌓이는 창이 아니다.** 실측에서
+3분이 지나도 항목이 `V`(유효)로 남아 있었다. 즉 테스트로 태운 실패는 한참 남고,
+`deny=10` 까지의 거리도 그만큼 오래 좁아진 채로 있다. 쿠키 단위 상한(§4-1)이 없으면
+요청 몇 번으로 계정이 잠긴다는 뜻이다.
+
+정리는 `faillock --reset` 으로 된다 — tally 파일이 사용자 소유라 root 가 필요 없다.
+
 ---
 
 ## 4. 구조 — 비밀번호는 데몬을 통과하지 않는다
