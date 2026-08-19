@@ -42,11 +42,12 @@ unset __minsoft1115_rc"#;
 
 /// Agents that would already hold the seat. polkit allows exactly one per
 /// session, so ours cannot start while any of these runs.
-const KNOWN_AGENTS: [&str; 4] = [
+const KNOWN_AGENTS: [&str; 5] = [
     "hyprpolkitagent",
     "polkit-gnome-authentication-agent-1",
     "polkit-kde-authentication-agent-1",
     "lxpolkit",
+    "mate-polkit",
 ];
 
 fn unit_body(exe: &Path) -> String {

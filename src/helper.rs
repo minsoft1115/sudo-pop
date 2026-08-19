@@ -28,18 +28,44 @@ const HELPERS: [&str; 2] = [
 /// Both doors can be pointed elsewhere, which is how the protocol is tested
 /// without a real PAM stack -- and the only way to exercise the fork fallback
 /// on a kernel whose socket helper always works.
+///
+/// The overrides are compiled in only for debug builds (`cargo test`). A
+/// release binary -- which is all install.sh ever builds -- never reads them,
+/// so an environment variable can never redirect the password to another path.
 fn socket_path() -> String {
-    std::env::var("SUDO_POP_HELPER_SOCKET").unwrap_or_else(|_| SOCKET.to_owned())
+    #[cfg(debug_assertions)]
+    if let Ok(path) = std::env::var("SUDO_POP_HELPER_SOCKET") {
+        return path;
+    }
+    SOCKET.to_owned()
 }
 
 fn helper_binary() -> Option<String> {
+    #[cfg(debug_assertions)]
     if let Ok(path) = std::env::var("SUDO_POP_HELPER_BIN") {
         return std::path::Path::new(&path).exists().then_some(path);
     }
+    // In production only a setuid-root helper is acceptable: the whole point of
+    // the fork door is to reach a binary that can run PAM as root, and exec'ing
+    // anything else here would hand it the password for nothing.
     HELPERS
         .iter()
-        .find(|p| std::path::Path::new(p).exists())
+        .find(|p| is_setuid_root(p))
         .map(|p| (*p).to_owned())
+}
+
+/// True if `path` is owned by root and carries the setuid bit.
+#[cfg(not(debug_assertions))]
+fn is_setuid_root(path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).is_ok_and(|md| md.uid() == 0 && md.mode() & 0o4000 != 0)
+}
+
+/// In debug builds the fork door is only ever pointed at the test helper, which
+/// is deliberately not setuid; the check would reject it.
+#[cfg(debug_assertions)]
+fn is_setuid_root(path: &str) -> bool {
+    std::path::Path::new(path).exists()
 }
 
 /// How one attempt ended.

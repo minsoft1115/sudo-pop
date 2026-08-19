@@ -75,6 +75,20 @@ trap cleanup EXIT INT TERM
 windows() { hyprctl clients -j 2>/dev/null | jq '[.[]|select(.class=="sudo-askpass")]|length'; }
 wait_window() { local i; for i in $(seq 1 40); do [ "$(windows)" -gt 0 ] && return 0; sleep 0.25; done; return 1; }
 
+# 화면 캡처 제외는 창의 열림 애니메이션이 끝난 뒤에야 안정된다. 여러 번 찍어
+# 최소 색 수를 본다 — 규칙이 걸리면 곧 4 색으로 떨어진다.
+min_colors() {
+  local geom="$1" c min=9999 i
+  for i in 1 2 3 4 5 6; do
+    grim -g "$geom" "$WORK/win.png" 2>/dev/null
+    c=$(identify -format "%k" "$WORK/win.png" 2>/dev/null || echo 9999)
+    [ "${c:-9999}" -lt "$min" ] && min=$c
+    [ "$min" -le 16 ] && break
+    sleep 0.4
+  done
+  echo "$min"
+}
+
 start_agent() {
   SUDO_POP_DEBUG=1 "$BIN" --agent >"$WORK/agent.log" 2>&1 &
   AGENT=$!
@@ -144,9 +158,8 @@ if [ -n "$AGENT" ]; then
       # 화면 공유 제외: 창 영역을 찍으면 비어 있어야 한다
       geom=$(hyprctl clients -j | jq -r '.[]|select(.class=="sudo-askpass")|"\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"' | head -1)
       if [ -n "$geom" ] && command -v grim >/dev/null && command -v identify >/dev/null; then
-        grim -g "$geom" "$WORK/win.png" 2>/dev/null
-        colors=$(identify -format "%k" "$WORK/win.png" 2>/dev/null || echo 9999)
         # 실측: 규칙을 빼면 같은 자리에서 1101 색, 걸면 4 색.
+        colors=$(min_colors "$geom")
         [ "${colors:-9999}" -le 16 ] \
           && ok "창이 화면 캡처에서 제외된다 (색 $colors 개)" \
           || bad "캡처에 내용이 찍힌다 (색 $colors 개)"
@@ -193,8 +206,7 @@ if wait_window; then
   # 화면 공유 제외: 창 영역을 찍으면 내용이 없어야 한다
   geom=$(echo "$win" | jq -r '"\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"')
   if command -v grim >/dev/null && command -v identify >/dev/null; then
-    grim -g "$geom" "$WORK/win.png" 2>/dev/null
-    colors=$(identify -format "%k" "$WORK/win.png" 2>/dev/null || echo 9999)
+    colors=$(min_colors "$geom")
     [ "${colors:-9999}" -le 16 ] && ok "창이 화면 캡처에서 제외된다 (색 $colors 개)" \
                                  || bad "캡처에 내용이 찍힌다 (색 $colors 개)"
   fi
@@ -221,7 +233,36 @@ kill $SUBJECT 2>/dev/null
 for p in $(agent_children); do kill "$p" 2>/dev/null; done
 
 # =============================================================================
-head_ "6. 설치 왕복"
+head_ "6. 잠긴 계정 게이팅 (C1)"
+# deny 는 /etc/security/faillock.conf(이 머신은 10) 에서 온다. 진짜 faillock 을
+# 태우면 sudo·로그인까지 잠기므로, tally 만 10 건으로 흉내 내는 가짜 faillock 을
+# PATH 앞에 두어 게이트만 격리한다. 실제 카운터는 건드리지 않는다.
+mkdir -p "$WORK/bin"
+cat >"$WORK/bin/faillock" <<'FAKE'
+#!/usr/bin/env bash
+# --reset 은 무시(가짜라 지울 게 없다). --user <name> 이면 잠긴 것처럼 V 행 10 건.
+for a in "$@"; do [ "$a" = "--reset" ] && exit 0; done
+printf '%s:
+' "${USER:-user}"
+printf 'When                Type  Source   Valid
+'
+for i in $(seq 1 10); do printf '2026-08-19 12:00:%02d RHOST test V
+' "$i"; done
+FAKE
+chmod +x "$WORK/bin/faillock"
+
+sleep 60 & LSUBJECT=$!
+( echo test-cookie | PATH="$WORK/bin:$PATH" SUDO_POP_USER="$USER"     SUDO_POP_SUBJECT_PID=$LSUBJECT SUDO_POP_MESSAGE=locked     "$BIN" --agent-prompt >"$WORK/locked.log" 2>&1; echo "exit=$?" >>"$WORK/locked.log" ) &
+sleep 2
+[ "$(windows)" = 0 ] && ok "잠긴 계정이면 창을 띄우지 않는다" || bad "창이 떴다"
+# 종료 코드 2(취소)여야 polkitd 가 요청을 되던지지 않는다. 1 이면 빈 창이 반복된다.
+grep -q "exit=2" "$WORK/locked.log" && ok "잠긴 계정은 종료 코드 2 (요청 정상 종료)"   || bad "종료 코드가 2 가 아니다" "$(cat "$WORK/locked.log")"
+grep -qi "lock" "$WORK/locked.log" && ok "잠긴 계정 안내를 남긴다" || bad "안내 메시지가 없다"
+kill $LSUBJECT 2>/dev/null
+for p in $(agent_children); do kill "$p" 2>/dev/null; done
+
+# =============================================================================
+head_ "7. 설치 왕복"
 cp ~/.config/hypr/hyprland.lua "$WORK/hl.before" 2>/dev/null
 "$BIN" --init >"$WORK/init2.log" 2>&1
 grep -q "already current" "$WORK/init2.log" && ok "--init 은 멱등하다" || bad "두 번째 --init 이 다시 쓴다"
@@ -239,7 +280,7 @@ fi
 # =============================================================================
 # 비밀번호가 필요한 케이스. 사람이 있어야 하므로 foot 창을 띄워 맡긴다.
 if [ "$WITH_PASSWORD" = 1 ]; then
-  head_ "7. 성공 경로 (직접 입력)"
+  head_ "8. 성공 경로 (직접 입력)"
   "$BIN" --init >/dev/null 2>&1
   omarchy-plugin-disable omarchy.polkit >/dev/null 2>&1; sleep 1
   systemctl --user restart sudo-pop-agent.service 2>/dev/null || start_agent

@@ -14,7 +14,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use crate::gui::{self, FromUi, Subject, ToUi};
 use crate::helper::{self, Conversation, Outcome};
 use crate::secret::Secret;
-use crate::attempts::MAX_ATTEMPTS;
+use crate::attempts::{self, MAX_ATTEMPTS};
 use crate::{harden, invocation};
 
 /// Exit codes. The daemon turns these back into a D-Bus answer, so the
@@ -81,6 +81,31 @@ pub fn run() -> ! {
         std::process::exit(EXIT_FAILED);
     }
 
+    // faillock is shared with sudo and login (deny=10), so a prompt spent on a
+    // locked account only burns everyone's budget. The live tally is also the
+    // cross-cookie cap: each request re-reads it, so repeated requests cannot
+    // hand out three fresh attempts each once the account is close to locking.
+    let budget = attempts::budget();
+    if let Some(budget) = &budget
+        && budget.is_locked()
+    {
+        // Report as cancelled, not failed: a failure has polkitd re-issue the
+        // request and the window would reopen forever (see helper.rs, §3-3).
+        match budget.unlock_in {
+            Some(secs) => eprintln!("sudo-pop: account locked, {secs}s to go"),
+            None => eprintln!("sudo-pop: account is locked out"),
+        }
+        std::process::exit(EXIT_CANCELLED);
+    }
+    let warning = budget.and_then(|budget| {
+        (budget.remaining < attempts::WARN_BELOW).then(|| {
+            format!(
+                "{} attempt(s) left before the account locks",
+                budget.remaining
+            )
+        })
+    });
+
     let (to_ui_tx, to_ui_rx) = channel::<ToUi>();
     let (from_ui_tx, from_ui_rx) = channel::<FromUi>();
 
@@ -89,6 +114,9 @@ pub fn run() -> ! {
             to_ui: to_ui_tx.clone(),
             from_ui: from_ui_rx,
         };
+        if let Some(text) = warning {
+            let _ = to_ui_tx.send(ToUi::Error(text));
+        }
         let mut last = Outcome::Failed;
         for attempt in 1..=MAX_ATTEMPTS {
             last = helper::authenticate(&username, &cookie, &mut conv);

@@ -9,7 +9,7 @@
 //! handed to a child (`--agent-prompt`) and the only thing that comes back is
 //! an exit code.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use async_process::{Command, Stdio};
@@ -31,8 +31,13 @@ pub struct Agent {
     /// One request at a time. A second one waits here rather than putting a
     /// second window on screen.
     pub turn: async_lock::Mutex<()>,
-    /// Cookie -> pid of the child asking about it, so a cancel can reach it.
-    pub running: Mutex<HashMap<String, u32>>,
+    /// Cookie -> pidfd of the child asking about it, so a cancel can signal the
+    /// exact process. A pidfd, not a bare pid: once the child exits the pid can
+    /// be recycled, and a stale kill would land on a stranger.
+    pub running: Mutex<HashMap<String, i32>>,
+    /// Cookies cancelled before their turn came up. The queued request checks
+    /// this after taking the lock and ends without drawing a window.
+    pub cancelled: Mutex<HashSet<String>>,
 }
 
 impl Agent {
@@ -42,12 +47,35 @@ impl Agent {
             once,
             turn: async_lock::Mutex::new(()),
             running: Mutex::new(HashMap::new()),
+            cancelled: Mutex::new(HashSet::new()),
         }
     }
 
     fn is_polkitd(&self, sender: Option<&str>) -> bool {
         let expected = self.polkitd.lock().ok();
         matches!((sender, expected), (Some(s), Some(e)) if s == e.as_str())
+    }
+}
+
+/// Per-request tracing goes to the journal, so it is off unless asked for.
+/// Only the security-relevant lines (a refused sender, an error) log always.
+fn tracing() -> bool {
+    std::env::var_os("SUDO_POP_DEBUG").is_some_and(|v| !v.is_empty())
+}
+
+/// Send a signal through a pidfd. Immune to pid reuse: after the child exits
+/// this fails with ESRCH rather than reaching a recycled pid.
+fn pidfd_signal(pidfd: i32, sig: i32) {
+    // SAFETY: a plain syscall with integer arguments; a null siginfo and no
+    // flags. The fd is owned by us and valid while held in `running`.
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd as libc::c_long,
+            sig as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+        );
     }
 }
 
@@ -65,18 +93,20 @@ impl Agent {
         identities: Vec<Identity>,
     ) -> zbus::fdo::Result<()> {
         let started = std::time::Instant::now();
-        println!("\n== BeginAuthentication ==  {}", crate::stamp());
-        println!("  action_id  : {action_id}");
-        println!("  message    : {message}");
-        println!("  icon_name  : {icon_name}");
-        println!("  details    : {details:?}");
+        if tracing() {
+            println!("\n== BeginAuthentication ==  {}", crate::stamp());
+            println!("  action_id  : {action_id}");
+            println!("  message    : {message}");
+            println!("  icon_name  : {icon_name}");
+            println!("  details    : {details:?}");
+        }
 
         // Only polkit may ask us to prompt. Without this any process on the bus
         // can put an attacker-worded dialog on screen, learn whether the
         // password was right, and burn the shared faillock budget.
         let sender = header.sender().map(|s| s.as_str().to_owned());
         if !self.is_polkitd(sender.as_deref()) {
-            println!("  REJECTED: sender {sender:?} is not polkitd");
+            eprintln!("sudo-pop: REJECTED begin from {sender:?}: not polkitd");
             return Err(zbus::fdo::Error::AccessDenied("not polkit".into()));
         }
 
@@ -87,18 +117,41 @@ impl Agent {
             .get("polkit.subject-pid")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        println!("  chosen     : {name} (uid {uid}), subject pid {subject_pid}");
+        if tracing() {
+            println!("  chosen     : {name} (uid {uid}), subject pid {subject_pid}");
+        }
 
         // Queue: one window at a time. Held for the whole request.
         let _turn = self.turn.lock().await;
 
+        // A cancel may have arrived while this waited its turn. If so, end it
+        // now rather than opening a window for a request polkitd has dropped.
+        if self
+            .cancelled
+            .lock()
+            .map(|mut set| set.remove(&cookie))
+            .unwrap_or(false)
+        {
+            if tracing() {
+                println!("  cancelled before it started");
+            }
+            return Ok(());
+        }
+
         let code = self.ask(&name, &cookie, subject_pid, &message).await;
 
-        println!(
-            "  exit {code}  ({} 초 경과, {})",
-            started.elapsed().as_secs_f32().round(),
-            crate::stamp()
-        );
+        // Drop any late cancel marker so the set cannot grow without bound.
+        if let Ok(mut set) = self.cancelled.lock() {
+            set.remove(&cookie);
+        }
+
+        if tracing() {
+            println!(
+                "  exit {code}  ({} 초 경과, {})",
+                started.elapsed().as_secs_f32().round(),
+                crate::stamp()
+            );
+        }
         if self.once {
             crate::HANDLED.store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -116,19 +169,33 @@ impl Agent {
     /// polkit gives up on a request -- the caller stopped waiting, or the
     /// action was withdrawn. Close the window that belongs to that cookie.
     async fn cancel_authentication(&self, cookie: String) {
-        println!("== CancelAuthentication ==  {}", crate::stamp());
-        let pid = self
-            .running
-            .lock()
-            .ok()
-            .and_then(|map| map.get(&cookie).copied());
-        match pid {
-            Some(pid) => {
-                // SAFETY: signalling a child we started.
-                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-                println!("  closed the prompt (pid {pid})");
+        if tracing() {
+            println!("== CancelAuthentication ==  {}", crate::stamp());
+        }
+        // Signal under the lock so `ask` cannot close the pidfd underneath us.
+        let mut signalled = false;
+        if let Ok(map) = self.running.lock()
+            && let Some(&pidfd) = map.get(&cookie)
+        {
+            pidfd_signal(pidfd, libc::SIGTERM);
+            signalled = true;
+        }
+        if signalled {
+            if tracing() {
+                println!("  closed the prompt for that cookie");
             }
-            None => println!("  nothing running for that cookie"),
+            return;
+        }
+        // Not started yet (still queued) or already gone. Remember it so the
+        // queued begin_authentication ends without a window when its turn comes.
+        if let Ok(mut set) = self.cancelled.lock() {
+            if set.len() > 256 {
+                set.clear();
+            }
+            set.insert(cookie);
+        }
+        if tracing() {
+            println!("  nothing running yet; marked cancelled");
         }
     }
 }
@@ -156,9 +223,20 @@ impl Agent {
             }
         };
 
+        // A pidfd for the child, so a cancel signals this exact process even
+        // after its pid could be recycled. If it cannot be opened the cancel
+        // path falls back to the 30s window backstop rather than a stale kill.
         let pid = child.id();
-        if let Ok(mut map) = self.running.lock() {
-            map.insert(cookie.to_owned(), pid);
+        // SAFETY: plain syscall; the child is alive here, freshly spawned.
+        let pidfd = unsafe {
+            libc::syscall(libc::SYS_pidfd_open, pid as libc::c_long, 0 as libc::c_long)
+        } as i32;
+        if pidfd >= 0 {
+            if let Ok(mut map) = self.running.lock() {
+                map.insert(cookie.to_owned(), pidfd);
+            }
+        } else {
+            eprintln!("sudo-pop: cannot open pidfd for the prompt child");
         }
 
         // The cookie goes down a pipe, not through argv or the environment:
@@ -176,8 +254,13 @@ impl Agent {
             }
         };
 
-        if let Ok(mut map) = self.running.lock() {
-            map.remove(cookie);
+        // Remove and close under the lock: a concurrent cancel either
+        // signalled before this, or finds nothing -- never an fd we are closing.
+        if let Ok(mut map) = self.running.lock()
+            && let Some(fd) = map.remove(cookie)
+        {
+            // SAFETY: our own pidfd, opened above and not closed elsewhere.
+            unsafe { libc::close(fd) };
         }
         code
     }

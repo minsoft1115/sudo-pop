@@ -41,6 +41,11 @@ const LOGIND_IFACE: &str = "org.freedesktop.login1.Manager";
 
 const AGENT_PATH: &str = "/org/minsoft1115/sudo_pop/AuthenticationAgent";
 
+/// Startup tracing goes to the journal, so it is off unless asked for.
+fn tracing() -> bool {
+    std::env::var_os("SUDO_POP_DEBUG").is_some_and(|v| !v.is_empty())
+}
+
 
 
 
@@ -185,21 +190,33 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let probe = Connection::system().await?;
     let dbus = zbus::fdo::DBusProxy::new(&probe).await?;
     let owner = dbus.get_name_owner(POLKIT_SERVICE.try_into()?).await?;
-    println!("polkitd owns {POLKIT_SERVICE} as {owner}");
+    if tracing() {
+        println!("polkitd owns {POLKIT_SERVICE} as {owner}");
+    }
 
     let Some((session, how)) = session_id(&probe).await else {
-        eprintln!("no logind session id: none of the three lookups answered");
-        std::process::exit(1);
+        // Exit cleanly rather than non-zero: with Restart=on-failure a restart
+        // would just fail the same way, two seconds forever. A missing session
+        // is a permanent condition here, not a transient one.
+        eprintln!(
+            "sudo-pop: no logind session id (none of the three lookups answered); \
+             not starting the agent"
+        );
+        std::process::exit(0);
     };
-    println!("session id  : {session}  (found by {how})");
+    if tracing() {
+        println!("session id  : {session}  (found by {how})");
+    }
 
     let conn = connection::Builder::system()?
         .serve_at(AGENT_PATH, Agent::new(owner.to_string(), once))?
         .build()
         .await?;
-    println!("agent object: {AGENT_PATH}");
-    if let Some(me) = conn.unique_name() {
-        println!("our bus name: {me}");
+    if tracing() {
+        println!("agent object: {AGENT_PATH}");
+        if let Some(me) = conn.unique_name() {
+            println!("our bus name: {me}");
+        }
     }
 
     if let Err(e) = register(&conn, &session).await {
@@ -207,9 +224,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("(expected while another agent holds this session)");
         return Ok(());
     }
-    println!("\nREGISTERED. this session's prompts come here now.");
-    if once {
-        println!("(stopping after the first request)");
+    if tracing() {
+        println!("\nREGISTERED. this session's prompts come here now.");
+        if once {
+            println!("(stopping after the first request)");
+        }
     }
 
     // polkitd restarting takes our registration with it, and its unique name
@@ -230,7 +249,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     && args.name() == POLKIT_SERVICE
                     && let Some(new_owner) = args.new_owner().as_ref()
                 {
-                    println!("polkitd came back as {new_owner}; registering again");
+                    if tracing() {
+                        println!("polkitd came back as {new_owner}; registering again");
+                    }
                     if let Ok(iface) = conn
                         .object_server()
                         .interface::<_, Agent>(AGENT_PATH)
@@ -253,8 +274,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Give the seat back rather than leaving polkitd to notice we left.
     match unregister(&conn, &session).await {
-        Ok(()) => println!("unregistered"),
-        Err(e) => println!("unregister failed: {e}"),
+        Ok(()) => {
+            if tracing() {
+                println!("unregistered");
+            }
+        }
+        Err(e) => eprintln!("sudo-pop: unregister failed: {e}"),
     }
     Ok(())
 }
