@@ -242,7 +242,7 @@ cat <<EOF
 ${B}Done.${N} Open a new shell, or: source ~/.bashrc
 
   sudo whoami        goes through the popup
-  command sudo ...   always runs the real sudo, alias or not
+  /usr/bin/sudo ...  always runs the real sudo, alias or not
 
 To remove it, run --uninit ${B}before${N} deleting the binary, or the sudo alias
 is left pointing at nothing:
