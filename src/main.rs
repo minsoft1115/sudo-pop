@@ -16,8 +16,17 @@ use zbus::blocking::{Connection, Proxy, connection};
 use zbus::interface;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
+mod font;
+mod gui;
+mod harden;
 mod helper;
+mod invocation;
+mod prompt;
+mod secret;
+mod theme;
+
 use helper::{Conversation, Outcome};
+use secret::Secret;
 
 const POLKIT_SERVICE: &str = "org.freedesktop.PolicyKit1";
 const POLKIT_PATH: &str = "/org/freedesktop/PolicyKit1/Authority";
@@ -34,7 +43,10 @@ type Identity = (String, HashMap<String, OwnedValue>);
 
 /// Prompts allowed for one cookie, out of the ten faillock would give. Carried
 /// over from the sudo path: one authentication request is one command.
-const MAX_ATTEMPTS: u32 = 3;
+///
+/// The child owns the retry loop, and a child is spawned per cookie, so this is
+/// per request without any state kept in the daemon.
+pub const MAX_ATTEMPTS: u32 = 3;
 
 /// Set when one request has been handled end to end, so a spike run can stop
 /// holding the seat by itself instead of waiting for Ctrl-C.
@@ -83,7 +95,7 @@ impl Drop for EchoOff {
 struct Terminal;
 
 impl Conversation for Terminal {
-    fn ask(&mut self, prompt: &str, echo: bool) -> Option<String> {
+    fn ask(&mut self, prompt: &str, echo: bool) -> Option<Secret> {
         use std::io::Write;
         print!("  [{}] {prompt} ", if echo { "echo" } else { "hidden" });
         let _ = std::io::stdout().flush();
@@ -92,14 +104,19 @@ impl Conversation for Terminal {
         // to be seen.
         let _guard = (!echo).then(EchoOff::new);
 
-        let mut line = String::new();
-        let read = std::io::stdin().read_line(&mut line);
+        let mut secret = Secret::new();
+        let read = std::io::stdin().read_line(secret.buffer_mut());
         if !echo {
             println!();
         }
         match read {
             Ok(0) | Err(_) => None,
-            Ok(_) => Some(line.trim_end_matches('\n').to_string()),
+            Ok(_) => {
+                while secret.buffer_mut().ends_with('\n') {
+                    secret.buffer_mut().pop();
+                }
+                Some(secret)
+            }
         }
     }
     fn info(&mut self, text: &str) {
@@ -107,6 +124,56 @@ impl Conversation for Terminal {
     }
     fn error(&mut self, text: &str) {
         println!("  error: {text}");
+    }
+}
+
+/// Run the request in a child process: hardening, window, helper conversation.
+///
+/// The daemon deliberately learns nothing but the exit code -- the password
+/// never enters this address space.
+fn spawn_prompt(username: &str, cookie: &str, subject_pid: u32, message: &str) -> i32 {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            eprintln!("sudo-pop: cannot find our own binary: {e}");
+            return prompt::EXIT_FAILED;
+        }
+    };
+
+    let child = Command::new(exe)
+        .arg("--agent-prompt")
+        .env("SUDO_POP_USER", username)
+        .env("SUDO_POP_SUBJECT_PID", subject_pid.to_string())
+        .env("SUDO_POP_MESSAGE", message)
+        .stdin(Stdio::piped())
+        .spawn();
+
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("sudo-pop: cannot start the prompt: {e}");
+            return prompt::EXIT_FAILED;
+        }
+    };
+
+    // The cookie goes down a pipe, not through argv or the environment: both
+    // are readable by anything that can see the process.
+    if let Some(mut stdin) = child.stdin.take()
+        && writeln!(stdin, "{cookie}").is_err()
+    {
+        let _ = child.kill();
+        return prompt::EXIT_FAILED;
+    }
+
+    match child.wait() {
+        Ok(status) => status.code().unwrap_or(prompt::EXIT_FAILED),
+        Err(e) => {
+            eprintln!("sudo-pop: prompt did not finish: {e}");
+            prompt::EXIT_FAILED
+        }
     }
 }
 
@@ -203,35 +270,59 @@ impl Agent {
         };
         println!("  chosen     : {name} (uid {uid})");
 
-        let mut conv = Terminal;
+        let subject_pid: u32 = details
+            .get("polkit.subject-pid")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
         let finish = |outcome: &str| {
-            println!("  {outcome}  ({} 초 경과, {})", started.elapsed().as_secs_f32().round(), stamp());
+            println!(
+                "  {outcome}  ({} 초 경과, {})",
+                started.elapsed().as_secs_f32().round(),
+                stamp()
+            );
             if self.once {
                 HANDLED.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         };
-        for attempt in 1..=MAX_ATTEMPTS {
-            println!("  -- attempt {attempt}/{MAX_ATTEMPTS} --");
-            match helper::authenticate(&name, &cookie, &mut conv) {
-                Outcome::Success => {
-                    finish("SUCCESS");
-                    return Ok(());
+
+        // Headless runs (no display, or a protocol test) keep the terminal
+        // conversation; everything else gets the window.
+        let code = if std::env::var_os("SUDO_POP_SPIKE_TERMINAL").is_some() {
+            let mut conv = Terminal;
+            let mut last = Outcome::Failed;
+            for attempt in 1..=MAX_ATTEMPTS {
+                println!("  -- attempt {attempt}/{MAX_ATTEMPTS} --");
+                last = helper::authenticate(&name, &cookie, &mut conv);
+                if last != Outcome::Failed {
+                    break;
                 }
-                Outcome::Cancelled => {
-                    finish("cancelled by the user");
-                    // Cancelling ends the request normally: an error would have
-                    // polkitd hand it straight back to us.
-                    return Ok(());
-                }
-                Outcome::RefusedWithoutPrompt => {
-                    finish("refused before any prompt (locked account or broken stack)");
-                    return Ok(());
-                }
-                Outcome::Failed => continue,
+            }
+            match last {
+                Outcome::Success => prompt::EXIT_SUCCESS,
+                Outcome::Failed => prompt::EXIT_FAILED,
+                _ => prompt::EXIT_CANCELLED,
+            }
+        } else {
+            spawn_prompt(&name, &cookie, subject_pid, &message)
+        };
+
+        match code {
+            prompt::EXIT_SUCCESS => {
+                finish("SUCCESS");
+                Ok(())
+            }
+            // Cancelled, or refused before any prompt. Both end the request
+            // normally: an error would have polkitd hand it straight back.
+            prompt::EXIT_CANCELLED => {
+                finish("cancelled");
+                Ok(())
+            }
+            _ => {
+                finish("failed");
+                Err(zbus::fdo::Error::Failed("authentication failed".into()))
             }
         }
-        finish("out of attempts");
-        Err(zbus::fdo::Error::Failed("authentication failed".into()))
     }
 
     fn cancel_authentication(&self, cookie: String) {
@@ -294,6 +385,12 @@ unsafe extern "C" {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The child that draws the window and talks to the helper. Checked before
+    // anything else so it never touches the bus.
+    if std::env::args().nth(1).as_deref() == Some("--agent-prompt") {
+        prompt::run();
+    }
+
     let conn = Connection::system()?;
 
     // Who owns the polkit name right now. This is what a real agent compares

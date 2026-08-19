@@ -11,6 +11,8 @@ exclude = ["old"]
 [dependencies]
 zbus = "5"
 libc = "0.2"
+zeroize = "1"
+eframe = { version = "0.36.1", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
 
 [profile.release]
 strip = true

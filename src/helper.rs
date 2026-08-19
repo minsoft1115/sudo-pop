@@ -14,6 +14,8 @@
 //! polkitd re-issues the request and the window reopens forever.
 
 use std::io::{BufRead, BufReader, Write};
+
+use crate::secret::Secret;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 
@@ -39,7 +41,8 @@ pub enum Outcome {
 /// What the caller shows, and how it asks. `echo` is true when the input is not
 /// a password (PAM_PROMPT_ECHO_ON) and may be shown on screen.
 pub trait Conversation {
-    fn ask(&mut self, prompt: &str, echo: bool) -> Option<String>;
+    /// `None` means the user closed the prompt.
+    fn ask(&mut self, prompt: &str, echo: bool) -> Option<Secret>;
     fn info(&mut self, text: &str);
     fn error(&mut self, text: &str);
 }
@@ -92,8 +95,13 @@ impl Channel {
         })
     }
 
-    fn answer(&mut self, text: &str) -> std::io::Result<()> {
-        writeln!(self.writer, "{text}")?;
+    /// Write the password and its newline as two raw writes.
+    ///
+    /// Formatting it into one line would allocate a second copy that nothing
+    /// wipes -- the same reason the sudo path never used `println!` here.
+    fn answer(&mut self, secret: &Secret) -> std::io::Result<()> {
+        self.writer.write_all(secret.as_bytes())?;
+        self.writer.write_all(b"\n")?;
         self.writer.flush()
     }
 }
@@ -140,10 +148,12 @@ fn attempt(channel: std::io::Result<Channel>, conv: &mut dyn Conversation) -> Ou
         match tag {
             "PAM_PROMPT_ECHO_OFF" | "PAM_PROMPT_ECHO_ON" => {
                 saw_prompt = true;
-                let Some(answer) = conv.ask(rest, tag.ends_with("ON")) else {
+                let Some(mut answer) = conv.ask(rest, tag.ends_with("ON")) else {
                     return Outcome::Cancelled;
                 };
-                if let Err(e) = channel.answer(&answer) {
+                let sent = channel.answer(&answer);
+                answer.wipe();
+                if let Err(e) = sent {
                     conv.error(&format!("cannot answer the helper: {e}"));
                     return Outcome::Failed;
                 }
