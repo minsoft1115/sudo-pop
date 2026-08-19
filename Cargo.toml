@@ -1,0 +1,19 @@
+[package]
+name = "sudo-pop"
+version = "0.2.0-spike"
+edition = "2024"
+description = "polkit authentication agent for Omarchy (in progress)"
+license = "MIT"
+# The previous implementation lives here and is a crate of its own; keep cargo
+# from treating it as part of this one.
+exclude = ["old"]
+
+[dependencies]
+zbus = "5"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = 3
