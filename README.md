@@ -1,258 +1,287 @@
 # sudo-pop
 
-Hyprland/Wayland 에서 `sudo` 비밀번호를 GUI 팝업으로 입력받는 단일 Rust 바이너리.
+**English** · [한국어](README.ko.md)
 
-비밀번호 수집만 별도 프로세스로 떼어내기 때문에 터미널의 stdin/stdout/stderr 가
-그대로 보존된다. `pacman` 의 `[Y/n]` 도, `vim` 의 전체 화면 편집도 평소와 똑같이 동작한다.
+A single Rust binary that asks for your `sudo` password in a GUI popup on
+Hyprland/Wayland.
+
+Only the password prompt is moved out of the terminal, into a separate process,
+so the terminal's stdin, stdout and stderr reach the real command untouched.
+`pacman`'s `[Y/n]` still works. So does a full-screen `vim`.
 
 ```
 $ sudo pacman -Syu
-   → 화면 가운데 비밀번호 창이 뜨고, 입력하면 pacman 이 평소처럼 이어서 실행된다
+   → a password window opens in the middle of the screen, and once you type it
+     pacman carries on exactly as it always did
 ```
 
 ---
 
-## 이 도구가 약속하는 것과 하지 않는 것
+## What this promises, and what it does not
 
-**이것은 보안 도구가 아니라 편의 도구다.**
+**This is a convenience tool, not a security tool.**
 
-사용자 권한으로 실행되는 악성코드는 alias 도, 바이너리도, `SUDO_ASKPASS` 환경변수도
-전부 바꿀 수 있다. 방어선이 존재하지 않는다. 오히려 "비밀번호를 묻는 GUI 창" 을
-일상화시키면 똑같이 생긴 가짜 창을 아무 권한 없이 만들 수 있으므로 피싱은 쉬워진다.
+Malware running as your user can replace the alias, the binary and the
+`SUDO_ASKPASS` variable alike. There is no line here for it to cross. If
+anything, making "a GUI window that asks for your password" an everyday sight
+makes phishing easier: an identical-looking fake window needs no privileges at
+all.
 
-sudo-pop 이 실제로 지키는 것은 **부주의로 인한 유출** 뿐이다:
+What sudo-pop does defend against is **careless leakage**:
 
-- 크래시해도 비밀번호가 코어 덤프로 디스크에 남지 않는다
-- 비밀번호 버퍼를 RAM 에 고정해 스왑·하이버네이션 이미지로 나가지 않게 한다
-- 화면 공유·녹화에 창이 잡히지 않는다
-- 로그·명령행·환경변수 어디에도 비밀번호가 남지 않는다
+- a crash cannot write the password to disk in a core dump
+- the password buffer is locked into RAM, so it cannot reach swap or a
+  hibernation image
+- the window is excluded from screen sharing and recording
+- the password appears in no log, no command line, and no environment variable
 
 ---
 
-## 요구사항
+## Requirements
 
-| 항목 | 비고 |
+| | |
 |---|---|
-| Hyprland | 0.56 이상에서 확인. 윈도우 룰이 Lua 설정 기준 |
-| sudo | askpass(`-A`) 지원. 1.9.17 에서 확인 |
-| Rust | 빌드용. `mise` 를 쓰면 `mise.toml` 이 툴체인을 고정한다 |
+| Hyprland | verified on 0.56+. The window rules assume the Lua config |
+| sudo | with askpass (`-A`) support. Verified on 1.9.17 |
+| Rust | to build. With `mise`, `mise.toml` pins the toolchain |
 
-Wayland·OpenGL 라이브러리는 데스크톱 환경이면 대개 이미 있다
-(`wayland`, `libxkbcommon`, `mesa`, `libglvnd`).
+The Wayland and OpenGL libraries (`wayland`, `libxkbcommon`, `mesa`,
+`libglvnd`) are already present on most desktop installs.
 
 ---
 
-## 설치
+## Install
 
 ```bash
-# 1. 빌드
+# 1. build
 cargo build --release
 
-# 2. PATH 에 놓기 (별칭이 해결되려면 필요하다)
+# 2. put it on PATH (the alias needs to resolve)
 install -Dm755 target/release/sudo-pop ~/.local/bin/sudo-pop
 
-# 3. 셸 별칭 + Hyprland 윈도우 룰 등록
+# 3. register the shell alias and the Hyprland window rules
 sudo-pop --init
 
-# 4. 새 셸을 열거나
+# 4. open a new shell, or
 source ~/.bashrc
 ```
 
-`--init` 이 하는 일:
+What `--init` writes:
 
-| 대상 | 내용 |
+| Path | Contents |
 |---|---|
 | `~/.config/minsoft1115/bash/sudo-pop.sh` | `alias sudo='sudo-pop'` |
-| `~/.config/minsoft1115/hypr/sudo-pop.lua` | 팝업 창 규칙 (float, center, dim_around, 화면공유 제외) |
-| `~/.config/hypr/hyprland.lua` | 위 파일을 `require` 하는 마커 블록 |
+| `~/.config/minsoft1115/hypr/sudo-pop.lua` | popup window rules (float, center, dim_around, excluded from screen sharing) |
+| `~/.config/hypr/hyprland.lua` | a marker block that `require`s the file above |
 
-여러 번 실행해도 중복 추가되지 않는다. 스니펫 로더 블록이 이미 있으면
-`.bashrc` 는 아예 건드리지 않는다.
+Running it again adds nothing twice. If the snippet loader block is already
+there, `.bashrc` is not touched at all.
 
-## 제거
+## Uninstall
 
 ```bash
 sudo-pop --uninit
 rm ~/.local/bin/sudo-pop
 ```
 
-설치한 파일과 `hyprland.lua` 의 마커 블록을 지운다. 스니펫 로더 블록은
-다른 도구와 공유하는 것이라 남겨둔다.
+This removes the files it installed and the marker block in `hyprland.lua`. The
+snippet loader block is left alone — it is shared with other tools.
 
 ---
 
-## 알아둘 것
+## Things worth knowing
 
-### 탈출구 — 먼저 기억해 둘 것
+### Escape hatches — read this first
 
-별칭만 남고 바이너리가 사라지면 `sudo` 가 "command not found" 가 된다.
-그때는 다음 중 아무거나 쓰면 원래 sudo 가 실행된다.
+If the alias survives but the binary does not, `sudo` becomes "command not
+found". Any of these runs the real sudo:
 
 ```bash
-command sudo whoami   # 별칭도 함수도 무시
+command sudo whoami   # ignores both aliases and functions
 /usr/bin/sudo whoami
-\sudo whoami          # 별칭만 무시한다 — 아래 주의
+\sudo whoami          # ignores aliases only — see below
 ```
 
-`--uninit` 을 실행하기 전에 바이너리를 지우지 않는 편이 안전하다.
+Do not delete the binary before running `--uninit`.
 
-**`\sudo` 는 확실한 탈출구가 아니다.** 백슬래시는 별칭 확장만 막고 **셸 함수는 못 막는다.**
-같은 스니펫 폴더를 쓰는 다른 도구가 `sudo` 를 함수로 잡아 둘 수 있다 — omarchy-setup 의
-패키지 가드(`zz-pkg-guards.sh`)가 그렇고, 그건 이 별칭을 로드 시점에 넘겨받아 자기 안에서
-호출한다. 그런 셸에서 `\sudo` 는 그 함수로 들어간다. 어느 경우에도 원래 sudo 로 가려면
-`command sudo` 나 절대 경로를 쓴다.
+**`\sudo` is not a reliable escape hatch.** A backslash suppresses alias
+expansion, but **not shell functions**. Another tool sharing the same snippet
+folder may define `sudo` as a function — omarchy-setup's package guard
+(`zz-pkg-guards.sh`) does exactly that, taking over this alias when it loads and
+calling it from inside itself. In such a shell, `\sudo` lands in that function.
+Use `command sudo` or an absolute path to be sure.
 
-### 별칭은 대화형 셸에서만 확장된다
+### Aliases only expand in interactive shells
 
-셸 별칭의 성질이라 어쩔 수 없다. 아래에서는 **원래 sudo 가 그대로 실행**된다.
+That is how shell aliases work, and it cannot be changed. In all of these, **the
+real sudo runs**:
 
-- 셸 스크립트, `sh -c "..."`
-- Makefile 의 레시피
+- shell scripts, `sh -c "..."`
+- Makefile recipes
 - `xargs sudo ...`
-- systemd 유닛, cron
+- systemd units, cron
 
-즉 sudo-pop 은 사람이 직접 명령을 치는 상황만 바꾼다. 자동화된 경로는 건드리지 않는다.
+So sudo-pop only changes what happens when a person types a command. It leaves
+every automated path alone.
 
-### GUI 를 못 띄우는 상황에서는 알아서 비켜난다
+### It steps aside when it cannot draw
 
-다음 중 하나라도 해당하면 팝업을 포기하고 평범한 터미널 프롬프트로 넘어간다.
+Any one of these makes it give up on the popup and fall back to the ordinary
+terminal prompt:
 
-- `WAYLAND_DISPLAY` 와 `DISPLAY` 가 둘 다 없을 때 (SSH 접속, 콘솔 TTY)
-- 인자에 이미 `-n` / `-S` / `-A` 가 있을 때
-- `XDG_RUNTIME_DIR` 이 없거나 준비에 실패했을 때
+- neither `WAYLAND_DISPLAY` nor `DISPLAY` is set (SSH, a console TTY)
+- the arguments already contain `-n`, `-S` or `-A`
+- `XDG_RUNTIME_DIR` is missing, or preparing it failed
 
-**SSH 로 접속해도 sudo 가 잠기지 않는다.**
+**Logging in over SSH does not lock you out of sudo.**
 
-### faillock — 취소도 실패 1건으로 집계된다
+### faillock — a cancel also counts as one failure
 
-이 부분은 sudo-pop 이 아니라 PAM 의 동작이다. askpass 가 실행되는 시점에는
-이미 인증 대화가 시작된 상태라서, 그 안에서 취소하면 실패 1건으로 기록된다.
+This is PAM's behaviour, not sudo-pop's. By the time askpass runs, the
+authentication conversation has already started, so cancelling inside it is
+recorded as a failed attempt.
 
 ```
-Esc 로 취소       → 실패 +1
-비밀번호 오입력   → 실패 +1
+Esc to cancel      → failures +1
+wrong password     → failures +1
 ```
 
-기본 설정에서는 **15분 안에 10건이 쌓이면 120초 동안 계정이 잠긴다**
-(`/etc/security/faillock.conf` 의 `deny`, `/etc/pam.d/system-auth` 의 `unlock_time`).
+With the stock configuration, **10 failures within 15 minutes lock the account
+for 120 seconds** (`deny` in `/etc/security/faillock.conf`, `unlock_time` in
+`/etc/pam.d/system-auth`).
 
-sudo-pop 은 이를 세 가지로 완화한다.
+sudo-pop softens that in three ways:
 
-- 한 번의 `sudo` 명령에서 팝업은 **최대 3회**까지만 뜬다. sudo 자체는 10회를
-  허용하지만 그대로 두면 한 명령이 예산을 다 쓸 수 있다.
-- 남은 실패 예산이 **3 이하로 떨어지면 창에 경고**를 띄운다.
-- 이미 잠긴 상태면 비밀번호를 묻지 않고 안내만 띄운다. 헛시도로 예산을 더
-  깎지 않기 위해서다.
+- one `sudo` command opens the popup **at most 3 times**. sudo itself allows
+  ten, which lets a single command spend the whole budget.
+- when the remaining budget drops to **3 or fewer, the window says so**.
+- if the account is already locked, it explains that instead of asking for a
+  password, so a doomed attempt cannot spend more of the budget.
 
-**정상 인증을 한 번 하면 기록이 초기화된다.** 실패가 쌓였다면 비밀번호를
-정확히 한 번 입력하는 것으로 정리된다. 잠긴 동안은 120초를 기다리면 풀린다.
+**One successful authentication clears the record.** If failures have piled up,
+typing the password correctly once puts it back to zero. While locked, waiting
+out the 120 seconds is the only cure.
 
-현재 상태는 언제든 확인할 수 있다.
+You can always look:
 
 ```bash
-faillock --user "$USER"    # Valid 열이 V 인 항목만 집계 대상이다
+faillock --user "$USER"    # only rows with V in the Valid column count
 ```
 
-### 창 사용법
+### Using the window
 
-| 키 | 동작 |
+| Key | |
 |---|---|
-| Enter | 제출. 비어 있으면 무시하고 창을 유지한다 |
-| Esc | 취소 |
-| (방치) | 90초 후 자동 취소 |
+| Enter | submit. An empty box is ignored and the window stays |
+| Esc | cancel |
+| (left alone) | cancels itself after 90 seconds |
 
-창은 위에서부터 이렇게 구성된다.
+Top to bottom, the window is:
 
 ```
-      pacman -Syu               ← 실행될 명령 (테마 강조색)
-  [sudo] password for you:      ← sudo 가 준 프롬프트 (흐리게)
+      pacman -Syu               ← the command about to run (theme accent)
+  [sudo] password for you:      ← the prompt sudo handed over (dimmed)
   ┌────────────────────────┐
   └────────────────────────┘
    Enter to confirm  Esc to cancel
 ```
 
-**맨 윗줄이 지금 무엇을 실행하려는지 알려준다.** 예상치 못한 명령이 비밀번호를
-요구하면 여기서 눈에 띈다. 명령을 알아낼 수 없는 경우(`sudo -v` 등)에는 그 줄만
-생략된다.
+**The top line tells you what is about to run.** An unexpected command asking
+for your password stands out there. When the command cannot be determined
+(`sudo -v` and friends), that line is simply omitted.
 
-비밀번호는 256자까지 입력된다. 창의 문구는 영문이다 — 한글 글리프를 넣으려면
-CJK 폰트를 로드해야 하는데, 팝업이 즉시 뜨는 것이 이 도구의 핵심이라
-시작 시간을 내주지 않았다. 화면에서 가장 중요한 문구는 어차피 sudo 가 그대로
-넘겨주는 프롬프트다.
+The password field takes up to 256 characters. The window's own wording is in
+English: Korean glyphs would mean loading a CJK font, and a popup that appears
+instantly is the whole point of this tool, so that startup cost was not worth
+paying. The most important text on screen is the prompt sudo passes through
+anyway.
 
-### 색과 폰트는 데스크톱을 따라간다
+### Colors and font follow the desktop
 
-**색상**은 현재 Omarchy 테마에서 가져온다
-(`~/.local/state/omarchy/current/theme/colors.toml`). 배경, 입력 필드, 강조색,
-경고색이 모두 테마 팔레트에서 나온다.
+**Colors** come from the current Omarchy theme
+(`~/.local/state/omarchy/current/theme/colors.toml`) — background, input field,
+accent and warning colors all come from that palette.
 
-**폰트**는 `fc-match monospace` 가 알려주는 것을 쓴다. `omarchy-font-set` 으로
-바꾼 폰트가 그대로 적용된다는 뜻이고, Omarchy 가 아닌 환경에서도 시스템 기본
-고정폭 폰트를 따라간다.
+**The font** is whatever `fc-match monospace` reports, so a font set with
+`omarchy-font-set` applies as-is, and outside Omarchy it follows the system
+default monospace.
 
-팝업은 매번 새 프로세스라 **테마나 폰트를 바꾸면 다음 팝업부터 바로 반영된다.**
-재시작도 리로드도 필요 없다. 어느 쪽이든 읽지 못하면 조용히 기본값으로 돌아간다.
+Each popup is a fresh process, so **changing the theme or the font shows up on
+the very next popup** — nothing to restart or reload. If either cannot be read,
+it falls back to defaults without complaining.
 
-폰트 크기만은 직접 정해 두었다. Omarchy 에 전역 크기 설정이 없고, 터미널 기준
-크기는 이 창에 맞지 않는다.
+Only the font size is fixed here. Omarchy has no global size setting, and the
+terminal's size is not right for this window.
 
-### 스크린샷으로는 창을 볼 수 없다
+### You cannot screenshot the window
 
-화면 공유 차단(`no_screen_share`)이 걸려 있어서, `grim` 같은 스크린샷 도구도
-같은 프로토콜을 쓰는 탓에 창이 **검은 사각형으로만 찍힌다.** 버그가 아니라
-의도된 동작이며, 비밀번호 창이 녹화·공유에 새지 않는다는 증거다.
+The screen-share exclusion (`no_screen_share`) is on, and screenshot tools such
+as `grim` use the same protocol, so the window comes out as **a black
+rectangle**. That is not a bug — it is the proof that the password window does
+not leak into recordings or shared screens.
 
-외형을 캡처해야 한다면 `~/.config/minsoft1115/hypr/sudo-pop.lua` 에서
-`no_screen_share` 를 잠시 끄고 `hyprctl reload` 한 뒤, 반드시 되돌린다.
+To capture it anyway, turn `no_screen_share` off in
+`~/.config/minsoft1115/hypr/sudo-pop.lua`, run `hyprctl reload`, and put it
+back afterwards.
 
 ---
 
-## 문제 해결
+## Troubleshooting
 
-**팝업이 안 뜨고 터미널에서 물어본다**
-GUI 를 포기하는 조건 중 하나에 걸렸다. 원인을 보려면:
+**The popup does not appear and the terminal asks instead**
+One of the conditions for stepping aside was met. To see which:
 
 ```bash
 SUDO_POP_DEBUG=1 sudo true
 ```
 
-어느 관문에서 비켜났는지 stderr 에 나온다. 이 변수는 stdout 을 절대 건드리지 않으므로
-켜둔 채로 써도 안전하다.
+It prints which gate it stepped aside at, on stderr. The variable never touches
+stdout, so leaving it on is safe.
 
-**창이 화면 구석에 뜨거나 배경이 안 어두워진다**
-Hyprland 룰이 적용되지 않았다. `~/.config/hypr/hyprland.lua` 에
-`-- sudo-pop:begin` 블록이 있는지 확인하고 `hyprctl reload` 를 실행한다.
+**The window opens in a corner, or the background is not dimmed**
+The Hyprland rules did not apply. Check that `~/.config/hypr/hyprland.lua`
+contains the `-- sudo-pop:begin` block, then run `hyprctl reload`.
 
 **`sudo: command not found`**
-바이너리가 PATH 에 없다. 위의 탈출구로 `\sudo` 를 쓰고, `~/.local/bin` 이
-PATH 에 있는지 확인한다.
+The binary is not on PATH. Use `command sudo` from the escape hatches above, and
+check that `~/.local/bin` is on your PATH.
 
-**비밀번호가 맞는데 자꾸 실패한다**
-계정이 잠겼을 수 있다. `faillock --user "$USER"` 로 확인하고 120초 기다린다.
+**The password is right but keeps failing**
+The account may be locked. Check `faillock --user "$USER"` and wait 120 seconds.
 
 ---
 
-## 문서
+## Documentation
 
-| 파일 | 내용 |
+| File | |
 |---|---|
-| `docs/architecture.html` | 구조와 흐름 다이어그램 |
-| `docs/plan.md` | 구현 사양 |
-| `docs/rationale.md` | 설계 근거와 실측 기록 |
+| `docs/architecture.html` | structure and flow diagrams |
+| `docs/plan.md` | implementation spec |
+| `docs/rationale.md` | design decisions and measurements |
 
-`sudo -A` 를 쓰는 이유, `/tmp` 대신 `$XDG_RUNTIME_DIR` 심볼릭 링크를 쓰는 이유,
-`panic = "abort"` 를 유지하면서 코어 덤프를 막는 방법 같은 결정의 근거는
-전부 `docs/rationale.md` 에 실측과 함께 남아 있다.
+**These three are written in Korean.** They are the author's working record, not
+usage instructions — this README covers everything needed to use the tool.
+
+They are where the reasoning lives: why `sudo -A` is used at all, why the
+askpass path is a symlink under `$XDG_RUNTIME_DIR` rather than a script in
+`/tmp`, and how core dumps are suppressed while keeping `panic = "abort"` — each
+with the measurement that settled it.
 
 ---
 
-## 개발
+## Development
 
 ```bash
-cargo test           # 단위 테스트
+cargo test           # unit tests
 cargo clippy --all-targets
 cargo fmt
 ```
 
-`SUDO_POP_DEBUG=1` 을 켜면 폴백 판정, 하드닝 적용 결과, 재시도 카운터가
-stderr 로 출력된다.
+`SUDO_POP_DEBUG=1` reports fallback decisions, the hardening results and the
+retry counter on stderr.
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE).
