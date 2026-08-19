@@ -117,6 +117,9 @@ pub fn run() -> ! {
     }
     let warning = budget.and_then(|budget| budget.warning());
 
+    // Kept for the window before `username` is moved into the worker.
+    let user_display = username.clone();
+
     let (to_ui_tx, to_ui_rx) = channel::<ToUi>();
     let (from_ui_tx, from_ui_rx) = channel::<FromUi>();
 
@@ -140,6 +143,7 @@ pub fn run() -> ! {
             .then(|| invocation::command_of(subject_pid))
             .flatten(),
         message,
+        user: (!user_display.is_empty()).then_some(user_display),
     };
 
     if let Err(e) = gui::run(subject, to_ui_rx, from_ui_tx) {

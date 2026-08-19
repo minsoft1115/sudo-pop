@@ -28,6 +28,11 @@ pub const APP_ID: &str = "sudo-askpass";
 
 const WINDOW_SIZE: [f32; 2] = [400.0, 200.0];
 
+/// Nerd Font padlock (nf-fa-lock) -- the same glyph the system polkit dialog
+/// uses. The Omarchy monospace font carries it; without a Nerd Font egui draws
+/// a box, so this assumes the target platform (Omarchy) it is built for.
+const LOCK_GLYPH: &str = "\u{f023}";
+
 /// Give up a little after the caller does.
 ///
 /// polkit callers stop waiting at 25 seconds (sd-bus method timeout) and
@@ -56,6 +61,8 @@ pub struct Subject {
     pub command: Option<String>,
     /// polkit's own wording, used when there is no command to show.
     pub message: String,
+    /// Whose password is being asked. The helper's prompt never says.
+    pub user: Option<String>,
 }
 
 /// Show the window and pump it until the conversation ends.
@@ -186,10 +193,9 @@ impl eframe::App for Window {
             .inner_margin(24)
             .show(ui, |ui| {
                 ui.vertical_centered_justified(|ui| {
-                    // The command leads: it is the one piece of information
-                    // here, and the only cue that something unexpected is what
-                    // is asking. polkit's own message says nothing useful for
-                    // run0, so it is the fallback rather than the headline.
+                    // The command leads: the one cue that something unexpected is
+                    // asking. polkit's own message says nothing useful for run0, so
+                    // it is the fallback rather than the headline.
                     let headline = self
                         .subject
                         .command
@@ -204,32 +210,71 @@ impl eframe::App for Window {
                         )
                         .truncate(),
                     );
-                    ui.add_space(10.0);
 
-                    ui.label(
-                        egui::RichText::new(&self.prompt)
-                            .size(12.5)
-                            .color(ui.visuals().text_color().gamma_multiply(0.5)),
-                    );
-                    ui.add_space(16.0);
+                    // Whose password this is. The helper's prompt is a bare
+                    // "Password:" and never says, so the window does.
+                    if let Some(user) = &self.subject.user {
+                        ui.add_space(3.0);
+                        ui.label(
+                            egui::RichText::new(format!("for {user}"))
+                                .size(11.0)
+                                .color(ui.visuals().text_color().gamma_multiply(0.5)),
+                        );
+                    }
+                    ui.add_space(18.0);
 
-                    let field = ui.add_enabled(
-                        !self.waiting,
-                        egui::TextEdit::singleline(self.password.buffer_mut())
-                            .password(!self.echo)
-                            .char_limit(crate::secret::MAX_CHARS)
-                            .font(egui::TextStyle::Monospace)
-                            .margin(egui::Margin::symmetric(10, 8))
-                            .desired_width(f32::INFINITY),
-                    );
-
-                    if !self.focus_set && !self.waiting {
-                        field.request_focus();
-                        self.focus_set = true;
+                    // A prompt that is not a plain password (an OTP, a question)
+                    // still needs its words; a password is spoken by the lock alone.
+                    if self.echo && !self.prompt.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&self.prompt)
+                                .size(11.5)
+                                .color(ui.visuals().text_color().gamma_multiply(0.5)),
+                        );
+                        ui.add_space(8.0);
                     }
 
-                    let entered =
-                        field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    // A lock glyph in front of the field, like the system dialog --
+                    // no "Password:" label.
+                    let entered = ui
+                        .horizontal(|ui| {
+                            // Centre the glyph in a box the height of the field,
+                            // so it lines up with the input rather than riding high.
+                            let field_h =
+                                ui.text_style_height(&egui::TextStyle::Monospace) + 16.0;
+                            ui.add_sized(
+                                [24.0, field_h],
+                                egui::Label::new(
+                                    egui::RichText::new(LOCK_GLYPH)
+                                        .size(18.0)
+                                        .family(egui::FontFamily::Monospace)
+                                        .color(ui.visuals().hyperlink_color),
+                                ),
+                            );
+                            ui.add_space(6.0);
+                            let field = ui.add_enabled(
+                                !self.waiting,
+                                egui::TextEdit::singleline(self.password.buffer_mut())
+                                    .password(!self.echo)
+                                    .char_limit(crate::secret::MAX_CHARS)
+                                    .font(egui::TextStyle::Monospace)
+                                    .margin(egui::Margin::symmetric(10, 8))
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if !self.focus_set && !self.waiting {
+                                field.request_focus();
+                                self.focus_set = true;
+                            }
+                            let entered = field.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            // An empty line reads as a wrong password and costs an
+                            // attempt, so keep the window open instead of submitting.
+                            if entered && !self.waiting && self.password.is_empty() {
+                                field.request_focus();
+                            }
+                            entered
+                        })
+                        .inner;
 
                     ui.add_space(14.0);
                     match (&self.notice, self.waiting) {
@@ -251,14 +296,8 @@ impl eframe::App for Window {
                         ),
                     };
 
-                    if entered && !self.waiting {
-                        if self.password.is_empty() {
-                            // An empty line reads as a wrong password and costs
-                            // an attempt, so it just keeps the window open.
-                            field.request_focus();
-                        } else {
-                            self.submit();
-                        }
+                    if entered && !self.waiting && !self.password.is_empty() {
+                        self.submit();
                     }
                 });
             });

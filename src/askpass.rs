@@ -83,9 +83,13 @@ pub fn run(prompt: Option<OsString>) -> ! {
         written
     });
 
+    // sudo authenticates the invoking user; name them for the window.
+    // SAFETY: getuid cannot fail.
+    let user = crate::username(unsafe { libc::getuid() });
     let subject = Subject {
         command: invocation::command_from_sudo(),
         message: "sudo".to_owned(),
+        user,
     };
 
     if let Err(e) = gui::run(subject, to_ui_rx, from_ui_tx) {
