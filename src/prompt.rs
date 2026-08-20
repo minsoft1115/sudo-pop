@@ -115,7 +115,7 @@ pub fn run() -> ! {
         eprintln!("sudo-pop: {reason}");
         std::process::exit(EXIT_CANCELLED);
     }
-    let warning = budget.and_then(|budget| budget.warning());
+    let attempts = budget.and_then(|budget| budget.status());
 
     // Kept for the window before `username` is moved into the worker.
     let user_display = username.clone();
@@ -128,9 +128,6 @@ pub fn run() -> ! {
             to_ui: to_ui_tx.clone(),
             from_ui: from_ui_rx,
         };
-        if let Some(text) = warning {
-            let _ = to_ui_tx.send(ToUi::Error(text));
-        }
         let last = run_attempts(&mut conv, |conv| {
             helper::authenticate(&username, &cookie, conv)
         });
@@ -144,6 +141,7 @@ pub fn run() -> ! {
             .flatten(),
         message,
         user: (!user_display.is_empty()).then_some(user_display),
+        attempts,
     };
 
     if let Err(e) = gui::run(subject, to_ui_rx, from_ui_tx) {

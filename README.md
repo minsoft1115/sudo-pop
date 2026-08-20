@@ -41,7 +41,7 @@ all of it measured on this machine, not asserted:
 | Excluded from screen sharing and recording | ✓ | ✗ — a layer surface can't carry the rule |
 | Shows the **actual command** that is asking | ✓ `pacman -Syu` | a random unit name (`run-p1592…service`) |
 | Refuses callers that aren't polkit | ✓ | ✗ — neither reference agent checks |
-| Attempts-left warning · refuses a locked account | ✓ | ✗ |
+| Shows the shared lockout budget at all times · refuses a locked account | ✓ | ✗ |
 | `sudo` and polkit prompts in one window | ✓ | sudo untouched |
 | Theme colors, matched to the system dialog | ✓ | ✓ |
 | Fingerprint | ✗ | ✓ |
@@ -131,9 +131,10 @@ A few things that follow from being a polkit agent rather than a plain askpass:
   Anything with an option or a `VAR=value` keeps sudo's meaning instead.
   `SUDO_POP_RUN0=0` turns the routing off.
 - **On the run0 path, answer within 25 seconds** — the caller's D-Bus timeout, not
-  ours. The window says as much; the sudo path has no such limit.
+  ours, and not something the window shows. The sudo path has no such limit.
 - **polkit and sudo share one faillock counter**, so a wrong password here counts
-  against both. The window shows how many attempts remain before a lock.
+  against both. The window says how many are left the whole time it is open,
+  in the error colour once three or fewer remain.
 - **`/usr/bin/sudo` always reaches the real sudo.** `\sudo` doesn't — it suppresses
   the alias but not the shell function another tool in this config installs.
 

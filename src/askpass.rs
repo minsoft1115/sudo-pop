@@ -57,15 +57,12 @@ pub fn run(prompt: Option<OsString>) -> ! {
         eprintln!("sudo-pop: {reason}");
         std::process::exit(1);
     }
-    let warning = budget.and_then(|budget| budget.warning());
+    let attempts = budget.and_then(|budget| budget.status());
 
     let (to_ui_tx, to_ui_rx) = channel::<ToUi>();
     let (from_ui_tx, from_ui_rx) = channel::<FromUi>();
 
     let worker = std::thread::spawn(move || {
-        if let Some(text) = warning {
-            let _ = to_ui_tx.send(ToUi::Error(text));
-        }
         let _ = to_ui_tx.send(ToUi::Prompt {
             text: prompt,
             echo: false,
@@ -90,6 +87,7 @@ pub fn run(prompt: Option<OsString>) -> ! {
         command: invocation::command_from_sudo(),
         message: "sudo".to_owned(),
         user,
+        attempts,
     };
 
     if let Err(e) = gui::run(subject, to_ui_rx, from_ui_tx) {

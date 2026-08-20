@@ -102,6 +102,9 @@ polkitd 의 고유 이름을 **읽기 전에 `NameOwnerChanged` 를 구독한다
 - app-id 는 `sudo-askpass`. `assets/sudo-pop.lua` 의 규칙이 이 이름으로 매칭한다
 - 규칙: `float`·`center`·`size 400 200`·`dim_around`·`stay_focused`·`pin`·**`no_screen_share`**
 - 요청 하나에 창 하나. PAM 이 여러 번 물어도 창은 그대로 두고 글자만 바꾼다
+- 입력칸 아래 두 줄은 성격이 다르다. 위는 **지나가는 것**(`Wrong`·PAM 메시지·`Checking...`)
+  이고, 아래는 **상시**로 남는 faillock 잔여 횟수다. 잔여가 **3 이하이면 경고색**
+  (`attempts::WARN_AT_OR_BELOW`). 조작 안내(Enter·Esc)는 띄우지 않는다
 - 이벤트 루프는 프로세스당 하나만 만들 수 있다. 창이 메인 스레드를 갖고 대화가 옆 스레드로 간다
 - 자체 타임아웃 30초. **폴킷 호출자는 25초에 포기한다** — 그 뒤는 백스톱일 뿐이다
 - 창에 띄우는 것은 polkit 의 `message` 가 아니라 **`polkit.subject-pid` 의 cmdline** 이다

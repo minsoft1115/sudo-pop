@@ -18,8 +18,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Prompts allowed per sudo command, out of the ten sudo would otherwise give.
 pub const MAX_ATTEMPTS: u32 = 3;
 
-/// Below this many remaining failures the window starts warning.
-pub const WARN_BELOW: u32 = 4;
+/// At or below this many remaining failures the standing line turns to the
+/// error colour. Above it the same line is drawn quietly.
+pub const WARN_AT_OR_BELOW: u32 = 3;
 
 /// A stale counter is ignored. This only matters when sudo was invoked without
 /// going through our wrapper, which is the one path that never resets it.
@@ -105,12 +106,22 @@ impl Budget {
         self.remaining == 0
     }
 
-    /// The window warning shown as the budget runs low, or `None` while there
-    /// is still room -- or when the account is already locked, which `refusal`
-    /// speaks to instead.
-    pub fn warning(&self) -> Option<String> {
-        (self.remaining > 0 && self.remaining < WARN_BELOW).then(|| {
-            format!("{} attempt(s) left before the account locks", self.remaining)
+    /// The line that stands under the field for the whole life of the window:
+    /// what is left of the shared faillock budget, and whether that is few
+    /// enough to say so in the error colour.
+    ///
+    /// Shown at all times rather than only when it runs low. The number is
+    /// what the window is for -- polkit failures lock sudo and login too, so
+    /// "how much room is left" is worth knowing before it is nearly gone.
+    ///
+    /// `None` only when the account is already locked, which `refusal` speaks
+    /// to instead and which never reaches a window anyway.
+    pub fn status(&self) -> Option<(String, bool)> {
+        (self.remaining > 0).then(|| {
+            (
+                format!("{} attempt(s) left before the account locks", self.remaining),
+                self.remaining <= WARN_AT_OR_BELOW,
+            )
         })
     }
 
@@ -366,15 +377,29 @@ When                Type  Source   Valid
     }
 
     #[test]
-    fn a_warning_shows_only_in_the_low_band() {
+    fn the_budget_line_is_always_there() {
         let b = |remaining| Budget { remaining, unlock_in: None };
-        assert_eq!(b(10).warning(), None);
-        assert_eq!(b(4).warning(), None);
+        // Ten left is not a warning, but the window says so all the same.
         assert_eq!(
-            b(3).warning().as_deref(),
-            Some("3 attempt(s) left before the account locks")
+            b(10).status(),
+            Some(("10 attempt(s) left before the account locks".to_owned(), false))
         );
-        assert_eq!(b(0).warning(), None, "a locked account warns via refusal, not here");
+        assert_eq!(b(0).status(), None, "a locked account speaks through refusal");
+    }
+
+    #[test]
+    fn only_three_or_fewer_turn_the_line_red() {
+        let warned = |remaining| {
+            Budget { remaining, unlock_in: None }
+                .status()
+                .expect("not locked")
+                .1
+        };
+        assert!(!warned(5));
+        assert!(!warned(4));
+        assert!(warned(WARN_AT_OR_BELOW));
+        assert!(warned(3));
+        assert!(warned(1));
     }
 
     #[test]

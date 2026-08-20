@@ -65,6 +65,10 @@ pub struct Subject {
     pub message: String,
     /// Whose password is being asked. The helper's prompt never says.
     pub user: Option<String>,
+    /// The standing budget line and whether it is low enough to alarm, from
+    /// `attempts::Budget::status`. It does not change while the window is up,
+    /// so it is a property of the request rather than a message on the channel.
+    pub attempts: Option<(String, bool)>,
 }
 
 /// Show the window and pump it until the conversation ends.
@@ -304,25 +308,41 @@ impl eframe::App for Window {
                         })
                         .inner;
 
+                    // Two lines under the field, and they say different kinds
+                    // of thing. The first is what just happened -- a wrong
+                    // password, something PAM wants shown -- and comes and
+                    // goes. The second is how much of the shared faillock
+                    // budget is left, which is true for as long as the window
+                    // is open and so is never taken away to make room.
                     ui.add_space(14.0);
-                    match (&self.notice, self.waiting) {
-                        (Some((text, true)), _) => ui.label(
+                    let transient = match (&self.notice, self.waiting) {
+                        (Some((text, error)), _) => Some((text.as_str(), *error)),
+                        (None, true) => Some(("Checking...", false)),
+                        // Keeps the line's height so the budget below it does
+                        // not jump when a notice arrives.
+                        (None, false) => None,
+                    };
+                    match transient {
+                        Some((text, true)) => ui.label(
                             egui::RichText::new(text)
                                 .size(11.0)
                                 .color(ui.visuals().error_fg_color),
                         ),
-                        (Some((text, false)), _) => {
+                        Some((text, false)) => {
                             ui.label(egui::RichText::new(text).size(11.0).weak())
                         }
-                        (None, true) => {
-                            ui.label(egui::RichText::new("Checking...").size(11.0).weak())
-                        }
-                        (None, false) => ui.label(
-                            egui::RichText::new("Enter to confirm    Esc to cancel")
-                                .size(11.0)
-                                .weak(),
-                        ),
+                        None => ui.label(egui::RichText::new(" ").size(11.0)),
                     };
+
+                    if let Some((text, low)) = &self.subject.attempts {
+                        ui.add_space(2.0);
+                        let text = egui::RichText::new(text).size(11.0);
+                        ui.label(if *low {
+                            text.color(ui.visuals().error_fg_color)
+                        } else {
+                            text.weak()
+                        });
+                    }
 
                     if entered && !self.waiting && !self.password.is_empty() {
                         self.submit();
