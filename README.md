@@ -40,6 +40,7 @@ all of it measured on this machine, not asserted:
 | Password hardening — no core dump, no swap, locked in RAM, wiped | ✓ | ✗ — the password lives in the long-lived shell process |
 | Excluded from screen sharing and recording | ✓ | ✗ — a layer surface can't carry the rule |
 | Shows the **actual command** that is asking | ✓ `pacman -Syu` | a random unit name (`run-p1592…service`) |
+| …and what a desktop request will do | ✓ `mount the filesystem` | ✓ |
 | Refuses callers that aren't polkit | ✓ | ✗ — neither reference agent checks |
 | Shows the shared lockout budget at all times · refuses a locked account | ✓ | ✗ |
 | Counts down the caller's 25-second deadline | ✓ | ✗ |

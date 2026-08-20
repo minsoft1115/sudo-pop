@@ -142,10 +142,13 @@ pub fn run() -> ! {
         last
     });
 
+    let command = (subject_pid != 0)
+        .then(|| invocation::command_of(subject_pid))
+        .flatten();
+    let action = std::env::var("SUDO_POP_ACTION").unwrap_or_default();
     let subject = Subject {
-        command: (subject_pid != 0)
-            .then(|| invocation::command_of(subject_pid))
-            .flatten(),
+        purpose: invocation::purpose(&message, &action, command.is_some()),
+        command,
         message,
         user: (!user_display.is_empty()).then_some(user_display),
         attempts,

@@ -85,6 +85,9 @@ pub fn run(prompt: Option<OsString>) -> ! {
     let user = crate::username(unsafe { libc::getuid() });
     let subject = Subject {
         command: invocation::command_from_sudo(),
+        // sudo's own path has no polkit action and no sentence to show; the
+        // command line is the whole of what there is to say.
+        purpose: None,
         message: "sudo".to_owned(),
         user,
         attempts,

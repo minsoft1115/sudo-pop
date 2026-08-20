@@ -421,9 +421,67 @@ else
 fi
 
 # =============================================================================
+head_ "10. GUI 유래 요청과 자체 백스톱"
+# 여기까지의 시나리오는 전부 run0 을 통했다. 데스크톱 앱이 거는 요청은 폴킷이
+# 주는 것이 다르다 — message 가 사람 말이고, subject 의 cmdline 은 "무엇을 할지"
+# 가 아니라 "누가 묻는지"다. pkcheck 로 그 경로를 그대로 만든다.
+if start_agent; then
+  MOUNT=org.freedesktop.udisks2.filesystem-mount-system
+  pkcheck --action-id "$MOUNT" --process $$ --allow-user-interaction >/dev/null 2>&1 &
+  PKC=$!
+  if wait_window; then
+    ok "데스크톱 액션에도 창이 뜬다 (run0 이 아닌 경로)"
+    grep -q "action_id  : $MOUNT" "$WORK/agent.log" \
+      && ok "폴킷이 보낸 액션이 그대로 온다" || bad "action_id 가 로그에 없다"
+    # 이 문장이 창의 둘째 줄이 된다. run0 의 message 와 달리 쓸모가 있다.
+    grep -q "message    : Authentication is required to mount" "$WORK/agent.log" \
+      && ok "message 가 무엇을 할지 말해 준다" \
+      || bad "message 가 예상과 다르다" "$(grep 'message    :' "$WORK/agent.log" | tail -1)"
+
+    for i in $(seq 1 20); do
+      [ "$(hyprctl activewindow -j | jq -r .class)" = "sudo-askpass" ] && break; sleep 0.25
+    done
+    closed=no
+    for attempt in 1 2 3; do
+      hyprctl dispatch 'hl.dsp.send_shortcut({ mods = 0, key = "escape", window = "class:sudo-askpass" })' >/dev/null 2>&1
+      for i in $(seq 1 12); do [ "$(windows)" = 0 ] && { closed=yes; break; }; sleep 0.25; done
+      [ "$closed" = yes ] && break
+    done
+    [ "$closed" = yes ] && ok "Esc 로 닫힌다" || bad "Esc 후에도 창이 남아 있다"
+  else
+    bad "데스크톱 액션에 창이 뜨지 않았다" "$(tail -3 "$WORK/agent.log")"
+  fi
+  kill $PKC 2>/dev/null
+
+  # 자체 백스톱. pkcheck 는 자기 타임아웃이 없어서 폴킷이 25초에 취소해 주지
+  # 않는다 — 창을 닫는 것이 우리 30초뿐인 유일한 경우다. 이것이 안 돌면 창이
+  # 영영 남는다. 30초를 기다리는 값이 그래서 있다.
+  pkcheck --action-id "$MOUNT" --process $$ --allow-user-interaction >/dev/null 2>&1 &
+  PKC2=$!
+  if wait_window; then
+    t0=$(date +%s)
+    gone=no
+    for i in $(seq 1 80); do [ "$(windows)" = 0 ] && { gone=yes; break; }; sleep 0.5; done
+    took=$(( $(date +%s) - t0 ))
+    if [ "$gone" = yes ] && [ "$took" -ge 25 ] && [ "$took" -le 38 ]; then
+      ok "호출자가 포기하지 않아도 자체 백스톱이 창을 닫는다 (${took}초)"
+    else
+      bad "백스톱이 예상대로 돌지 않았다" "closed=$gone took=${took}초"
+    fi
+  else
+    bad "두 번째 창이 뜨지 않아 백스톱을 못 봄"
+  fi
+  kill $PKC2 2>/dev/null
+  for p in $(agent_children); do kill "$p" 2>/dev/null; done
+  kill "$AGENT" 2>/dev/null; AGENT=""
+else
+  bad "에이전트가 등록되지 않아 10번을 건너뜀"
+fi
+
+# =============================================================================
 # 비밀번호가 필요한 케이스. 사람이 있어야 하므로 foot 창을 띄워 맡긴다.
 if [ "$WITH_PASSWORD" = 1 ]; then
-  head_ "10. 성공 경로 (직접 입력)"
+  head_ "11. 성공 경로 (직접 입력)"
   "$BIN" --init >/dev/null 2>&1
   omarchy-plugin-disable omarchy.polkit >/dev/null 2>&1; sleep 1
   systemctl --user restart sudo-pop-agent.service 2>/dev/null || start_agent

@@ -45,6 +45,20 @@ fn ceil_secs(left: Duration) -> u64 {
     left.as_millis().div_ceil(1000) as u64
 }
 
+/// The number to draw, or `None` for "do not draw one".
+///
+/// Zero is where the estimate stops being one. The 25 seconds belongs to the
+/// caller's bus library, not to us, and a caller that sets no timeout of its
+/// own -- `pkcheck` waits indefinitely, measured -- is still very much waiting
+/// when the count runs out. A red `0s` on a live request is a lie, and the
+/// only requests that ever reach zero on screen are the ones it lies about:
+/// a caller that really did time out has polkitd cancel it, which closes the
+/// window in the same moment.
+fn countdown(left: Duration) -> Option<u64> {
+    let secs = ceil_secs(left);
+    (secs > 0).then_some(secs)
+}
+
 /// Nerd Font padlock (nf-fa-lock) -- the same glyph the system polkit dialog
 /// uses. The Omarchy monospace font carries it; without a Nerd Font egui draws
 /// a box, so this assumes the target platform (Omarchy) it is built for.
@@ -76,8 +90,12 @@ pub enum FromUi {
 pub struct Subject {
     /// The command behind the request, if it could be established.
     pub command: Option<String>,
-    /// polkit's own wording, used when there is no command to show.
+    /// polkit's own wording, the last thing tried when nothing better exists.
     pub message: String,
+    /// What the request will do, from `invocation::purpose`: the second line
+    /// under the command, and the headline when there is no command. `None`
+    /// where polkit's sentence would add nothing (the `run0` path).
+    pub purpose: Option<String>,
     /// Whose password is being asked. The helper's prompt never says.
     pub user: Option<String>,
     /// The standing budget line and whether it is low enough to alarm, from
@@ -209,7 +227,7 @@ impl Window {
     /// for its whole length.
     fn seconds_left(&self) -> Option<u64> {
         let deadline = self.subject.deadline?;
-        Some(ceil_secs(deadline.saturating_duration_since(Instant::now())))
+        countdown(deadline.saturating_duration_since(Instant::now()))
     }
 
     fn submit(&mut self) {
@@ -267,6 +285,7 @@ impl eframe::App for Window {
                         .subject
                         .command
                         .clone()
+                        .or_else(|| self.subject.purpose.clone())
                         .unwrap_or_else(|| self.subject.message.clone());
                     ui.add(
                         egui::Label::new(
@@ -277,6 +296,23 @@ impl eframe::App for Window {
                         )
                         .truncate(),
                     );
+
+                    // What it will do, when the command line does not already
+                    // say. A desktop app's line names the binary and nothing
+                    // else; this is where "mount the filesystem" appears.
+                    if let Some(purpose) = self
+                        .subject
+                        .command
+                        .is_some()
+                        .then_some(self.subject.purpose.as_ref())
+                        .flatten()
+                    {
+                        ui.add_space(3.0);
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(purpose).size(11.0))
+                                .truncate(),
+                        );
+                    }
 
                     // Whose password this is. The helper's prompt is a bare
                     // "Password:" and never says, so the window does.
@@ -415,6 +451,13 @@ mod tests {
         assert_eq!(ceil_secs(Duration::from_millis(1000)), 1);
         assert_eq!(ceil_secs(Duration::from_millis(1001)), 2);
         assert_eq!(ceil_secs(Duration::from_secs(25)), 25);
+    }
+
+    #[test]
+    fn a_spent_countdown_is_not_drawn_at_all() {
+        assert_eq!(countdown(Duration::ZERO), None);
+        assert_eq!(countdown(Duration::from_millis(1)), Some(1));
+        assert_eq!(countdown(Duration::from_secs(25)), Some(25));
     }
 
     #[test]

@@ -107,10 +107,15 @@ polkitd 의 고유 이름을 **읽기 전에 `NameOwnerChanged` 를 구독한다
   (`attempts::WARN_AT_OR_BELOW`). 조작 안내(Enter·Esc)는 띄우지 않는다
 - 이벤트 루프는 프로세스당 하나만 만들 수 있다. 창이 메인 스레드를 갖고 대화가 옆 스레드로 간다
 - 자체 타임아웃 30초. **폴킷 호출자는 25초에 포기한다** — 그 뒤는 백스톱일 뿐이다
-- 그 25초를 **우상단 여백에 1초 단위로 센다.** 5초 이하이면 경고색. 기준은 자식이 뜬
+- 그 25초를 **우상단 여백에 1초 단위로 센다.** 5초 이하이면 경고색, **0 이 되면 지운다** —
+  자기 타임아웃이 없는 호출자(`pkcheck`)는 그 뒤로도 기다리므로 빨간 `0s` 는 거짓말이 된다. 기준은 자식이 뜬
   시각이 아니라 **에이전트가 요청을 받은 시각**이다 — 큐에서 흘린 시간을 다시 내주면
   없는 여유를 약속하게 된다. sudo 경로는 마감이 없으므로 아무것도 세지 않는다
-- 창에 띄우는 것은 polkit 의 `message` 가 아니라 **`polkit.subject-pid` 의 cmdline** 이다
+- 첫 줄은 polkit 의 `message` 가 아니라 **`polkit.subject-pid` 의 cmdline** 이다
+- 둘째 줄은 **무엇을 하려는지**(`invocation::purpose`). polkit 의 `message` 에서 상투구를
+  걷어낸 것이고, **`manage-units`(run0) 에서는 띄우지 않는다** — 그 문장은 난수 유닛 이름뿐이라
+  첫 줄이 이미 더 많이 말한다. 반대로 데스크톱 앱은 첫 줄이 바이너리 이름뿐이라 이 줄이
+  유일한 단서다 (`rationale.md` §20)
 - 테마 색은 `colors.toml` 에 더해 **`shell.toml` 의 `[polkit]` 섹션**을 읽어 시스템 창과 맞춘다 (실패색 `text-error` 포함)
 - 폰트 체인은 Omarchy 의 monospace 면이 앞이고, **우리가 쓰지 않은 글자**(cmdline·polkit
   message·PAM 프롬프트)에 ASCII 밖 문자가 있을 때만 `fc-match :charset=` 으로 한 면을

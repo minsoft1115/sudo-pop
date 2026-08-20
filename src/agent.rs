@@ -178,7 +178,9 @@ impl Agent {
         if tracing() {
             println!("  left       : {} ms", left.as_millis());
         }
-        let code = self.ask(&name, &cookie, subject_pid, &message, left).await;
+        let code = self
+            .ask(&name, &cookie, subject_pid, &message, &action_id, left)
+            .await;
 
         // Drop any late cancel marker so the set cannot grow without bound.
         let _ = self.take_cancelled(&cookie);
@@ -241,6 +243,7 @@ impl Agent {
         cookie: &str,
         subject_pid: u32,
         message: &str,
+        action_id: &str,
         left: std::time::Duration,
     ) -> i32 {
         let Ok(exe) = std::env::current_exe() else {
@@ -252,6 +255,7 @@ impl Agent {
             .env("SUDO_POP_USER", username)
             .env("SUDO_POP_SUBJECT_PID", subject_pid.to_string())
             .env("SUDO_POP_MESSAGE", message)
+            .env("SUDO_POP_ACTION", action_id)
             .env("SUDO_POP_LEFT_MS", left.as_millis().to_string())
             .stdin(Stdio::piped())
             .spawn();
