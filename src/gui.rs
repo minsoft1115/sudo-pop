@@ -28,7 +28,46 @@ use crate::theme;
 /// this string, so the two must stay in step.
 pub const APP_ID: &str = "sudo-askpass";
 
-const WINDOW_SIZE: [f32; 2] = [400.0, 200.0];
+const WINDOW_HEIGHT: f32 = 200.0;
+
+/// The window is as wide as the lines it has to show, between these.
+///
+/// The command line is why. `run0 pacman -Syu` fits in 400 with room to spare,
+/// but a systemd unit path, a desktop app's argv, or `sudo` on a long
+/// invocation does not -- and a truncated command is the one thing this window
+/// must not do, because that line is what tells you whether to type at all.
+/// 800 rather than "as wide as it takes": past that the eye stops reading a
+/// line and starts scanning it, and a password box has no business filling a
+/// screen.
+const MIN_WIDTH: f32 = 400.0;
+const MAX_WIDTH: f32 = 800.0;
+
+/// The panel's inner margin, on every side.
+const PANEL_MARGIN: f32 = 24.0;
+
+/// What the window costs around its widest line: the panel's inner margin on
+/// both sides, and a little slack so a line that just fits is not truncated by
+/// a rounding difference between measuring and drawing.
+const CHROME_WIDTH: f32 = PANEL_MARGIN * 2.0 + 8.0;
+
+/// The lock glyph and the gap between it and the field.
+const LOCK_WIDTH: f32 = 24.0;
+const LOCK_GAP: f32 = 6.0;
+
+/// The password row keeps the width it has in the narrowest window and is
+/// centred in anything wider.
+///
+/// It could stretch with the window, and that is what a text field normally
+/// does -- but the window only widens to fit a long *command*, and a password
+/// box that grows with the command reads as though the command belongs in it.
+/// The thing being typed is the same length whatever is being authorised.
+const FIELD_ROW_WIDTH: f32 = MIN_WIDTH - PANEL_MARGIN * 2.0;
+
+/// Text sizes, shared between measuring the window and drawing it. Measuring
+/// with one size and drawing with another is a bug that only shows up on the
+/// long lines nobody tests with.
+const HEADLINE_SIZE: f32 = 11.5;
+const DETAIL_SIZE: f32 = 11.0;
 
 /// Below this many seconds the countdown turns to the error colour, the same
 /// way the attempts line does when its budget runs low.
@@ -111,13 +150,60 @@ pub struct Subject {
     pub deadline: Option<Instant>,
 }
 
+impl Subject {
+    /// The first line: the command if we have one, else what polkit says the
+    /// request will do, else its raw wording.
+    fn headline(&self) -> String {
+        self.command
+            .clone()
+            .or_else(|| self.purpose.clone())
+            .unwrap_or_else(|| self.message.clone())
+    }
+
+    /// The second line, which exists only when the first one is a command and
+    /// polkit's sentence adds something to it.
+    fn detail(&self) -> Option<&str> {
+        self.command.is_some().then(|| self.purpose.as_deref())?
+    }
+}
+
+/// Wide enough for the lines it must show, within bounds.
+fn fitted_width(chain: &font::Chain, subject: &Subject) -> f32 {
+    let headline = subject.headline();
+    let mut lines = vec![(headline.as_str(), egui::FontId::monospace(HEADLINE_SIZE))];
+    if let Some(detail) = subject.detail() {
+        lines.push((detail, egui::FontId::proportional(DETAIL_SIZE)));
+    }
+    let text = chain.measure(&lines);
+    let width = clamp_width(text);
+    if std::env::var_os("SUDO_POP_DEBUG").is_some_and(|v| !v.is_empty()) {
+        eprintln!("sudo-pop: text {text:.0}pt -> window {width:.0}pt");
+    }
+    width
+}
+
+/// Text width to window width.
+fn clamp_width(text: f32) -> f32 {
+    (text + CHROME_WIDTH).clamp(MIN_WIDTH, MAX_WIDTH)
+}
+
 /// Show the window and pump it until the conversation ends.
 pub fn run(subject: Subject, to_ui: Receiver<ToUi>, from_ui: Sender<FromUi>) -> Result<(), String> {
+    // Built before the window rather than inside it: the size depends on how
+    // wide these lines come out, and that cannot be measured without the fonts.
+    let mut chain = font::Chain::new();
+    // The command line and polkit's wording are the only text here we did not
+    // write; either can be in any script.
+    chain.cover(subject.command.as_deref().unwrap_or_default());
+    chain.cover(subject.purpose.as_deref().unwrap_or_default());
+    chain.cover(&subject.message);
+    let width = fitted_width(&chain, &subject);
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id(APP_ID)
             .with_title(APP_ID)
-            .with_inner_size(WINDOW_SIZE)
+            .with_inner_size([width, WINDOW_HEIGHT])
             .with_decorations(false)
             .with_resizable(false),
         ..Default::default()
@@ -127,11 +213,6 @@ pub fn run(subject: Subject, to_ui: Receiver<ToUi>, from_ui: Sender<FromUi>) -> 
         APP_ID,
         options,
         Box::new(move |cc| {
-            let mut chain = font::Chain::new();
-            // The command line and polkit's wording are the only text here we
-            // did not write; either can be in any script.
-            chain.cover(subject.command.as_deref().unwrap_or_default());
-            chain.cover(&subject.message);
             chain.install(&cc.egui_ctx);
             if let Some(theme) = theme::load() {
                 cc.egui_ctx.set_theme(if theme.dark {
@@ -275,22 +356,17 @@ impl eframe::App for Window {
         let panel = ui.max_rect();
 
         egui::Frame::central_panel(ui.style())
-            .inner_margin(24)
+            .inner_margin(PANEL_MARGIN as i8)
             .show(ui, |ui| {
                 ui.vertical_centered_justified(|ui| {
                     // The command leads: the one cue that something unexpected is
                     // asking. polkit's own message says nothing useful for run0, so
                     // it is the fallback rather than the headline.
-                    let headline = self
-                        .subject
-                        .command
-                        .clone()
-                        .or_else(|| self.subject.purpose.clone())
-                        .unwrap_or_else(|| self.subject.message.clone());
+                    let headline = self.subject.headline();
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(headline)
-                                .size(11.5)
+                                .size(HEADLINE_SIZE)
                                 .family(egui::FontFamily::Monospace)
                                 .color(ui.visuals().hyperlink_color),
                         )
@@ -300,16 +376,10 @@ impl eframe::App for Window {
                     // What it will do, when the command line does not already
                     // say. A desktop app's line names the binary and nothing
                     // else; this is where "mount the filesystem" appears.
-                    if let Some(purpose) = self
-                        .subject
-                        .command
-                        .is_some()
-                        .then_some(self.subject.purpose.as_ref())
-                        .flatten()
-                    {
+                    if let Some(detail) = self.subject.detail() {
                         ui.add_space(3.0);
                         ui.add(
-                            egui::Label::new(egui::RichText::new(purpose).size(11.0))
+                            egui::Label::new(egui::RichText::new(detail).size(DETAIL_SIZE))
                                 .truncate(),
                         );
                     }
@@ -341,12 +411,15 @@ impl eframe::App for Window {
                     // no "Password:" label.
                     let entered = ui
                         .horizontal(|ui| {
+                            // Hold the row at its narrow-window width, centred.
+                            let slack = ui.available_width() - FIELD_ROW_WIDTH;
+                            ui.add_space((slack / 2.0).max(0.0));
                             // Centre the glyph in a box the height of the field,
                             // so it lines up with the input rather than riding high.
                             let field_h =
                                 ui.text_style_height(&egui::TextStyle::Monospace) + 16.0;
                             ui.add_sized(
-                                [24.0, field_h],
+                                [LOCK_WIDTH, field_h],
                                 egui::Label::new(
                                     egui::RichText::new(LOCK_GLYPH)
                                         .size(18.0)
@@ -354,7 +427,7 @@ impl eframe::App for Window {
                                         .color(ui.visuals().hyperlink_color),
                                 ),
                             );
-                            ui.add_space(6.0);
+                            ui.add_space(LOCK_GAP);
                             let field = ui.add_enabled(
                                 !self.waiting,
                                 egui::TextEdit::singleline(self.password.buffer_mut())
@@ -362,7 +435,7 @@ impl eframe::App for Window {
                                     .char_limit(crate::secret::MAX_CHARS)
                                     .font(egui::TextStyle::Monospace)
                                     .margin(egui::Margin::symmetric(10, 8))
-                                    .desired_width(f32::INFINITY),
+                                    .desired_width(FIELD_ROW_WIDTH - LOCK_WIDTH - LOCK_GAP),
                             );
                             if !self.focus_set && !self.waiting {
                                 field.request_focus();
@@ -451,6 +524,29 @@ mod tests {
         assert_eq!(ceil_secs(Duration::from_millis(1000)), 1);
         assert_eq!(ceil_secs(Duration::from_millis(1001)), 2);
         assert_eq!(ceil_secs(Duration::from_secs(25)), 25);
+    }
+
+    #[test]
+    fn short_lines_leave_the_window_at_its_usual_size() {
+        assert_eq!(clamp_width(0.0), MIN_WIDTH);
+        assert_eq!(clamp_width(MIN_WIDTH - CHROME_WIDTH - 1.0), MIN_WIDTH);
+    }
+
+    #[test]
+    fn a_long_line_widens_the_window_but_only_so_far() {
+        let grown = clamp_width(MIN_WIDTH);
+        assert_eq!(grown, MIN_WIDTH + CHROME_WIDTH);
+        assert!(grown > MIN_WIDTH && grown < MAX_WIDTH);
+        assert_eq!(clamp_width(10_000.0), MAX_WIDTH, "a runaway argv cannot fill the screen");
+    }
+
+    #[test]
+    fn the_password_row_does_not_grow_with_the_window() {
+        // It is sized to the narrow window and centred in anything wider, so
+        // the box a password goes into looks the same whatever is asking.
+        assert_eq!(FIELD_ROW_WIDTH, MIN_WIDTH - PANEL_MARGIN * 2.0);
+        assert!(FIELD_ROW_WIDTH < MIN_WIDTH);
+        assert!(LOCK_WIDTH + LOCK_GAP < FIELD_ROW_WIDTH);
     }
 
     #[test]

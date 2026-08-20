@@ -231,7 +231,10 @@ if wait_window; then
   win=$(hyprctl clients -j | jq '.[]|select(.class=="sudo-askpass")')
   [ "$(echo "$win" | jq -r .floating)" = "true" ] && ok "창이 떠 있다 (floating)" || bad "floating 이 아니다"
   [ "$(echo "$win" | jq -r .pinned)" = "true" ]   && ok "창이 고정된다 (pin)"    || bad "pin 이 아니다"
-  [ "$(echo "$win" | jq -r '.size|join("x")')" = "400x200" ] && ok "창 크기가 규칙대로" || bad "창 크기가 다르다"
+  # 폭은 보여 줄 줄에 맞춰 400~800 사이에서 정해진다. 높이는 고정이다.
+  ww=$(echo "$win" | jq -r '.size[0]'); wh=$(echo "$win" | jq -r '.size[1]')
+  { [ "$ww" -ge 400 ] && [ "$ww" -le 800 ] && [ "$wh" = 200 ]; } \
+    && ok "창 크기가 규칙대로 (${ww}x${wh})" || bad "창 크기가 다르다" "${ww}x${wh}"
 
   # 화면 공유 제외: 창 영역을 찍으면 내용이 없어야 한다
   geom=$(echo "$win" | jq -r '"\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"')

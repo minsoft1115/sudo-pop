@@ -628,8 +628,6 @@ mod tests {
         assert!(!Seat::Process("polkit-kde-auth".into()).hint().contains(".service"));
     }
 
-    use super::*;
-
     const B: &str = "-- x:begin";
     const E: &str = "-- x:end";
     const BODY: &str = "the body";

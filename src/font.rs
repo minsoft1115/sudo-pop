@@ -128,6 +128,29 @@ impl Chain {
         true
     }
 
+    /// The width in points the widest of these lines needs, laid out with this
+    /// chain exactly as the window will lay it out.
+    ///
+    /// Built and thrown away, because the window does not exist yet: egui's own
+    /// `Fonts` is not available until the first frame, and the size has to be
+    /// decided before there is a window to have a size. Measured at 0.2 ms for
+    /// the Latin chain and 1.2 ms with a CJK face behind it (§16-3), against a
+    /// launch that takes about 40 ms.
+    ///
+    /// Counting characters instead would be wrong for a proportional face and
+    /// wrong by a factor of two for CJK.
+    pub fn measure(&self, lines: &[(&str, egui::FontId)]) -> f32 {
+        use eframe::egui::epaint::text::{Fonts, TextOptions};
+
+        let mut fonts = Fonts::new(TextOptions::default(), self.defs.clone());
+        let mut view = fonts.with_pixels_per_point(1.0);
+        lines.iter().fold(0.0_f32, |widest, (text, font)| {
+            let galley =
+                view.layout_no_wrap((*text).to_owned(), font.clone(), egui::Color32::WHITE);
+            widest.max(galley.rect.width())
+        })
+    }
+
     /// Hand the chain to egui. Takes effect on the next frame.
     pub fn install(&self, ctx: &egui::Context) {
         ctx.set_fonts(self.defs.clone());

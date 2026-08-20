@@ -100,7 +100,11 @@ polkitd 의 고유 이름을 **읽기 전에 `NameOwnerChanged` 를 구독한다
 ### 2-6. 창
 
 - app-id 는 `sudo-askpass`. `assets/sudo-pop.lua` 의 규칙이 이 이름으로 매칭한다
-- 규칙: `float`·`center`·`size 400 200`·`dim_around`·`stay_focused`·`pin`·**`no_screen_share`**
+- 규칙: `float`·`center`·`dim_around`·`stay_focused`·`pin`·**`no_screen_share`**.
+  **`size` 규칙은 두지 않는다** — 두면 클라이언트가 요청한 폭을 덮어쓴다
+- 폭은 **보여 줄 줄에 맞춰 400~800**. 창을 만들기 전에 같은 폰트 체인으로 실제 폭을 재고
+  (`font::Chain::measure`), 높이는 200 고정이다. **입력칸은 안 늘어난다** — 400 창에서의
+  폭 그대로 가운데에 둔다 (`rationale.md` §21)
 - 요청 하나에 창 하나. PAM 이 여러 번 물어도 창은 그대로 두고 글자만 바꾼다
 - 입력칸 아래 두 줄은 성격이 다르다. 위는 **지나가는 것**(`Wrong`·PAM 메시지·`Checking...`)
   이고, 아래는 **상시**로 남는 faillock 잔여 횟수다. 잔여가 **3 이하이면 경고색**
