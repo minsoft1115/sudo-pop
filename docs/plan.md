@@ -96,6 +96,10 @@ faillock 카운터는 **sudo·polkit·로그인이 공유한다.** polkit 에서
 - 자체 타임아웃 30초. **폴킷 호출자는 25초에 포기한다** — 그 뒤는 백스톱일 뿐이다
 - 창에 띄우는 것은 polkit 의 `message` 가 아니라 **`polkit.subject-pid` 의 cmdline** 이다
 - 테마 색은 `colors.toml` 에 더해 **`shell.toml` 의 `[polkit]` 섹션**을 읽어 시스템 창과 맞춘다 (실패색 `text-error` 포함)
+- 폰트 체인은 Omarchy 의 monospace 면이 앞이고, **우리가 쓰지 않은 글자**(cmdline·polkit
+  message·PAM 프롬프트)에 ASCII 밖 문자가 있을 때만 `fc-match :charset=` 으로 한 면을
+  꼬리에 더한다. egui 는 글리프 폴백을 하지 않으므로 이것이 없으면 한글이 `◻` 가 된다
+  (`rationale.md` §16). 8MB 상한은 **주 폰트에만** 건다
 
 ### 2-7. 라우팅
 
@@ -171,6 +175,7 @@ assets/sudo-pop.lua · assets/sudo-pop.sh
 cargo test                            단위 + 통합. 환경 없이 돈다
 tests/scenarios.sh                    polkitd·버스·컴포지터가 필요한 것들
 tests/scenarios.sh --with-password    위 + 사람이 비밀번호를 넣는 한 케이스
+cargo run --release --example font-cost   폰트 체인 비용 실측 (rationale §16-3)
 ```
 
 `tests/fake-helper.sh` 가 헬퍼 행세를 하고, `SUDO_POP_HELPER_BIN`·`SUDO_POP_HELPER_SOCKET`

@@ -968,9 +968,10 @@ askpass 모드도 돌아왔다. 창 코드는 에이전트와 **같은 것을 �
 세 층으로 나뉜다. 위로 갈수록 환경을 더 요구하고, 아래로 갈수록 자주 돌린다.
 
 ```
-cargo test                  24 단위 + 9 통합 — 환경 없이 돈다
+cargo test                  77 단위 + 8 통합 — 환경 없이 돈다
 tests/scenarios.sh          27 시나리오 — polkitd·버스·컴포지터가 필요하다
 tests/scenarios.sh --with-password   위 + 사람이 비밀번호를 넣는 한 케이스
+cargo run --release --example font-cost   폰트 비용 실측 (§16-3)
 ```
 
 ### 단위·통합 (`cargo test`)
@@ -1025,3 +1026,136 @@ Hyprland 와 실제 polkitd 를 시험 장비로 쓴다. 세션을 원래대로 
 
 성공 경로 하나뿐이다. `--with-password` 를 주면 **foot 창을 띄워** 거기서 입력받고,
 `run0` 이 실제로 명령을 실행했는지(`exit=0`)까지 본다.
+---
+
+## 16. 한글이 두부로 나오던 것 — 실측과 고침
+
+`audit.md` 의 L3 는 "CJK 폰트 8MB 상한으로 현지화 메시지가 깨질 수 있음" 한 줄이었다.
+파고 보니 **상한은 원인이 아니었고, 조건도 현지화가 아니었다.**
+
+### 16-1. 무엇이 깨졌나
+
+egui 에는 **글리프 단위 폴백이 없다.** 체인은 우리가 `FontDefinitions` 에 넣은 목록이
+전부다. 터미널·GTK·브라우저가 한글을 잘 그리는 것은 못 그리는 글리프마다 fontconfig 에
+다시 물어보기 때문인데, `font.rs` 는 `fc-match monospace` 를 **한 번** 묻고 그 답만 들고 있었다.
+
+체인에 무엇이 있었는지 세어 봤다.
+
+| | 한글 |
+|---|---|
+| `omarchy-font-list` 의 다섯 후보 — Adwaita Mono, iA Writer Mono S, JetBrainsMono NF, Liberation Mono, Nimbus Mono PS | **전부 없음** |
+| egui 번들 넷 — Hack, Ubuntu-Light, NotoEmoji, emoji-icon-font | **전부 없음** |
+
+`omarchy-font-set` 은 터미널 모노스페이스를 고르는 도구라 CJK 는 애초에 후보가 아니다.
+시스템에 `noto-cjk` 는 깔려 있다 — Omarchy 가 그것을 `monospace` 로 가리키지 않을 뿐이다.
+그래서 **시스템 전체에서 한글이 멀쩡한데 우리 창에서만 깨지는** 모양이 된다.
+
+깨지는 모양은 epaint 의 대체 글리프다.
+
+```rust
+const PRIMARY_REPLACEMENT_CHAR: char = '◻';  // epaint-0.36.1/src/text/fonts.rs:643
+```
+
+즉 `sudo vim 계획서.md` 는 창 맨 윗줄에 `vim ◻◻◻.md` 로 떴다. 하필 그 줄이 "지금 무엇에
+비밀번호를 주는가" 를 알려 주는 정보고, README 가 omarchy.polkit 대비 우위로 내세운 항목이다.
+
+**로케일과 무관하다.** L3 가 상정한 것은 `locale` 을 넘겨 받는 polkit 의 번역 메시지였는데,
+`gui.rs` 는 `message` 보다 **subject-pid 의 cmdline** 을 앞세운다 (§3-5). cmdline 은 사용자가
+친 것이라 `LANG=en_US.UTF-8` 인 이 머신에서도 한글 파일명 하나로 바로 재현된다.
+
+### 16-2. 고친 방식 — 필요할 때만 늘어나는 체인
+
+`font::Chain` 이 생겼다. Omarchy 면이 맨 앞에 서고, **우리가 쓰지 않은 글자**(cmdline,
+polkit 의 message, PAM 프롬프트)에 ASCII 밖 문자가 있을 때만 뒤에 한 면이 더 붙는다.
+
+```
+foreign_chars("vim 계획서.md")  →  ['계','획','서']       ASCII 는 버린다
+charset_query(..)              →  ":charset=ACC4 D68D C11C"
+fc-match                       →  Noto Sans CJK JP        체인 꼬리에
+```
+
+결정 세 가지.
+
+- **스크립트를 우리가 판정하지 않는다.** 어떤 Nerd Font 가 무엇을 담는지 표를 들고 있느니
+  fontconfig 에 문자를 그대로 넘긴다. 한글·일본어·아랍어가 같은 코드로 처리된다
+- **fontconfig 이 이미 가진 파일을 답하면 아무것도 안 한다.** `café` 는 Omarchy 면이 이미
+  덮으므로 fc-match 가 그 파일을 되돌려 주고, 바이트를 **읽기 전에** 걸러진다
+- **폴백에는 8MB 상한을 걸지 않는다.** 설치된 한글 면 중 가장 작은 것이 16.7MB 고
+  (`NotoSansCJK-Thin.ttc`), 상한을 걸면 두부가 그대로 남는다. 상한은 매 실행 파싱하는
+  **주 폰트에만** 남긴다
+
+**함정 하나.** 한글 면을 찾는 뻔한 질의가 이 시스템에서 거짓말을 한다.
+
+```
+fc-match ":lang=ko"          → Liberation Sans     ← 한글 없음
+fc-match "monospace:lang=ko" → JetBrainsMono NF    ← omarchy 의 monospace 규칙이 :lang 을 이긴다
+fc-match ":charset=AC00"     → Noto Sans CJK JP    ← 맞다
+```
+
+`:charset=` 으로 물어야 한다. 반환된 것이 `KR` 이 아니라 `JP` 면인 것은 상관없다 —
+Noto CJK 의 지역별 면은 한글 자모를 공통으로 싣고, 한자 기본 자형만 다르다.
+
+### 16-3. 얼마나 드나 — 실측
+
+`cargo run --release --example font-cost` 로 부분별 비용을, Hyprland 의 `openwindow`
+이벤트로 실제 창이 뜨는 시각을 쟀다 (2026-08-20, 같은 머신).
+
+| | min | mean |
+|---|---|---|
+| `fc-match monospace` | 6.28 ms | 6.53 ms |
+| `fc-match :charset=<한글 3자>` | 6.24 ms | 6.38 ms |
+| 주 폰트 읽기 (2.5MB, warm) | 0.12 ms | 0.36 ms |
+| 폴백 읽기 (19.5MB, warm) | 1.84 ms | 4.19 ms |
+| 폴백 읽기 (19.5MB, **cold**) | 4.81 ms | 5.09 ms |
+| egui 파싱 — 번들만 | 0.07 ms | 0.11 ms |
+| egui 파싱 — **+ 주 폰트 (지금까지)** | 0.20 ms | 0.34 ms |
+| egui 파싱 — **+ 폴백까지** | 1.24 ms | 1.60 ms |
+| 한 줄 배치 — 한글, 폴백 있음 | 1.51 ms | 1.56 ms |
+
+**19.5MB 를 싣는 값이 겁났는데 파싱은 1.2ms 였다.** epaint 는 harfrust 로 테이블만 읽고
+글리프는 쓸 때 굽는다. 진짜 비용은 폰트가 아니라 **`fc-match` 프로세스 하나(6.3ms)** 다.
+
+실제 창까지 (`--agent-prompt`, 7회, `openwindow` 이벤트 기준):
+
+```
+ascii  (pacman -Syu)    min 37.9 ms   median 39.4 ms
+korean (vim 계획서.md)   min 49.8 ms   median 51.5 ms
+```
+
+**한글일 때 12ms 늦게 뜬다. ASCII 경로는 이전과 완전히 같다.**
+
+### 16-4. 비동기로 먼저 띄우지 않는 이유
+
+"창을 먼저 띄우고 폰트는 뒤에서 싣자" 를 검토했고, **하지 않기로 했다.**
+
+- 차이가 **12ms** 다. 60Hz 한 프레임(16.7ms)보다 짧다. 창은 어느 쪽이든 40~50ms 에 뜬다
+- 얻는 것은 12ms 이르게 뜨는 창인데, 그 12ms 동안 화면에 있는 것은 **`vim ◻◻◻.md`** 다.
+  그 줄은 이 창의 존재 이유라, 틀린 것을 먼저 보여 주고 고치는 것은 손해다
+- 파싱(1.2ms)은 어차피 UI 스레드다. `FontsImpl::new` 가 체인의 모든 면을 한꺼번에 만들고,
+  그것이 `set_fonts` 다음 `begin_pass` 에서 돈다. 옆 스레드로 뺄 수 있는 것은 `fc-match`
+  와 파일 읽기뿐이고, 그마저 스레드·채널·대기 상태·리플로 한 프레임을 새로 들여야 한다
+
+**창이 뜬 뒤에 오는 글자는 이미 그 경로로 돈다.** PAM 이 나중에 보내는 프롬프트·안내는
+`drain()` 이 받을 때 `cover()` 를 거치고, 체인이 바뀌면 다음 프레임에 반영된다. 비동기가
+실제로 필요한 자리는 거기였고, 거기에는 이미 들어가 있다.
+
+### 16-5. 시험
+
+`cargo test` 에 12개가 붙었다 (65 → 77). 대부분 순수 함수라 환경이 필요 없다.
+
+| | |
+|---|---|
+| `foreign_chars` | ASCII 는 fc-match 를 부르지 않는다 / 한글만 추려낸다 / 중복 음절은 한 번 / 32자 상한 / 한·일·중 한 질의 |
+| `charset_query` | `계획` → `:charset=ACC4 D68D` |
+| `Chain::cover_with` | 폴백이 **꼬리**에 붙는다 (주 폰트가 계속 이긴다) / ASCII 는 조회조차 없다 / 이미 가진 파일이면 안 싣는다(`café`) / 두 번째 한글 프롬프트는 다시 안 싣는다 / 못 찾으면 체인 그대로 |
+| **`a_korean_command_line_becomes_drawable`** | 진짜 fontconfig·진짜 폰트로 `Fonts` 를 만들어 `has_glyphs("vim 계획서.md")` 를 묻는다. 프레임이 쓰는 것과 같은 경로라 **실제로 그려진다는 것**을 증명한다. 한글 면이 없는 머신에서는 건너뛴다 |
+
+실물로도 한 번 돌렸다 — cmdline 이 `vim 계획서.md` 인 프로세스를 subject 로 놓고
+`--agent-prompt` 를 띄우니 `sudo-pop: fell back to Noto Sans CJK JP (19484784 bytes) for 계획서`
+가 찍히고 (`SUDO_POP_DEBUG`) 창이 규칙대로 떴다.
+
+> **여기서 audit C2 가 실물로 확인됐다.** 처음에 `target/release` 로 시간을 재다가
+> `SUDO_POP_HELPER_BIN` 이 무시되는 바람에 **진짜 PAM 이 돌아 faillock 에 10건이 쌓였다.**
+> 릴리스 빌드가 시험용 env 를 안 읽는다는 C2 의 고침이 그대로 동작한 것이다.
+> `faillock --reset` 으로 치웠고, 측정은 `RUSTFLAGS="-C debug-assertions=yes"` 로
+> 최적화는 유지한 채 오버라이드만 살린 빌드로 다시 했다.

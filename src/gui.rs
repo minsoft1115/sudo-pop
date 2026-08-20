@@ -11,7 +11,9 @@
 //! one event loop per process (`EventLoopError::RecreationAttempt`), so this is
 //! the only place in the program that draws.
 //!
-//! Labels stay ASCII on purpose; see `font` for what that costs and why.
+//! Our own labels stay ASCII on purpose. The text we did not write -- the
+//! command line, polkit's message, PAM's prompts -- can be in any script, so
+//! the font chain grows to meet it; see `font`.
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
@@ -81,7 +83,12 @@ pub fn run(subject: Subject, to_ui: Receiver<ToUi>, from_ui: Sender<FromUi>) -> 
         APP_ID,
         options,
         Box::new(move |cc| {
-            font::apply(&cc.egui_ctx);
+            let mut chain = font::Chain::new();
+            // The command line and polkit's wording are the only text here we
+            // did not write; either can be in any script.
+            chain.cover(subject.command.as_deref().unwrap_or_default());
+            chain.cover(&subject.message);
+            chain.install(&cc.egui_ctx);
             if let Some(theme) = theme::load() {
                 cc.egui_ctx.set_theme(if theme.dark {
                     egui::Theme::Dark
@@ -90,7 +97,7 @@ pub fn run(subject: Subject, to_ui: Receiver<ToUi>, from_ui: Sender<FromUi>) -> 
                 });
                 cc.egui_ctx.set_visuals(theme.visuals());
             }
-            Ok(Box::new(Window::new(subject, to_ui, from_ui)))
+            Ok(Box::new(Window::new(subject, chain, to_ui, from_ui)))
         }),
     )
     .map_err(|e| format!("cannot open the password window: {e}"))
@@ -98,6 +105,7 @@ pub fn run(subject: Subject, to_ui: Receiver<ToUi>, from_ui: Sender<FromUi>) -> 
 
 struct Window {
     subject: Subject,
+    chain: font::Chain,
     to_ui: Receiver<ToUi>,
     from_ui: Sender<FromUi>,
     prompt: String,
@@ -111,9 +119,15 @@ struct Window {
 }
 
 impl Window {
-    fn new(subject: Subject, to_ui: Receiver<ToUi>, from_ui: Sender<FromUi>) -> Self {
+    fn new(
+        subject: Subject,
+        chain: font::Chain,
+        to_ui: Receiver<ToUi>,
+        from_ui: Sender<FromUi>,
+    ) -> Self {
         Self {
             subject,
+            chain,
             to_ui,
             from_ui,
             prompt: "Password:".into(),
@@ -128,10 +142,11 @@ impl Window {
 
     /// Take everything the helper thread has queued. Returns false when the
     /// conversation is over and the window should close.
-    fn drain(&mut self) -> bool {
+    fn drain(&mut self, ctx: &egui::Context) -> bool {
         loop {
             match self.to_ui.try_recv() {
                 Ok(ToUi::Prompt { text, echo }) => {
+                    self.cover(ctx, &text);
                     self.prompt = text;
                     self.echo = echo;
                     self.waiting = false;
@@ -139,14 +154,27 @@ impl Window {
                     // A new question deserves a fresh deadline.
                     self.deadline = Instant::now() + TIMEOUT;
                 }
-                Ok(ToUi::Info(text)) => self.notice = Some((text, false)),
+                Ok(ToUi::Info(text)) => {
+                    self.cover(ctx, &text);
+                    self.notice = Some((text, false));
+                }
                 Ok(ToUi::Error(text)) => {
+                    self.cover(ctx, &text);
                     self.notice = Some((text, true));
                     self.waiting = false;
                 }
                 Ok(ToUi::Done) | Err(TryRecvError::Disconnected) => return false,
                 Err(TryRecvError::Empty) => return true,
             }
+        }
+    }
+
+    /// PAM speaks after the window is up, so text can arrive in a script the
+    /// chain has no face for. A new chain takes effect on the next frame.
+    fn cover(&mut self, ctx: &egui::Context, text: &str) {
+        if self.chain.cover(text) {
+            self.chain.install(ctx);
+            ctx.request_repaint();
         }
     }
 
@@ -174,7 +202,7 @@ impl eframe::App for Window {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        if !self.drain() {
+        if !self.drain(&ctx) {
             self.password.wipe();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
