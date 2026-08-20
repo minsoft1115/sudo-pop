@@ -87,6 +87,16 @@ faillock 카운터는 **sudo·polkit·로그인이 공유한다.** polkit 에서
 
 `AuthenticationAgentResponse2` 는 **우리가 부르지 않는다.** 헬퍼가 root 로 보낸다.
 
+### 2-3-1. 소유자 추적
+
+polkitd 의 고유 이름을 **읽기 전에 `NameOwnerChanged` 를 구독한다.** 순서가 뒤집히면 그 사이의
+재시작을 놓쳐 죽은 이름으로 진짜 폴킷을 영영 거절한다 (`rationale.md` §17-2). 들고 있는 이름과
+같은 신호로는 재등록하지 않는다.
+
+등록 실패는 두 갈래다. `already exists for the given subject` 면 자리를 뺏긴 것이므로 **정상
+종료**하고 (`Restart=on-failure` 폭주 방지), 그 밖의 실패는 재시작이 고칠 수 있으므로 **실패로
+끝낸다.**
+
 ### 2-6. 창
 
 - app-id 는 `sudo-askpass`. `assets/sudo-pop.lua` 의 규칙이 이 이름으로 매칭한다
@@ -161,8 +171,10 @@ assets/sudo-pop.lua · assets/sudo-pop.sh
 | `~/.config/hypr/hyprland.lua` | `-- sudo-pop:begin/end` 마커와 require 한 줄 |
 | `~/.config/systemd/user/sudo-pop-agent.service` | `ExecStart=<절대경로> --agent`, `WantedBy=graphical-session.target` |
 
-- **다른 폴킷 에이전트가 있으면 유닛을 깔되 enable 하지 않는다.** 감지 1순위는
-  `omarchy.polkit` — 셸 안의 서비스라 프로세스 목록에 안 보인다
+- **다른 폴킷 에이전트가 있으면 유닛을 깔되 enable 하지 않는다.** 감지는 셋이다 —
+  ① `omarchy.polkit`(셸 안의 서비스라 프로세스 목록에 안 보인다) ② 우리 uid 의 `/proc/*/comm`
+  ③ 활성 user 유닛. **이름은 표가 아니라 `polkit`/`policykit` 포함 여부로 본다** — comm 은
+  커널이 15자에서 자르므로 정확한 이름 표는 긴 이름을 영영 놓친다 (`rationale.md` §17-1)
 - 등록 충돌은 **실패가 아닌 정상 종료**로 끝낸다. `Restart=on-failure` 가 무한히 되살린다
 - `--uninit` 은 우리 것만 지운다. 공유 로더 블록은 남긴다
 - `ExecStart` 에는 `--init` 을 실행한 바이너리의 절대 경로가 박힌다
@@ -175,6 +187,7 @@ assets/sudo-pop.lua · assets/sudo-pop.sh
 cargo test                            단위 + 통합. 환경 없이 돈다
 tests/scenarios.sh                    polkitd·버스·컴포지터가 필요한 것들
 tests/scenarios.sh --with-password    위 + 사람이 비밀번호를 넣는 한 케이스
+tests/scenarios.sh --restart-polkitd  위 + polkitd 를 실제로 재시작한다 (비밀번호 1회)
 cargo run --release --example font-cost   폰트 체인 비용 실측 (rationale §16-3)
 ```
 
@@ -194,4 +207,4 @@ cargo run --release --example font-cost   폰트 체인 비용 실측 (rationale
 | 지문 (`pam_fprintd`) | 이 머신에 `fprintd` 가 없다. PAM 파일은 `/etc` 와 `/usr/lib` 둘 다 봐야 한다 |
 | 신원 선택 UI | 관리자가 여럿인 환경에서만 의미가 있다 |
 | 레이어셸 서피스 | 전체화면 위 동작이 문제가 될 때 (`rationale.md` §2-4) |
-| polkitd 재시작 재등록 | 코드는 있으나 실측하지 않았다 |
+| polkitd 재시작 재등록 | **실측 완료.** `tests/scenarios.sh --restart-polkitd` (비밀번호 1회) |

@@ -126,6 +126,17 @@ fn subject(session: &str) -> (&'static str, HashMap<&'static str, Value<'_>>) {
     ("unix-session", details)
 }
 
+/// Does this registration error mean another agent already holds the seat?
+///
+/// polkitd answers a second registration for the same subject with this, and
+/// only this. Everything else -- polkitd not on the bus yet, a bus error --
+/// is something a restart might get past, and the two must not be confused:
+/// treating a transient error as "seat taken" leaves the session with no agent
+/// and no complaint.
+fn seat_is_taken(message: &str) -> bool {
+    message.contains("already exists for the given subject")
+}
+
 async fn register(conn: &Connection, session: &str) -> zbus::Result<()> {
     let authority = Proxy::new(
         conn,
@@ -189,6 +200,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let probe = Connection::system().await?;
     let dbus = zbus::fdo::DBusProxy::new(&probe).await?;
+
+    // Subscribe BEFORE reading the owner, not after registering.
+    //
+    // The sender check compares each request against polkitd's unique name,
+    // and that name changes when polkitd restarts. Reading it first and
+    // subscribing later leaves a window: a restart inside it emits the signal
+    // before there is anything listening, so the check keeps comparing against
+    // a dead name and refuses the real polkit -- for good, since the process
+    // never fails and so is never restarted. Subscribing first closes it.
+    let mut owner_changes = dbus.receive_name_owner_changed().await?;
+    if tracing() {
+        println!("watching {POLKIT_SERVICE} for owner changes");
+    }
+
     let owner = dbus.get_name_owner(POLKIT_SERVICE.try_into()?).await?;
     if tracing() {
         println!("polkitd owns {POLKIT_SERVICE} as {owner}");
@@ -221,8 +246,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(e) = register(&conn, &session).await {
         println!("\nREFUSED: {e}");
-        println!("(expected while another agent holds this session)");
-        return Ok(());
+        if seat_is_taken(&e.to_string()) {
+            // Someone else holds the seat. Restarting cannot win it, and
+            // `Restart=on-failure` would keep trying, so end successfully.
+            println!("(expected while another agent holds this session)");
+            return Ok(());
+        }
+        // Anything else -- polkitd away, the bus refusing -- may well be gone
+        // by the next try, and exiting 0 here would leave the session with no
+        // agent and nothing saying so.
+        eprintln!("sudo-pop: registration failed for a reason a restart may fix");
+        std::process::exit(1);
     }
     if tracing() {
         println!("\nREGISTERED. this session's prompts come here now.");
@@ -232,10 +266,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // polkitd restarting takes our registration with it, and its unique name
-    // changes -- which is also what the sender check compares against.
-    let dbus = zbus::fdo::DBusProxy::new(&conn).await?;
-    let mut owner_changes = dbus.receive_name_owner_changed().await?;
-
+    // changes -- which is also what the sender check compares against. The
+    // stream this reads was subscribed before any of the above, so a restart
+    // during startup is waiting in it rather than lost.
     loop {
         if HANDLED.load(Ordering::SeqCst) {
             break;
@@ -249,19 +282,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     && args.name() == POLKIT_SERVICE
                     && let Some(new_owner) = args.new_owner().as_ref()
                 {
-                    if tracing() {
-                        println!("polkitd came back as {new_owner}; registering again");
-                    }
-                    if let Ok(iface) = conn
+                    // Subscribing early means a signal can arrive for the
+                    // owner we already have. Re-registering on that one would
+                    // draw an "already exists" error out of polkitd for no
+                    // reason, so only a name we do not hold counts.
+                    let known = conn
                         .object_server()
                         .interface::<_, Agent>(AGENT_PATH)
                         .await
-                        && let Ok(mut polkitd) = iface.get().await.polkitd.lock()
-                    {
-                        *polkitd = new_owner.to_string();
-                    }
-                    if let Err(e) = register(&conn, &session).await {
-                        eprintln!("sudo-pop: could not register again: {e}");
+                        .ok();
+                    let changed = match &known {
+                        Some(iface) => iface
+                            .get()
+                            .await
+                            .polkitd
+                            .lock()
+                            .is_ok_and(|held| *held != new_owner.to_string()),
+                        None => false,
+                    };
+                    if changed {
+                        if tracing() {
+                            println!("polkitd came back as {new_owner}; registering again");
+                        }
+                        if let Some(iface) = &known
+                            && let Ok(mut polkitd) = iface.get().await.polkitd.lock()
+                        {
+                            *polkitd = new_owner.to_string();
+                        }
+                        if let Err(e) = register(&conn, &session).await {
+                            eprintln!("sudo-pop: could not register again: {e}");
+                        }
                     }
                 }
             },
@@ -282,4 +332,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => eprintln!("sudo-pop: unregister failed: {e}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two registration failures must not be confused. polkitd's wording
+    /// for a taken seat is the only thing that ends the process successfully;
+    /// read it too loosely and a session that merely raced polkitd's start is
+    /// left with no agent and nothing said about it.
+    #[test]
+    fn only_a_taken_seat_ends_the_agent_successfully() {
+        assert!(seat_is_taken(
+            "An authentication agent already exists for the given subject"
+        ));
+        for other in [
+            "The name org.freedesktop.PolicyKit1 was not provided by any .service files",
+            "Connection timed out",
+            "Message recipient disconnected from message bus without replying",
+            "",
+        ] {
+            assert!(!seat_is_taken(other), "{other:?} may be worth a restart");
+        }
+    }
 }

@@ -16,6 +16,7 @@
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -40,15 +41,9 @@ const BASH_LOADER_BODY: &str = r#"for __minsoft1115_rc in "$HOME/.config/minsoft
 done
 unset __minsoft1115_rc"#;
 
-/// Agents that would already hold the seat. polkit allows exactly one per
-/// session, so ours cannot start while any of these runs.
-const KNOWN_AGENTS: [&str; 5] = [
-    "hyprpolkitagent",
-    "polkit-gnome-authentication-agent-1",
-    "polkit-kde-authentication-agent-1",
-    "lxpolkit",
-    "mate-polkit",
-];
+/// Names that belong to polkit itself rather than to an agent competing for
+/// the seat, plus our own.
+const NOT_AN_AGENT: [&str; 3] = ["polkitd", "polkit-agent-helper", "sudo-pop"];
 
 fn unit_body(exe: &Path) -> String {
     format!(
@@ -170,9 +165,9 @@ fn install_all(layout: &Layout) -> io::Result<()> {
     // polkit allows one agent per session. Starting ours while another holds
     // the seat would fail to register and then be restarted forever.
     if let Some(other) = other_agent() {
-        println!("\n{other} already holds this session's polkit seat.");
+        println!("\n{} already holds this session's polkit seat.", other.describe());
         println!("The unit is installed but not enabled. To switch:");
-        println!("  {}", switch_hint(&other));
+        println!("  {}", other.hint());
         println!("  sudo-pop --init");
         return Ok(());
     }
@@ -263,32 +258,126 @@ fn uninstall_all(layout: &Layout) -> io::Result<()> {
     Ok(())
 }
 
+/// Whoever holds the seat, and how to hand it over.
+pub enum Seat {
+    /// The Omarchy shell's own agent, which lives inside the shell process.
+    Omarchy,
+    /// A running process, named as the kernel reports it.
+    Process(String),
+    /// An active user unit.
+    Unit(String),
+}
+
+impl Seat {
+    fn describe(&self) -> String {
+        match self {
+            Self::Omarchy => "omarchy.polkit (the Omarchy shell's own agent)".into(),
+            Self::Process(name) => format!("a running {name}"),
+            Self::Unit(name) => format!("the {name} unit"),
+        }
+    }
+
+    fn hint(&self) -> String {
+        match self {
+            Self::Omarchy => "omarchy plugin disable omarchy.polkit".into(),
+            Self::Unit(name) => format!("systemctl --user disable --now {name}"),
+            // The process was not started by a unit we can name, so there is
+            // nothing honest to put here but "however you started it".
+            Self::Process(name) => format!("stop {name}, however this session starts it"),
+        }
+    }
+}
+
+/// Whether a process or unit name is another polkit agent.
+///
+/// Matched on the substring rather than against a table of exact names, and
+/// that is the point. The table this replaced was compared with `pgrep -x`,
+/// which matches `/proc/<pid>/comm` -- **truncated by the kernel to 15
+/// characters**. `polkit-gnome-authentication-agent-1` is 35, so it could
+/// never match anything; pgrep says so itself and returns zero matches. Four
+/// of the five names in that table were dead weight.
+///
+/// What every agent does have is `polkit` or `policykit` in its name, and that
+/// survives truncation. polkit's own daemon and helper are excluded, and so
+/// are we.
+fn looks_like_agent(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    if !(name.contains("polkit") || name.contains("policykit")) {
+        return false;
+    }
+    // polkitd's own unit, matched whole: as a substring it would also strike
+    // out `xfce-polkit.service`, which is an agent.
+    if name == "polkit" || name == "polkit.service" {
+        return false;
+    }
+    !NOT_AN_AGENT.iter().any(|skip| name.contains(skip))
+}
+
 /// Which other polkit agent is holding the seat, if any.
 ///
-/// Omarchy's lives inside the shell process rather than one of its own, so it
-/// cannot be found by looking at process names -- ask the plugin list instead.
-fn other_agent() -> Option<String> {
+/// Three ways of looking, because no one of them sees everything. Omarchy's
+/// agent lives inside the shell process and has no process or unit of its own;
+/// an agent started by XDG autostart has a process but no unit; and a unit
+/// that is active but whose process is momentarily gone still owns the seat.
+fn other_agent() -> Option<Seat> {
     if omarchy_polkit_enabled() {
-        return Some("omarchy.polkit (the Omarchy shell's own agent)".into());
+        return Some(Seat::Omarchy);
     }
-    for name in KNOWN_AGENTS {
-        if Command::new("pgrep")
-            .args(["-x", name])
-            .output()
-            .is_ok_and(|out| out.status.success())
-        {
-            return Some(name.into());
+    if let Some(name) = agent_process() {
+        return Some(Seat::Process(name));
+    }
+    agent_unit().map(Seat::Unit)
+}
+
+/// A process of ours whose name is another agent's.
+///
+/// `/proc` is read directly rather than through `pgrep`: the names are read
+/// back as the kernel stores them, so the 15-character truncation is something
+/// we see instead of something that silently loses the match. Only our own
+/// processes count -- an agent authenticates a session, so it runs as the user
+/// whose session it is, and that also keeps root's `polkitd` out.
+fn agent_process() -> Option<String> {
+    // SAFETY: getuid cannot fail.
+    let me = unsafe { libc::getuid() };
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
+        let path = entry.path();
+        if path.file_name()?.to_str()?.parse::<u32>().is_err() {
+            continue;
+        }
+        if fs::metadata(&path).ok()?.uid() != me {
+            continue;
+        }
+        let comm = fs::read_to_string(path.join("comm")).unwrap_or_default();
+        if looks_like_agent(&comm) {
+            return Some(comm.trim().to_owned());
         }
     }
     None
 }
 
-fn switch_hint(other: &str) -> String {
-    if other.starts_with("omarchy.polkit") {
-        "omarchy plugin disable omarchy.polkit".into()
-    } else {
-        format!("systemctl --user disable --now {other}.service")
-    }
+/// An active user unit whose name is another agent's.
+///
+/// Unit names are not truncated, so this catches the agents whose binaries are
+/// too long to recognise by process name alone -- and it is what finds an agent
+/// installed but between restarts.
+fn agent_unit() -> Option<String> {
+    let out = Command::new("systemctl")
+        .args([
+            "--user",
+            "list-units",
+            "--type=service",
+            "--state=active",
+            "--no-legend",
+            "--plain",
+            "--no-pager",
+        ])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .find(|unit| looks_like_agent(unit))
+        .map(str::to_owned)
 }
 
 fn omarchy_polkit_enabled() -> bool {
@@ -441,6 +530,104 @@ fn reload_hyprland() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The comm the kernel would report for a binary of this name.
+    fn comm(binary: &str) -> String {
+        binary.chars().take(15).collect()
+    }
+
+    #[test]
+    fn the_agents_are_recognised_by_the_names_they_run_under() {
+        for binary in [
+            "hyprpolkitagent",
+            "polkit-gnome-authentication-agent-1",
+            "polkit-kde-authentication-agent-1",
+            "polkit-mate-authentication-agent-1",
+            "lxqt-policykit-agent",
+            "lxpolkit",
+            "xfce-polkit",
+        ] {
+            assert!(looks_like_agent(binary), "{binary} should be an agent");
+        }
+    }
+
+    /// The defect this replaced: `pgrep -x` compares against comm, which the
+    /// kernel cuts to 15 characters, so every long name silently matched
+    /// nothing. Matching has to survive the cut.
+    #[test]
+    fn a_name_the_kernel_truncated_is_still_recognised() {
+        for binary in [
+            "polkit-gnome-authentication-agent-1",
+            "polkit-kde-authentication-agent-1",
+            "polkit-mate-authentication-agent-1",
+            "lxqt-policykit-agent",
+        ] {
+            let truncated = comm(binary);
+            assert!(
+                binary.len() > 15,
+                "{binary} would not have been truncated; pick a longer example"
+            );
+            assert!(
+                looks_like_agent(&truncated),
+                "{truncated:?} (comm of {binary}) should still be an agent"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_names_are_recognised_too() {
+        assert!(looks_like_agent("hyprpolkitagent.service"));
+        assert!(looks_like_agent("plasma-polkit-agent.service"));
+        assert!(looks_like_agent("xfce-polkit.service"));
+    }
+
+    #[test]
+    fn polkits_own_processes_are_not_agents() {
+        // polkitd is the daemon we register with, and the helper is what
+        // authenticates. Calling either one a competing agent would mean
+        // --init never enables anything.
+        assert!(!looks_like_agent("polkitd"));
+        assert!(!looks_like_agent("polkit-agent-helper-1"));
+        // Its unit is a system unit, so `agent_unit` would not list it
+        // anyway; struck out here as well because the name is confusing.
+        assert!(!looks_like_agent("polkit.service"));
+        // ... but only as a whole name. This one is an agent.
+        assert!(looks_like_agent("xfce-polkit.service"));
+    }
+
+    #[test]
+    fn we_are_not_our_own_competitor() {
+        assert!(!looks_like_agent("sudo-pop"));
+        assert!(!looks_like_agent("sudo-pop-agent.service"));
+    }
+
+    #[test]
+    fn ordinary_processes_are_left_alone() {
+        for name in ["firefox", "bash", "systemd", "Hyprland", "sleep", ""] {
+            assert!(!looks_like_agent(name), "{name} is not an agent");
+        }
+    }
+
+    #[test]
+    fn the_name_is_matched_however_it_is_cased_or_padded() {
+        // /proc/<pid>/comm comes back with a trailing newline.
+        assert!(looks_like_agent("hyprpolkitagent\n"));
+        assert!(looks_like_agent("PolKit-KDE-Auth"));
+    }
+
+    #[test]
+    fn the_hint_names_the_way_out_for_each_kind() {
+        assert_eq!(Seat::Omarchy.hint(), "omarchy plugin disable omarchy.polkit");
+        assert_eq!(
+            Seat::Unit("hyprpolkitagent.service".into()).hint(),
+            "systemctl --user disable --now hyprpolkitagent.service"
+        );
+        // The old code appended ".service" to a process name and produced a
+        // command that does not exist. Say something true instead.
+        assert!(!Seat::Process("polkit-kde-auth".into()).hint().contains(".service"));
+    }
+
     use super::*;
 
     const B: &str = "-- x:begin";

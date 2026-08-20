@@ -7,6 +7,8 @@
 #   ./tests/scenarios.sh --keep           leave the agent registered at the end
 #   ./tests/scenarios.sh --with-password  also open a foot window for the one
 #                                         case that needs a human to type
+#   ./tests/scenarios.sh --restart-polkitd  also restart polkitd and check the
+#                                         agent follows it (needs one password)
 #
 # The session is put back the way it was found -- whichever agent held the seat
 # gets it back -- even if a case fails or the run is interrupted.
@@ -17,14 +19,26 @@ BIN="$ROOT/target/release/sudo-pop"
 WORK="$(mktemp -d)"
 KEEP=0
 WITH_PASSWORD=0
+RESTART_POLKITD=0
 for arg in "$@"; do
   case "$arg" in
     --keep) KEEP=1 ;;
     # foot 창을 띄워 사람이 비밀번호를 넣는 케이스까지 돌린다
     --with-password) WITH_PASSWORD=1 ;;
+    # polkitd 를 실제로 재시작한다. 비밀번호가 한 번 필요하고, 세션 전체에
+    # 영향이 있으므로 따로 켜야 한다.
+    --restart-polkitd) RESTART_POLKITD=1 ;;
     *) echo "unknown option: $arg"; exit 2 ;;
   esac
 done
+
+POLKIT_NAME="org.freedesktop.PolicyKit1"
+
+# 되돌릴 때는 설치된 바이너리로 --init 한다. $BIN 으로 되돌리면 유닛의 ExecStart 가
+# 개발 트리를 가리킨 채 남아, 다음부터 cargo build 가 도는 동안 에이전트가 죽는다
+# (rationale §6-1). 설치본이 없으면 어쩔 수 없이 $BIN 이다.
+INSTALLED="$(command -v sudo-pop 2>/dev/null || true)"
+[ -z "$INSTALLED" ] && INSTALLED="$BIN"
 
 PASS=0; FAIL=0
 ok()   { printf '  \033[1;32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
@@ -53,8 +67,10 @@ cleanup() {
     # 되돌리기는 눈에 보여야 한다. 조용히 실패하면 세션이 인증 못 하는 채로 남는다.
     printf '\n\033[1m되돌리기\033[0m\n'
     if [ "$had_unit" = yes ]; then
-      "$BIN" --init >/dev/null 2>&1
-      printf '  sudo-pop-agent: %s\n' "$(systemctl --user is-active sudo-pop-agent.service 2>&1)"
+      "$INSTALLED" --init >/dev/null 2>&1
+      printf '  sudo-pop-agent: %s (%s)\n' \
+        "$(systemctl --user is-active sudo-pop-agent.service 2>&1)" \
+        "$(awk -F= '/^ExecStart=/{print $2}' ~/.config/systemd/user/sudo-pop-agent.service 2>/dev/null)"
     fi
     if [ "$had_omarchy" = yes ]; then
       omarchy-plugin-enable omarchy.polkit >/dev/null 2>&1
@@ -278,9 +294,122 @@ if [ -f "$WORK/hl.before" ]; then
 fi
 
 # =============================================================================
+head_ "8. 다른 에이전트 감지 (L1)"
+# 예전 코드는 `pgrep -x <이름>` 으로 봤는데, comm 은 커널이 15자에서 자르므로
+# `polkit-gnome-authentication-agent-1`(35자) 같은 이름은 영영 안 걸렸다.
+# 여기서는 진짜로 그 이름을 단 프로세스를 만들어 그 구멍을 재현한다.
+omarchy-plugin-disable omarchy.polkit >/dev/null 2>&1; sleep 1
+"$BIN" --uninit >/dev/null 2>&1      # enable 여부를 깨끗한 자리에서 본다
+
+mkdir -p "$WORK/bin"
+FAKE_AGENT="$WORK/bin/polkit-kde-authentication-agent-1"
+cp "$(command -v sleep)" "$FAKE_AGENT"
+"$FAKE_AGENT" 120 & FAKE_PID=$!
+sleep 0.5
+fake_comm=$(cat "/proc/$FAKE_PID/comm" 2>/dev/null)
+[ "$fake_comm" = "polkit-kde-auth" ] \
+  && ok "커널이 이름을 15자로 자른다 (comm=$fake_comm)" \
+  || bad "comm 이 예상과 다르다" "comm=$fake_comm"
+# 옛 방식이 왜 못 잡았는지를 같은 자리에서 보여 준다.
+pgrep -x polkit-kde-authentication-agent-1 >/dev/null 2>&1 \
+  && bad "pgrep -x 가 잡았다 — 전제가 바뀌었다" \
+  || ok "pgrep -x 로는 못 잡는다 (옛 방식의 구멍)"
+
+"$BIN" --init >"$WORK/init-proc.log" 2>&1
+grep -q "already holds this session's polkit seat" "$WORK/init-proc.log" \
+  && ok "프로세스로 도는 다른 에이전트를 잡는다" \
+  || bad "감지하지 못했다" "$(tail -3 "$WORK/init-proc.log")"
+grep -q "polkit-kde-auth" "$WORK/init-proc.log" \
+  && ok "무엇을 찾았는지 이름으로 말한다" || bad "찾은 이름이 안 나온다"
+[ "$(systemctl --user is-enabled sudo-pop-agent.service 2>&1)" = "enabled" ] \
+  && bad "다른 에이전트가 있는데 유닛을 enable 했다" \
+  || ok "유닛은 깔되 enable 하지 않는다"
+[ -e ~/.config/systemd/user/sudo-pop-agent.service ] \
+  && ok "유닛 파일 자체는 깔린다" || bad "유닛 파일이 없다"
+
+kill $FAKE_PID 2>/dev/null; wait $FAKE_PID 2>/dev/null; sleep 0.5
+
+# 유닛으로만 도는 경우 — 프로세스 이름(sleep)에는 단서가 없으므로 3순위만 본다.
+systemd-run --user --unit=scenario-polkit-agent.service --quiet sleep 120 2>/dev/null
+sleep 1
+if systemctl --user is-active --quiet scenario-polkit-agent.service; then
+  "$BIN" --init >"$WORK/init-unit.log" 2>&1
+  grep -q "already holds this session's polkit seat" "$WORK/init-unit.log" \
+    && ok "활성 user 유닛으로만 있는 에이전트를 잡는다 (3순위)" \
+    || bad "유닛 감지가 안 된다" "$(tail -3 "$WORK/init-unit.log")"
+  grep -q "systemctl --user disable --now scenario-polkit-agent.service" "$WORK/init-unit.log" \
+    && ok "유닛일 때는 끄는 명령을 정확히 알려 준다" \
+    || bad "안내가 유닛에 맞지 않다" "$(grep -A2 'To switch' "$WORK/init-unit.log")"
+  systemctl --user stop scenario-polkit-agent.service 2>/dev/null
+else
+  bad "가짜 유닛을 띄우지 못해 3순위를 건너뜀"
+fi
+sleep 1
+
+# 아무도 없으면 이제 켜져야 한다 — 감지가 과하게 걸리지 않는지 보는 반대편.
+"$BIN" --init >"$WORK/init-clear.log" 2>&1
+grep -q "already holds this session's polkit seat" "$WORK/init-clear.log" \
+  && bad "아무도 없는데 자리가 찼다고 한다" "$(tail -3 "$WORK/init-clear.log")" \
+  || ok "자리가 비면 평소대로 enable 한다"
+systemctl --user stop sudo-pop-agent.service 2>/dev/null
+
+# =============================================================================
+head_ "9. polkitd 소유자 추적 (L5)"
+# 결함은 "소유자를 먼저 읽고 구독을 나중에" 였다. 그 사이에 polkitd 가 재시작하면
+# 신호를 못 받고, 죽은 고유 이름으로 진짜 폴킷을 영영 거절한다. 순서가 곧 수정이라
+# 순서를 로그에서 확인한다.
+if start_agent; then
+  sub=$(grep -n "watching $POLKIT_NAME for owner changes" "$WORK/agent.log" | head -1 | cut -d: -f1)
+  reg=$(grep -n "REGISTERED" "$WORK/agent.log" | head -1 | cut -d: -f1)
+  own=$(grep -n "polkitd owns" "$WORK/agent.log" | head -1 | cut -d: -f1)
+  if [ -n "$sub" ] && [ -n "$own" ] && [ "$sub" -lt "$own" ]; then
+    ok "소유자를 읽기 전에 구독한다 (구독 $sub 줄 < 읽기 $own 줄)"
+  else
+    bad "구독이 소유자 읽기보다 늦다" "구독=$sub 읽기=$own"
+  fi
+  if [ -n "$sub" ] && [ -n "$reg" ] && [ "$sub" -lt "$reg" ]; then
+    ok "등록보다도 먼저 구독한다 (등록 $reg 줄)"
+  else
+    bad "구독이 등록보다 늦다" "구독=$sub 등록=$reg"
+  fi
+  # 구독을 일찍 하면 이미 들고 있는 소유자에 대한 신호가 올 수 있다. 그것으로
+  # 재등록하면 polkitd 가 "already exists" 를 돌려주므로, 걸러야 한다.
+  grep -q "could not register again" "$WORK/agent.log" \
+    && bad "같은 소유자에 대해 재등록을 시도했다" || ok "이미 아는 소유자로는 재등록하지 않는다"
+
+  if [ "$RESTART_POLKITD" = 1 ]; then
+    printf '  polkitd 를 재시작합니다 — foot 창에서 비밀번호를 한 번 넣어 주세요.\n'
+    foot -a sudo-pop-scenario bash -lc \
+      "echo 'polkitd 재시작 — 비밀번호를 넣으세요.'; run0 systemctl restart polkit.service; \
+       echo \"exit=\$?\" > $WORK/restart.txt; sleep 2" >/dev/null 2>&1
+    if grep -q "exit=0" "$WORK/restart.txt" 2>/dev/null; then
+      ok "polkitd 를 재시작했다"
+      for i in $(seq 1 40); do grep -q "came back as" "$WORK/agent.log" && break; sleep 0.25; done
+      grep -q "came back as" "$WORK/agent.log" \
+        && ok "새 소유자를 보고 다시 등록한다" || bad "재등록 로그가 없다" "$(tail -3 "$WORK/agent.log")"
+      # 진짜 시험은 여기다. 검증 기준이 낡았으면 polkitd 의 요청이 거절되어
+      # 창이 안 뜬다. polkitd 재시작이 인증 캐시도 지우므로 반드시 물어본다.
+      ( timeout 12 run0 --background= true </dev/null >/dev/null 2>&1 ) & RP=$!
+      if wait_window; then
+        ok "재시작 뒤에도 진짜 폴킷 요청에 창이 뜬다 (검증 기준이 따라갔다)"
+      else
+        bad "창이 안 뜬다 — 낡은 고유 이름으로 거절하고 있다" "$(tail -5 "$WORK/agent.log")"
+      fi
+      kill $RP 2>/dev/null
+      for p in $(agent_children); do kill "$p" 2>/dev/null; done
+    else
+      bad "polkitd 재시작이 확인되지 않아 건너뜀" "$(cat "$WORK/restart.txt" 2>/dev/null)"
+    fi
+  fi
+  kill "$AGENT" 2>/dev/null; AGENT=""
+else
+  bad "에이전트가 등록되지 않아 9번을 건너뜀"
+fi
+
+# =============================================================================
 # 비밀번호가 필요한 케이스. 사람이 있어야 하므로 foot 창을 띄워 맡긴다.
 if [ "$WITH_PASSWORD" = 1 ]; then
-  head_ "8. 성공 경로 (직접 입력)"
+  head_ "10. 성공 경로 (직접 입력)"
   "$BIN" --init >/dev/null 2>&1
   omarchy-plugin-disable omarchy.polkit >/dev/null 2>&1; sleep 1
   systemctl --user restart sudo-pop-agent.service 2>/dev/null || start_agent
