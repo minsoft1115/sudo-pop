@@ -16,7 +16,8 @@ sudo -E make       →  sudo -A -E make    ─┤→  같은 창
 
 <p align="center">
   <img src="screenshots/sudo-pop.png" width="440"
-       alt="sudo pacman -Syu 를 비밀번호 입력칸 위에 보여 주는 sudo-pop 창">
+       alt="sudo-pop 창 — 입력칸 위에 명령 pacman -Syu, 구석에 남은 시간,
+            아래에 잠금까지 남은 횟수">
 </p>
 
 옵션 없는 명령은 `run0` 으로, 옵션이나 `VAR=값` 이 붙으면 `sudo` 에 남아 `-A` 만 더해
@@ -151,6 +152,7 @@ askpass 가 아니라 polkit 에이전트라서 따라 나오는 것들이다:
 cargo test                            # 단위·프로토콜 시험. 환경이 필요 없다
 ./tests/scenarios.sh                  # polkitd·버스·컴포지터가 필요하다
 ./tests/scenarios.sh --with-password  # 입력이 필요한 한 케이스를 foot 창으로
+./tests/scenarios.sh --restart-polkitd  # polkitd 를 재시작하고 에이전트가 따라가는지 본다
 ```
 
 시나리오는 세션을 원래대로 돌려놓고, 무엇을 되돌렸는지 찍고, 태운 faillock 도 치운다.

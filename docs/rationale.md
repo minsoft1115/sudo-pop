@@ -981,6 +981,9 @@ cargo run --release --example font-cost   폰트 비용 실측 (§16-3)
 `SUDO_POP_HELPER_SOCKET` 으로 두 문을 다른 곳에 걸 수 있어서, **PAM 도 비밀번호도 root 도
 없이** 대화의 갈래를 전부 돌린다.
 
+> **디버그 빌드에서만 걸린다** (audit C2). 릴리스 바이너리는 이 변수를 아예 안 읽으므로
+> 손시험에 쓰면 진짜 PAM 이 돌아 faillock 을 태운다 — §21-6 에서 두 번 겪었다.
+
 | 잡는 것 | |
 |---|---|
 | 성공·오답·`ECHO_ON`·`TEXT_INFO`·`ERROR_MSG` | 줄 프로토콜의 각 태그 |

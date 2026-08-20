@@ -17,7 +17,8 @@ disk mounts · NetworkManager · systemctl ─┘
 
 <p align="center">
   <img src="screenshots/sudo-pop.png" width="440"
-       alt="the sudo-pop window, showing 'sudo pacman -Syu' above the password field">
+       alt="the sudo-pop window: the command 'pacman -Syu' above the password field,
+            the seconds left in the corner, and the remaining lockout budget below">
 </p>
 
 Option-free commands route to `run0`; anything with an option or a `VAR=value`
@@ -160,6 +161,7 @@ The design docs are written in Korean.
 cargo test                            # unit and protocol tests, no environment needed
 ./tests/scenarios.sh                  # needs polkitd, the bus, and a compositor
 ./tests/scenarios.sh --with-password  # opens a foot window for the one case that needs typing
+./tests/scenarios.sh --restart-polkitd  # restarts polkitd and checks the agent follows it
 ```
 
 The scenario suite puts the session back the way it found it, prints what it

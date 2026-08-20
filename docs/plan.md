@@ -72,6 +72,16 @@ askpass 판별은 `argv[0]` 으로 한다. `current_exe` 는 심볼릭 링크를
 발신자가 `org.freedesktop.PolicyKit1` 의 현재 소유자인지 확인하고, 아니면 창을 띄우기 전에
 `AccessDenied`. 소유자 이름은 `NameOwnerChanged` 로 따라간다.
 
+### 2-3-1. 소유자 추적
+
+polkitd 의 고유 이름을 **읽기 전에 `NameOwnerChanged` 를 구독한다.** 순서가 뒤집히면 그 사이의
+재시작을 놓쳐 죽은 이름으로 진짜 폴킷을 영영 거절한다 (`rationale.md` §17-2). 들고 있는 이름과
+같은 신호로는 재등록하지 않는다.
+
+등록 실패는 두 갈래다. `already exists for the given subject` 면 자리를 뺏긴 것이므로 **정상
+종료**하고 (`Restart=on-failure` 폭주 방지), 그 밖의 실패는 재시작이 고칠 수 있으므로 **실패로
+끝낸다.**
+
 ### 2-4. 시도 횟수
 
 `cookie` 하나가 sudo 명령 하나다. 자식이 쿠키당 하나 뜨고 재시도를 자기가 돌리므로
@@ -87,39 +97,38 @@ faillock 카운터는 **sudo·polkit·로그인이 공유한다.** polkit 에서
 
 `AuthenticationAgentResponse2` 는 **우리가 부르지 않는다.** 헬퍼가 root 로 보낸다.
 
-### 2-3-1. 소유자 추적
-
-polkitd 의 고유 이름을 **읽기 전에 `NameOwnerChanged` 를 구독한다.** 순서가 뒤집히면 그 사이의
-재시작을 놓쳐 죽은 이름으로 진짜 폴킷을 영영 거절한다 (`rationale.md` §17-2). 들고 있는 이름과
-같은 신호로는 재등록하지 않는다.
-
-등록 실패는 두 갈래다. `already exists for the given subject` 면 자리를 뺏긴 것이므로 **정상
-종료**하고 (`Restart=on-failure` 폭주 방지), 그 밖의 실패는 재시작이 고칠 수 있으므로 **실패로
-끝낸다.**
-
 ### 2-6. 창
+
+**정체와 크기**
 
 - app-id 는 `sudo-askpass`. `assets/sudo-pop.lua` 의 규칙이 이 이름으로 매칭한다
 - 규칙: `float`·`center`·`dim_around`·`stay_focused`·`pin`·**`no_screen_share`**.
   **`size` 규칙은 두지 않는다** — 두면 클라이언트가 요청한 폭을 덮어쓴다
-- 폭은 **보여 줄 줄에 맞춰 400~800**. 창을 만들기 전에 같은 폰트 체인으로 실제 폭을 재고
-  (`font::Chain::measure`), 높이는 200 고정이다. **입력칸은 안 늘어난다** — 400 창에서의
-  폭 그대로 가운데에 둔다 (`rationale.md` §21)
+- 폭은 보여 줄 줄에 맞춰 **400~800**, 높이는 200 고정. 창을 만들기 전에 같은 폰트 체인으로
+  실제 폭을 잰다 (`font::Chain::measure`)
+- **입력칸은 창을 따라 늘어나지 않는다.** 400 창에서의 폭 그대로 가운데에 선다 — 창이
+  넓어지는 이유는 명령이 길어서지 비밀번호가 길어서가 아니다 (`rationale.md` §21)
 - 요청 하나에 창 하나. PAM 이 여러 번 물어도 창은 그대로 두고 글자만 바꾼다
-- 입력칸 아래 두 줄은 성격이 다르다. 위는 **지나가는 것**(`Wrong`·PAM 메시지·`Checking...`)
-  이고, 아래는 **상시**로 남는 faillock 잔여 횟수다. 잔여가 **3 이하이면 경고색**
-  (`attempts::WARN_AT_OR_BELOW`). 조작 안내(Enter·Esc)는 띄우지 않는다
-- 이벤트 루프는 프로세스당 하나만 만들 수 있다. 창이 메인 스레드를 갖고 대화가 옆 스레드로 간다
-- 자체 타임아웃 30초. **폴킷 호출자는 25초에 포기한다** — 그 뒤는 백스톱일 뿐이다
-- 그 25초를 **우상단 여백에 1초 단위로 센다.** 5초 이하이면 경고색, **0 이 되면 지운다** —
-  자기 타임아웃이 없는 호출자(`pkcheck`)는 그 뒤로도 기다리므로 빨간 `0s` 는 거짓말이 된다. 기준은 자식이 뜬
-  시각이 아니라 **에이전트가 요청을 받은 시각**이다 — 큐에서 흘린 시간을 다시 내주면
-  없는 여유를 약속하게 된다. sudo 경로는 마감이 없으므로 아무것도 세지 않는다
+
+**무엇을 띄우는가** (위에서 아래로)
+
 - 첫 줄은 polkit 의 `message` 가 아니라 **`polkit.subject-pid` 의 cmdline** 이다
 - 둘째 줄은 **무엇을 하려는지**(`invocation::purpose`). polkit 의 `message` 에서 상투구를
   걷어낸 것이고, **`manage-units`(run0) 에서는 띄우지 않는다** — 그 문장은 난수 유닛 이름뿐이라
   첫 줄이 이미 더 많이 말한다. 반대로 데스크톱 앱은 첫 줄이 바이너리 이름뿐이라 이 줄이
   유일한 단서다 (`rationale.md` §20)
+- 입력칸 아래 두 줄은 성격이 다르다. 위는 **지나가는 것**(`Wrong`·PAM 메시지·`Checking...`)
+  이고, 아래는 **상시**로 남는 faillock 잔여 횟수다. 잔여가 **3 이하이면 경고색**
+  (`attempts::WARN_AT_OR_BELOW`). 조작 안내(Enter·Esc)는 띄우지 않는다
+- 우상단 여백에 **남은 시간을 1초 단위로** 센다. 5초 이하이면 경고색, **0 이 되면 지운다** —
+  자기 타임아웃이 없는 호출자(`pkcheck`)는 그 뒤로도 기다리므로 빨간 `0s` 는 거짓말이 된다.
+  기준은 자식이 뜬 시각이 아니라 **에이전트가 요청을 받은 시각**이다 (큐에서 흘린 시간을 다시
+  내주면 없는 여유를 약속하게 된다). sudo 경로는 마감이 없으므로 아무것도 세지 않는다
+
+**그 밖**
+
+- 이벤트 루프는 프로세스당 하나만 만들 수 있다. 창이 메인 스레드를 갖고 대화가 옆 스레드로 간다
+- 자체 타임아웃 30초. **폴킷 호출자는 25초에 포기한다** — 그 뒤는 백스톱일 뿐이다
 - 테마 색은 `colors.toml` 에 더해 **`shell.toml` 의 `[polkit]` 섹션**을 읽어 시스템 창과 맞춘다 (실패색 `text-error` 포함)
 - 폰트 체인은 Omarchy 의 monospace 면이 앞이고, **우리가 쓰지 않은 글자**(cmdline·polkit
   message·PAM 프롬프트)에 ASCII 밖 문자가 있을 때만 `fc-match :charset=` 으로 한 면을
@@ -207,7 +216,9 @@ cargo run --release --example font-cost   폰트 체인 비용 실측 (rationale
 ```
 
 `tests/fake-helper.sh` 가 헬퍼 행세를 하고, `SUDO_POP_HELPER_BIN`·`SUDO_POP_HELPER_SOCKET`
-으로 두 문을 다른 곳에 건다. 시나리오는 Hyprland 를 시험 장비로 쓴다 —
+으로 두 문을 다른 곳에 건다. **이 두 변수는 디버그 빌드에서만 읽힌다** (audit C2) — 릴리스
+바이너리로 손시험을 하면 진짜 PAM 이 돌아 faillock 을 태운다. 창 모양만 볼 때도 디버그 빌드를
+쓸 것. 시나리오는 Hyprland 를 시험 장비로 쓴다 —
 `hl.dsp.send_shortcut` 으로 Esc 를 주입하고, `grim` 으로 화면 캡처 제외를 센다.
 
 무엇을 잡는지는 [`rationale.md`](rationale.md) §15.
@@ -222,4 +233,4 @@ cargo run --release --example font-cost   폰트 체인 비용 실측 (rationale
 | 지문 (`pam_fprintd`) | 이 머신에 `fprintd` 가 없다. PAM 파일은 `/etc` 와 `/usr/lib` 둘 다 봐야 한다 |
 | 신원 선택 UI | 관리자가 여럿인 환경에서만 의미가 있다 |
 | 레이어셸 서피스 | 전체화면 위 동작이 문제가 될 때 (`rationale.md` §2-4) |
-| polkitd 재시작 재등록 | **실측 완료.** `tests/scenarios.sh --restart-polkitd` (비밀번호 1회) |
+| 대기 중인 요청 수 표시 | 큐에 밀린 요청이 있다는 것을 창이 알려 주지 않는다 (`rationale.md` §21-5) |
