@@ -117,6 +117,13 @@ pub fn run() -> ! {
     }
     let attempts = budget.and_then(|budget| budget.status());
 
+    // The agent measured this from the moment polkitd called it, so a request
+    // that queued behind another one does not get the full span offered back.
+    let deadline = std::env::var("SUDO_POP_LEFT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+
     // Kept for the window before `username` is moved into the worker.
     let user_display = username.clone();
 
@@ -142,6 +149,7 @@ pub fn run() -> ! {
         message,
         user: (!user_display.is_empty()).then_some(user_display),
         attempts,
+        deadline,
     };
 
     if let Err(e) = gui::run(subject, to_ui_rx, from_ui_tx) {

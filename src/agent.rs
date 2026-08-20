@@ -77,6 +77,16 @@ impl Agent {
     }
 }
 
+/// How long the caller waits for the whole authentication before giving up.
+///
+/// **Not ours.** It is the default method-call timeout of the bus library the
+/// caller uses -- 25 seconds for sd-bus (`run0`, `systemctl`) and for GDBus
+/// (udisks, NetworkManager), measured at 25.03 s end to end. A caller that
+/// passes its own timeout is not covered, so what the window draws from this is
+/// a countdown, not a promise: our own backstop stays a little longer and the
+/// request really ends when polkitd cancels it.
+const CALLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
 /// Per-request tracing goes to the journal, so it is off unless asked for.
 /// Only the security-relevant lines (a refused sender, an error) log always.
 fn tracing() -> bool {
@@ -161,7 +171,14 @@ impl Agent {
             return Ok(());
         }
 
-        let code = self.ask(&name, &cookie, subject_pid, &message).await;
+        // Measured from the top of this method, not from the child's start:
+        // a request that waited its turn in the queue has already spent some
+        // of the caller's patience, and the window must not offer it again.
+        let left = CALLER_TIMEOUT.saturating_sub(started.elapsed());
+        if tracing() {
+            println!("  left       : {} ms", left.as_millis());
+        }
+        let code = self.ask(&name, &cookie, subject_pid, &message, left).await;
 
         // Drop any late cancel marker so the set cannot grow without bound.
         let _ = self.take_cancelled(&cookie);
@@ -218,7 +235,14 @@ impl Agent {
 
 impl Agent {
     /// Run one request in a child and wait for its exit code.
-    async fn ask(&self, username: &str, cookie: &str, subject_pid: u32, message: &str) -> i32 {
+    async fn ask(
+        &self,
+        username: &str,
+        cookie: &str,
+        subject_pid: u32,
+        message: &str,
+        left: std::time::Duration,
+    ) -> i32 {
         let Ok(exe) = std::env::current_exe() else {
             return prompt::EXIT_FAILED;
         };
@@ -228,6 +252,7 @@ impl Agent {
             .env("SUDO_POP_USER", username)
             .env("SUDO_POP_SUBJECT_PID", subject_pid.to_string())
             .env("SUDO_POP_MESSAGE", message)
+            .env("SUDO_POP_LEFT_MS", left.as_millis().to_string())
             .stdin(Stdio::piped())
             .spawn();
 

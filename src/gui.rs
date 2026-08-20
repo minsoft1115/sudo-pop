@@ -30,6 +30,21 @@ pub const APP_ID: &str = "sudo-askpass";
 
 const WINDOW_SIZE: [f32; 2] = [400.0, 200.0];
 
+/// Below this many seconds the countdown turns to the error colour, the same
+/// way the attempts line does when its budget runs low.
+const HURRY_AT_OR_BELOW: u64 = 5;
+
+/// Seconds remaining, rounded up.
+///
+/// Up rather than down so the final second reads `1s` for its whole length
+/// instead of sitting on `0s`; the number reaches zero only once there really
+/// is nothing left. It is already a shade optimistic -- the caller started its
+/// clock before polkitd reached us, measured at about a quarter second -- and
+/// rounding down would hide a second that is still there.
+fn ceil_secs(left: Duration) -> u64 {
+    left.as_millis().div_ceil(1000) as u64
+}
+
 /// Nerd Font padlock (nf-fa-lock) -- the same glyph the system polkit dialog
 /// uses. The Omarchy monospace font carries it; without a Nerd Font egui draws
 /// a box, so this assumes the target platform (Omarchy) it is built for.
@@ -69,6 +84,13 @@ pub struct Subject {
     /// `attempts::Budget::status`. It does not change while the window is up,
     /// so it is a property of the request rather than a message on the channel.
     pub attempts: Option<(String, bool)>,
+    /// When the caller stops waiting, on the paths where one does.
+    ///
+    /// `None` on the sudo path: sudo waits for askpass however long it takes,
+    /// so a countdown there would be inventing a deadline. On the polkit path
+    /// the caller really does leave, and the window is the only place that can
+    /// say so before it happens.
+    pub deadline: Option<Instant>,
 }
 
 /// Show the window and pump it until the conversation ends.
@@ -182,6 +204,14 @@ impl Window {
         }
     }
 
+    /// Whole seconds until the caller gives up, or `None` where nothing is
+    /// counting. Rounded up so the last second reads `1s` rather than `0s`
+    /// for its whole length.
+    fn seconds_left(&self) -> Option<u64> {
+        let deadline = self.subject.deadline?;
+        Some(ceil_secs(deadline.saturating_duration_since(Instant::now())))
+    }
+
     fn submit(&mut self) {
         let password = std::mem::take(&mut self.password);
         // Sending moves the buffer; nothing is copied and nothing is left here.
@@ -220,6 +250,11 @@ impl eframe::App for Window {
             self.cancel(&ctx);
             return;
         }
+
+        // The countdown goes in the top-right margin band, put rather than
+        // laid out: it must not move the composition below it, and a centred
+        // headline must not be able to collide with it.
+        let panel = ui.max_rect();
 
         egui::Frame::central_panel(ui.style())
             .inner_margin(24)
@@ -349,5 +384,43 @@ impl eframe::App for Window {
                     }
                 });
             });
+
+        if let Some(left) = self.seconds_left() {
+            let text = egui::RichText::new(format!("{left}s")).size(11.0);
+            let text = if left <= HURRY_AT_OR_BELOW {
+                text.color(ui.visuals().error_fg_color)
+            } else {
+                text.weak()
+            };
+            let badge = egui::Rect::from_min_max(
+                egui::pos2(panel.right() - 56.0, panel.top() + 6.0),
+                egui::pos2(panel.right() - 8.0, panel.top() + 22.0),
+            );
+            ui.put(badge, egui::Label::new(text).halign(egui::Align::RIGHT));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The window is not unit-testable -- it owns an event loop -- but the
+    /// countdown's arithmetic is, and getting it wrong is visible every second.
+    #[test]
+    fn the_countdown_rounds_up_so_the_last_second_is_shown() {
+        assert_eq!(ceil_secs(Duration::ZERO), 0);
+        assert_eq!(ceil_secs(Duration::from_millis(1)), 1);
+        assert_eq!(ceil_secs(Duration::from_millis(999)), 1);
+        assert_eq!(ceil_secs(Duration::from_millis(1000)), 1);
+        assert_eq!(ceil_secs(Duration::from_millis(1001)), 2);
+        assert_eq!(ceil_secs(Duration::from_secs(25)), 25);
+    }
+
+    #[test]
+    fn the_last_five_seconds_are_the_ones_that_alarm() {
+        assert!(ceil_secs(Duration::from_millis(4500)) <= HURRY_AT_OR_BELOW);
+        assert!(ceil_secs(Duration::from_millis(5000)) <= HURRY_AT_OR_BELOW);
+        assert!(ceil_secs(Duration::from_millis(5001)) > HURRY_AT_OR_BELOW);
     }
 }

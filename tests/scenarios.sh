@@ -180,6 +180,20 @@ if [ -n "$AGENT" ]; then
           && ok "창이 화면 캡처에서 제외된다 (색 $colors 개)" \
           || bad "캡처에 내용이 찍힌다 (색 $colors 개)"
       fi
+      # 창에 뜨는 카운트다운의 기준. 요청이 도착한 시각부터 재므로 첫 요청은
+      # 25초에 거의 붙어 있어야 하고, 어떤 요청도 그것을 넘겨선 안 된다 —
+      # 줄을 서느라 흘린 시간을 창이 다시 내주면 없는 여유를 약속하는 셈이다.
+      lefts=$(grep -o 'left       : [0-9]* ms' "$WORK/agent.log" | grep -o '[0-9]*')
+      first=$(echo "$lefts" | head -1)
+      if [ -n "$first" ] && [ "$first" -le 25000 ] && [ "$first" -ge 24000 ]; then
+        ok "첫 요청의 남은 시간이 25초에 붙어 있다 (${first}ms)"
+      else
+        bad "남은 시간이 이상하다" "first=${first:-없음}"
+      fi
+      over=$(echo "$lefts" | awk '$1 > 25000' | wc -l)
+      [ "$over" = 0 ] && ok "어떤 요청도 25초를 넘겨 받지 않는다" \
+                      || bad "25초를 넘겨 받은 요청이 $over 건"
+
       kill $R2 2>/dev/null
     else
       bad "자식 프로세스를 찾지 못함"
