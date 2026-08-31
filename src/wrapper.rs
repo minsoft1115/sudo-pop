@@ -58,8 +58,41 @@ fn plain_command(args: &[OsString]) -> bool {
     matches!(command_start(args), Some(0)) && !args.first().is_some_and(|a| is_assignment(a))
 }
 
+/// Absolute path to a system binary, chosen so that a `sudo` (or `run0`) shim
+/// earlier on PATH cannot capture our own call to the real thing.
+///
+/// The wrapper runs *as* `sudo` — through the alias, and increasingly through a
+/// PATH shim another tool (minsh) installs to catch non-interactive
+/// `bash -c "sudo …"`, which the alias never sees. If we then spawned a bare
+/// `sudo`/`run0`, PATH would resolve it straight back to that shim:
+/// sudo-pop → shim → sudo-pop, forever, and every branch here except the run0
+/// one goes through `exec_sudo`. The shim is expected to strip itself from PATH
+/// before exec-ing us, but leaning on that alone is one mistake away from an
+/// unkillable loop. An absolute path shuts the door on our side regardless.
+///
+/// The candidates are the standard locations, first existing wins. If none do —
+/// an unusual layout — we fall back to the bare name rather than refuse, keeping
+/// the "always reach the real tool" guarantee; there the shim's own PATH
+/// cleaning is the remaining defence.
+fn absolute(name: &str, candidates: &[&str]) -> OsString {
+    for c in candidates {
+        if std::path::Path::new(c).exists() {
+            return OsString::from(c);
+        }
+    }
+    OsString::from(name)
+}
+
+fn real_sudo() -> OsString {
+    absolute("sudo", &["/usr/bin/sudo", "/bin/sudo"])
+}
+
+fn real_run0() -> OsString {
+    absolute("run0", &["/usr/bin/run0", "/bin/run0"])
+}
+
 fn exec_run0(args: &[OsString]) -> ! {
-    let mut cmd = Command::new("run0");
+    let mut cmd = Command::new(real_run0());
     cmd.args(args);
     let e = cmd.exec();
     // run0 missing or unrunnable: sudo is still there.
@@ -69,7 +102,7 @@ fn exec_run0(args: &[OsString]) -> ! {
 
 /// Replace this process with sudo. Never returns on success.
 fn exec_sudo(askpass: Option<&OsStr>, args: &[OsString]) -> ! {
-    let mut cmd = Command::new("sudo");
+    let mut cmd = Command::new(real_sudo());
     if let Some(link) = askpass {
         cmd.arg("-A");
         cmd.env("SUDO_ASKPASS", link);
@@ -158,5 +191,27 @@ mod tests {
     fn an_argument_that_merely_contains_equals_is_not_an_assignment() {
         assert!(plain_command(&args(&["find", "-name=x"])));
         assert!(plain_command(&args(&["=weird"])));
+    }
+
+    #[test]
+    fn absolute_prefers_an_existing_candidate_over_the_bare_name() {
+        // The test binary itself is a path guaranteed to exist right now, so this
+        // stays independent of what is installed on the machine.
+        let me = std::env::current_exe().unwrap();
+        let me_str = me.to_str().unwrap();
+        assert_eq!(
+            absolute("sudo", &["/no/such/path", me_str]),
+            OsString::from(me_str),
+        );
+    }
+
+    #[test]
+    fn absolute_falls_back_to_the_bare_name_when_nothing_exists() {
+        // No candidate on disk: keep the "always reach the real tool" guarantee
+        // by returning the bare name for a PATH lookup, as before.
+        assert_eq!(
+            absolute("run0", &["/no/such/path", "/also/missing"]),
+            OsString::from("run0"),
+        );
     }
 }
