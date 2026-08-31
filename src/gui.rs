@@ -115,6 +115,7 @@ pub enum ToUi {
     Prompt { text: String, echo: bool },
     Info(String),
     Error(String),
+    Attempts(Option<(String, bool)>),
     /// The conversation is over; close.
     Done,
 }
@@ -287,6 +288,9 @@ impl Window {
                     self.cover(ctx, &text);
                     self.notice = Some((text, true));
                     self.waiting = false;
+                }
+                Ok(ToUi::Attempts(attempts)) => {
+                    self.subject.attempts = attempts;
                 }
                 Ok(ToUi::Done) | Err(TryRecvError::Disconnected) => return false,
                 Err(TryRecvError::Empty) => return true,

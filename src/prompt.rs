@@ -51,6 +51,10 @@ impl Conversation for WindowConversation {
     fn error(&mut self, text: &str) {
         let _ = self.to_ui.send(ToUi::Error(text.to_owned()));
     }
+
+    fn update_attempts(&mut self, attempts: Option<(String, bool)>) {
+        let _ = self.to_ui.send(ToUi::Attempts(attempts));
+    }
 }
 
 /// Drive up to `MAX_ATTEMPTS` authentications, re-prompting after a wrong
@@ -61,7 +65,15 @@ impl Conversation for WindowConversation {
 /// window, or a password.
 fn run_attempts(
     conv: &mut dyn Conversation,
+    authenticate: impl FnMut(&mut dyn Conversation) -> Outcome,
+) -> Outcome {
+    run_attempts_with(conv, authenticate, attempts::budget)
+}
+
+fn run_attempts_with(
+    conv: &mut dyn Conversation,
     mut authenticate: impl FnMut(&mut dyn Conversation) -> Outcome,
+    mut get_budget: impl FnMut() -> Option<attempts::Budget>,
 ) -> Outcome {
     let mut last = Outcome::Failed;
     for attempt in 1..=MAX_ATTEMPTS {
@@ -69,7 +81,16 @@ fn run_attempts(
         match last {
             // PAM already said its piece; this is the one word the window needs
             // before asking again.
-            Outcome::Failed if attempt < MAX_ATTEMPTS => conv.error("Wrong"),
+            Outcome::Failed if attempt < MAX_ATTEMPTS => {
+                let budget = get_budget();
+                if let Some(ref b) = budget {
+                    if b.is_locked() {
+                        return Outcome::Cancelled;
+                    }
+                    conv.update_attempts(b.status());
+                }
+                conv.error("Wrong");
+            }
             _ => break,
         }
     }
@@ -178,6 +199,7 @@ mod tests {
     /// `authenticate` never asks it to).
     struct Rec {
         errors: Vec<String>,
+        attempts: Vec<Option<(String, bool)>>,
     }
     impl Conversation for Rec {
         fn ask(&mut self, _prompt: &str, _echo: bool) -> Option<Secret> {
@@ -187,17 +209,34 @@ mod tests {
         fn error(&mut self, text: &str) {
             self.errors.push(text.to_owned());
         }
+        fn update_attempts(&mut self, attempts: Option<(String, bool)>) {
+            self.attempts.push(attempts);
+        }
     }
 
     /// Run the loop against a fixed list of outcomes, counting the attempts.
     fn drive(outcomes: Vec<Outcome>) -> (Outcome, usize, Rec) {
-        let mut rec = Rec { errors: Vec::new() };
+        drive_with_budget(outcomes, || None)
+    }
+
+    fn drive_with_budget(
+        outcomes: Vec<Outcome>,
+        mut get_budget: impl FnMut() -> Option<attempts::Budget>,
+    ) -> (Outcome, usize, Rec) {
+        let mut rec = Rec {
+            errors: Vec::new(),
+            attempts: Vec::new(),
+        };
         let mut it = outcomes.into_iter();
         let mut calls = 0;
-        let last = run_attempts(&mut rec, |_conv| {
-            calls += 1;
-            it.next().expect("run_attempts asked more times than scripted")
-        });
+        let last = run_attempts_with(
+            &mut rec,
+            |_conv| {
+                calls += 1;
+                it.next().expect("run_attempts asked more times than scripted")
+            },
+            &mut get_budget,
+        );
         (last, calls, rec)
     }
 
@@ -231,5 +270,79 @@ mod tests {
         assert_eq!(calls, MAX_ATTEMPTS as usize, "no fourth prompt");
         // "Wrong" between attempts, but not after the final one.
         assert_eq!(rec.errors.len(), (MAX_ATTEMPTS - 1) as usize);
+    }
+
+    #[test]
+    fn wrong_updates_attempts_on_the_window() {
+        let mut budgets = vec![
+            Some(attempts::Budget {
+                remaining: 9,
+                unlock_in: None,
+            }),
+            Some(attempts::Budget {
+                remaining: 8,
+                unlock_in: None,
+            }),
+        ]
+        .into_iter();
+
+        let (last, calls, rec) = drive_with_budget(
+            vec![Outcome::Failed, Outcome::Success],
+            || budgets.next().flatten(),
+        );
+        assert_eq!(last, Outcome::Success);
+        assert_eq!(calls, 2);
+        assert_eq!(
+            rec.attempts,
+            vec![Some((
+                "9 attempt(s) left before the account locks".to_owned(),
+                false
+            ))]
+        );
+    }
+
+    #[test]
+    fn lockout_during_retries_stops_immediately() {
+        let mut budgets = vec![
+            Some(attempts::Budget {
+                remaining: 0,
+                unlock_in: Some(60),
+            }),
+        ]
+        .into_iter();
+
+        let (last, calls, rec) = drive_with_budget(
+            vec![Outcome::Failed, Outcome::Failed],
+            || budgets.next().flatten(),
+        );
+        // When the account locks mid-conversation, stop prompting immediately.
+        assert_eq!(last, Outcome::Cancelled);
+        assert_eq!(calls, 1, "must not attempt a second time when locked");
+        assert!(rec.errors.is_empty(), "no 'Wrong' when locked");
+    }
+
+    #[test]
+    fn a_spent_budget_alarms_with_error_color() {
+        let mut budgets = vec![
+            Some(attempts::Budget {
+                remaining: 3,
+                unlock_in: None,
+            }),
+        ]
+        .into_iter();
+
+        let (last, calls, rec) = drive_with_budget(
+            vec![Outcome::Failed, Outcome::Success],
+            || budgets.next().flatten(),
+        );
+        assert_eq!(last, Outcome::Success);
+        assert_eq!(calls, 2);
+        assert_eq!(
+            rec.attempts,
+            vec![Some((
+                "3 attempt(s) left before the account locks".to_owned(),
+                true
+            ))]
+        );
     }
 }

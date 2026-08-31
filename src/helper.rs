@@ -88,6 +88,8 @@ pub trait Conversation {
     fn ask(&mut self, prompt: &str, echo: bool) -> Option<Secret>;
     fn info(&mut self, text: &str);
     fn error(&mut self, text: &str);
+    /// Updates the standing budget / remaining attempts shown on the prompt.
+    fn update_attempts(&mut self, _attempts: Option<(String, bool)>) {}
 }
 
 /// Reading and writing are separate ends on purpose: the socket is cloned and
