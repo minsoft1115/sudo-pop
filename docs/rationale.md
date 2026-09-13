@@ -1848,3 +1848,22 @@ ManagerEnvironment=SYSTEMD_BUS_TIMEOUT=120
 - 지문 30초가 25초 안에 안 들어가는 문제는 **아직 열려 있다.** 호출자 쪽 시계는 위에서 본
   대로 우리 손 밖이므로, 남는 손잡이는 `pam_fprintd` 줄의 `timeout=` 뿐이다. 지금은
   [`fingerprint.md`](fingerprint.md) §7 대로 두 단계 모두에 호출자 25초를 그리기만 한다
+
+### 23-5. 호출자의 시계를 읽는다 — 줄이기만
+
+23-1 의 표는 창이 그리는 25 가 가정이라는 뜻이기도 하다. `SYSTEMD_BUS_TIMEOUT=5 run0 …` 은
+5초에 죽는데 창은 25 부터 셌다. 읽을 수 있는 만큼은 읽기로 했다.
+
+polkitd 가 subject 로 넘기는 pid 는 run0 자신이고 (저널: `system-bus-name::1.253
+[run0 --background= true]`), run0 은 setuid 가 아니라 같은 uid 인 에이전트가
+`/proc/<pid>/environ` 을 열 수 있다. sd-bus 가 그 변수를 읽는 규칙대로 — 첫 항목, systemd
+시간 문법, `0` 은 기본값 — 파싱해서 `min(25초, 그 값)` 을 `SUDO_POP_LEFT_MS` 의 출발점으로
+쓴다 (`src/agent.rs` `caller_timeout`). 창은 손대지 않았다.
+
+**줄이기만 한다.** 마감은 run0 과 PID 1 두 시계 중 짧은 쪽이고 PID 1 의 값은 읽을 수 없으므로,
+`=120` 이나 `infinity` 가 있어도 25 를 그린다. 못 읽는 subject — 사라진 것, setuid 인
+`pkexec`, 남의 것 — 는 그대로 25 다. 세션 전체에 짧은 값을 둔 사용자의 GDBus 앱은 실제보다
+짧게 세다가 0 에서 숨는다 (§20-3). 실제보다 길게 세는 쪽으로 틀리는 경우는 없다.
+
+시험은 파서와 environ 블록 파싱, 그리고 `sleep` 자식 셋(`=5`, `=120`, 없음)을 실제 subject 처럼
+읽어 5·25·25 가 나오는지 본다.

@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_process::{Command, Stdio};
 use futures_lite::io::AsyncWriteExt;
@@ -84,8 +85,72 @@ impl Agent {
 /// (udisks, NetworkManager), measured at 25.03 s end to end. A caller that
 /// passes its own timeout is not covered, so what the window draws from this is
 /// a countdown, not a promise: our own backstop stays a little longer and the
-/// request really ends when polkitd cancels it.
-const CALLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+/// request really ends when polkitd cancels it. Where the caller's own clock
+/// can be read it shortens this (`caller_timeout`); nothing lengthens it.
+const CALLER_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// The caller's clock as far as we can know it.
+///
+/// An sd-bus client takes its method-call timeout from `SYSTEMD_BUS_TIMEOUT`
+/// in its own environment, and polkitd names that client as the subject, so
+/// its `/proc/<pid>/environ` says how long it will wait. The kernel lets only
+/// the same uid read that file, and not for a setuid process, so a subject we
+/// cannot read (gone, `pkexec`, somebody else's) keeps the default.
+///
+/// The request also passes through PID 1, whose own 25 s clock we cannot read,
+/// and the deadline is the shorter of the two. So this only ever shortens the
+/// countdown: a caller with `=5` is shown 5, one with `=120` or `infinity` is
+/// still shown 25 (rationale §23).
+fn caller_timeout(subject_pid: u32) -> Duration {
+    if subject_pid == 0 {
+        return CALLER_TIMEOUT;
+    }
+    std::fs::read(format!("/proc/{subject_pid}/environ"))
+        .ok()
+        .and_then(|environ| bus_timeout_in(&environ))
+        .map_or(CALLER_TIMEOUT, |theirs| theirs.min(CALLER_TIMEOUT))
+}
+
+/// `SYSTEMD_BUS_TIMEOUT` out of a NUL-separated environment block, as sd-bus
+/// would read it: the first entry wins, and a value it would reject (empty,
+/// zero, unparsable) means the default, which is `None` here.
+fn bus_timeout_in(environ: &[u8]) -> Option<Duration> {
+    let value = environ
+        .split(|b| *b == 0)
+        .find_map(|entry| entry.strip_prefix(b"SYSTEMD_BUS_TIMEOUT="))?;
+    parse_sec(std::str::from_utf8(value).ok()?)
+}
+
+/// systemd's time syntax, the part of it a timeout can be written in: a bare
+/// number is seconds, else each whitespace-separated part is a number (with an
+/// optional fraction) and a unit, and the parts add up. `0` is `None` because
+/// sd-bus falls back to its default for it; `infinity` is `None` because a
+/// caller with no clock cannot shorten ours.
+fn parse_sec(text: &str) -> Option<Duration> {
+    let text = text.trim();
+    if text.is_empty() || text == "infinity" {
+        return None;
+    }
+    let mut total = Duration::ZERO;
+    for part in text.split_whitespace() {
+        let digits = part
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(part.len());
+        let (number, unit) = part.split_at(digits);
+        let number: f64 = number.parse().ok()?;
+        let usec_per_unit: f64 = match unit {
+            "" | "s" | "sec" | "second" | "seconds" => 1_000_000.0,
+            "ms" | "msec" => 1_000.0,
+            "us" | "usec" | "µs" => 1.0,
+            "m" | "min" | "minute" | "minutes" => 60_000_000.0,
+            "h" | "hr" | "hour" | "hours" => 3_600_000_000.0,
+            "d" | "day" | "days" => 86_400_000_000.0,
+            _ => return None,
+        };
+        total += Duration::from_micros((number * usec_per_unit) as u64);
+    }
+    (total > Duration::ZERO).then_some(total)
+}
 
 /// Per-request tracing goes to the journal, so it is off unless asked for.
 /// Only the security-relevant lines (a refused sender, an error) log always.
@@ -174,9 +239,14 @@ impl Agent {
         // Measured from the top of this method, not from the child's start:
         // a request that waited its turn in the queue has already spent some
         // of the caller's patience, and the window must not offer it again.
-        let left = CALLER_TIMEOUT.saturating_sub(started.elapsed());
+        let timeout = caller_timeout(subject_pid);
+        let left = timeout.saturating_sub(started.elapsed());
         if tracing() {
-            println!("  left       : {} ms", left.as_millis());
+            println!(
+                "  left       : {} ms (caller waits {} ms)",
+                left.as_millis(),
+                timeout.as_millis()
+            );
         }
         let code = self
             .ask(&name, &cookie, subject_pid, &message, &action_id, left)
@@ -365,5 +435,73 @@ mod tests {
         }
         let len = agent.cancelled.lock().unwrap().len();
         assert!(len <= 257, "the set must not grow without bound, was {len}");
+    }
+
+    #[test]
+    fn systemd_time_syntax_is_read_the_way_sd_bus_reads_it() {
+        assert_eq!(
+            parse_sec("5"),
+            Some(Duration::from_secs(5)),
+            "bare = seconds"
+        );
+        assert_eq!(parse_sec("5s"), Some(Duration::from_secs(5)));
+        assert_eq!(parse_sec("500ms"), Some(Duration::from_millis(500)));
+        assert_eq!(parse_sec("1.5s"), Some(Duration::from_millis(1500)));
+        assert_eq!(parse_sec("1min"), Some(Duration::from_secs(60)));
+        assert_eq!(parse_sec("2h"), Some(Duration::from_secs(7200)));
+        assert_eq!(parse_sec(" 1min 30s "), Some(Duration::from_secs(90)));
+        assert_eq!(parse_sec("0"), None, "sd-bus treats 0 as unset");
+        assert_eq!(parse_sec("infinity"), None, "no clock cannot shorten ours");
+        assert_eq!(parse_sec(""), None);
+        assert_eq!(parse_sec("abc"), None);
+        assert_eq!(
+            parse_sec("5 apples"),
+            None,
+            "an unknown unit is not a guess"
+        );
+    }
+
+    #[test]
+    fn the_first_entry_in_the_block_wins_and_others_are_ignored() {
+        let block = b"HOME=/home/x\0SYSTEMD_BUS_TIMEOUT=7\0SYSTEMD_BUS_TIMEOUT=9\0";
+        assert_eq!(bus_timeout_in(block), Some(Duration::from_secs(7)));
+        assert_eq!(bus_timeout_in(b"HOME=/home/x\0PATH=/bin\0"), None);
+        assert_eq!(
+            bus_timeout_in(b"SYSTEMD_BUS_TIMEOUT_X=3\0"),
+            None,
+            "a longer name is a different variable"
+        );
+        assert_eq!(bus_timeout_in(b""), None);
+    }
+
+    /// A child of ours with the variable set, read the way a real subject is.
+    fn sleeping_child(timeout: Option<&str>) -> std::process::Child {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30").env_remove("SYSTEMD_BUS_TIMEOUT");
+        if let Some(t) = timeout {
+            cmd.env("SYSTEMD_BUS_TIMEOUT", t);
+        }
+        cmd.spawn().expect("sleep is available")
+    }
+
+    #[test]
+    fn a_callers_own_clock_shortens_the_countdown_but_never_lengthens_it() {
+        let mut short = sleeping_child(Some("5"));
+        let mut long = sleeping_child(Some("120"));
+        let mut none = sleeping_child(None);
+
+        assert_eq!(caller_timeout(short.id()), Duration::from_secs(5));
+        assert_eq!(
+            caller_timeout(long.id()),
+            CALLER_TIMEOUT,
+            "PID 1's clock is still 25 s, so more is not on offer"
+        );
+        assert_eq!(caller_timeout(none.id()), CALLER_TIMEOUT);
+        assert_eq!(caller_timeout(0), CALLER_TIMEOUT, "no subject, no reading");
+
+        for child in [&mut short, &mut long, &mut none] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
