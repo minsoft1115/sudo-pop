@@ -112,7 +112,10 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What the helper thread tells the window.
 pub enum ToUi {
-    Prompt { text: String, echo: bool },
+    Prompt {
+        text: String,
+        echo: bool,
+    },
     Info(String),
     Error(String),
     Attempts(Option<(String, bool)>),
@@ -420,8 +423,7 @@ impl eframe::App for Window {
                             ui.add_space((slack / 2.0).max(0.0));
                             // Centre the glyph in a box the height of the field,
                             // so it lines up with the input rather than riding high.
-                            let field_h =
-                                ui.text_style_height(&egui::TextStyle::Monospace) + 16.0;
+                            let field_h = ui.text_style_height(&egui::TextStyle::Monospace) + 16.0;
                             ui.add_sized(
                                 [LOCK_WIDTH, field_h],
                                 egui::Label::new(
@@ -445,8 +447,8 @@ impl eframe::App for Window {
                                 field.request_focus();
                                 self.focus_set = true;
                             }
-                            let entered = field.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            let entered =
+                                field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                             // An empty line reads as a wrong password and costs an
                             // attempt, so keep the window open instead of submitting.
                             if entered && !self.waiting && self.password.is_empty() {
@@ -541,7 +543,11 @@ mod tests {
         let grown = clamp_width(MIN_WIDTH);
         assert_eq!(grown, MIN_WIDTH + CHROME_WIDTH);
         assert!(grown > MIN_WIDTH && grown < MAX_WIDTH);
-        assert_eq!(clamp_width(10_000.0), MAX_WIDTH, "a runaway argv cannot fill the screen");
+        assert_eq!(
+            clamp_width(10_000.0),
+            MAX_WIDTH,
+            "a runaway argv cannot fill the screen"
+        );
     }
 
     #[test]

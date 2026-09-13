@@ -165,7 +165,10 @@ fn install_all(layout: &Layout) -> io::Result<()> {
     // polkit allows one agent per session. Starting ours while another holds
     // the seat would fail to register and then be restarted forever.
     if let Some(other) = other_agent() {
-        println!("\n{} already holds this session's polkit seat.", other.describe());
+        println!(
+            "\n{} already holds this session's polkit seat.",
+            other.describe()
+        );
         println!("The unit is installed but not enabled. To switch:");
         println!("  {}", other.hint());
         println!("  sudo-pop --init");
@@ -414,7 +417,11 @@ fn systemctl(args: &[&str]) -> bool {
         Ok(out) if out.status.success() => true,
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            eprintln!("sudo-pop: systemctl {} failed: {}", args.join(" "), stderr.trim());
+            eprintln!(
+                "sudo-pop: systemctl {} failed: {}",
+                args.join(" "),
+                stderr.trim()
+            );
             false
         }
         Err(e) => {
@@ -618,14 +625,21 @@ mod tests {
 
     #[test]
     fn the_hint_names_the_way_out_for_each_kind() {
-        assert_eq!(Seat::Omarchy.hint(), "omarchy plugin disable omarchy.polkit");
+        assert_eq!(
+            Seat::Omarchy.hint(),
+            "omarchy plugin disable omarchy.polkit"
+        );
         assert_eq!(
             Seat::Unit("hyprpolkitagent.service".into()).hint(),
             "systemctl --user disable --now hyprpolkitagent.service"
         );
         // The old code appended ".service" to a process name and produced a
         // command that does not exist. Say something true instead.
-        assert!(!Seat::Process("polkit-kde-auth".into()).hint().contains(".service"));
+        assert!(
+            !Seat::Process("polkit-kde-auth".into())
+                .hint()
+                .contains(".service")
+        );
     }
 
     const B: &str = "-- x:begin";
@@ -635,7 +649,10 @@ mod tests {
     #[test]
     fn a_block_is_appended_then_left_alone() {
         let out = insert_block("line1\nline2\n", B, E, BODY).unwrap();
-        assert!(out.starts_with("line1\nline2\n"), "existing content is kept");
+        assert!(
+            out.starts_with("line1\nline2\n"),
+            "existing content is kept"
+        );
         assert!(out.contains(B) && out.contains(BODY) && out.contains(E));
         // Idempotent: a second insert finds the marker and does nothing.
         assert_eq!(insert_block(&out, B, E, BODY), None);
@@ -677,7 +694,9 @@ mod tests {
         assert!(!polkit_enabled_in(
             r#"[{"id":"omarchy.polkit","enabled":false}]"#
         ));
-        assert!(!polkit_enabled_in(r#"[{"id":"omarchy.bar","enabled":true}]"#));
+        assert!(!polkit_enabled_in(
+            r#"[{"id":"omarchy.bar","enabled":true}]"#
+        ));
         // A different plugin being enabled must not be read as ours.
         assert!(!polkit_enabled_in(
             r#"[{"id":"omarchy.polkit","enabled":false},{"id":"x","enabled":true}]"#

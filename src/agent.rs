@@ -273,9 +273,9 @@ impl Agent {
         // path falls back to the 30s window backstop rather than a stale kill.
         let pid = child.id();
         // SAFETY: plain syscall; the child is alive here, freshly spawned.
-        let pidfd = unsafe {
-            libc::syscall(libc::SYS_pidfd_open, pid as libc::c_long, 0 as libc::c_long)
-        } as i32;
+        let pidfd =
+            unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_long, 0 as libc::c_long) }
+                as i32;
         if pidfd >= 0 {
             if let Ok(mut map) = self.running.lock() {
                 map.insert(cookie.to_owned(), pidfd);
@@ -319,7 +319,10 @@ mod tests {
     fn only_the_polkitd_owner_passes_the_sender_check() {
         let agent = Agent::new(":1.12".to_owned(), false);
         assert!(agent.is_polkitd(Some(":1.12")));
-        assert!(!agent.is_polkitd(Some(":1.99")), "a different name is not polkit");
+        assert!(
+            !agent.is_polkitd(Some(":1.99")),
+            "a different name is not polkit"
+        );
         assert!(!agent.is_polkitd(None), "no sender is not polkit");
     }
 
@@ -327,7 +330,10 @@ mod tests {
     fn success_and_cancel_end_without_an_error() {
         assert!(is_ok_exit(prompt::EXIT_SUCCESS));
         assert!(is_ok_exit(prompt::EXIT_CANCELLED));
-        assert!(!is_ok_exit(prompt::EXIT_FAILED), "a real failure is a D-Bus error");
+        assert!(
+            !is_ok_exit(prompt::EXIT_FAILED),
+            "a real failure is a D-Bus error"
+        );
         assert!(!is_ok_exit(42), "an unexpected code is a D-Bus error");
     }
 
@@ -335,9 +341,18 @@ mod tests {
     fn a_cancel_before_start_is_remembered_then_consumed_once() {
         let agent = Agent::new(":1.12".to_owned(), false);
         agent.remember_cancelled("c1".to_owned());
-        assert!(agent.take_cancelled("c1"), "the queued request sees the cancel");
-        assert!(!agent.take_cancelled("c1"), "and it is consumed, not sticky");
-        assert!(!agent.take_cancelled("never"), "an unknown cookie was not cancelled");
+        assert!(
+            agent.take_cancelled("c1"),
+            "the queued request sees the cancel"
+        );
+        assert!(
+            !agent.take_cancelled("c1"),
+            "and it is consumed, not sticky"
+        );
+        assert!(
+            !agent.take_cancelled("never"),
+            "an unknown cookie was not cancelled"
+        );
     }
 
     #[test]

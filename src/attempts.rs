@@ -119,7 +119,10 @@ impl Budget {
     pub fn status(&self) -> Option<(String, bool)> {
         (self.remaining > 0).then(|| {
             (
-                format!("{} attempt(s) left before the account locks", self.remaining),
+                format!(
+                    "{} attempt(s) left before the account locks",
+                    self.remaining
+                ),
                 self.remaining <= WARN_AT_OR_BELOW,
             )
         })
@@ -290,7 +293,9 @@ mod tests {
     use super::*;
 
     fn with_runtime_dir<T>(f: impl FnOnce() -> T) -> T {
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("sudo-pop-attempts-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("sudo-pop")).unwrap();
@@ -348,8 +353,14 @@ mod tests {
         assert_eq!(parse_pam_setting(pam, "deny"), Some(10));
         assert_eq!(parse_pam_setting(pam, "unlock_time"), Some(120));
         // only pam_faillock lines are consulted
-        assert_eq!(parse_pam_setting("auth required pam_unix.so deny=3\n", "deny"), None);
-        assert_eq!(parse_pam_setting("# pam_faillock.so deny=3\n", "deny"), None);
+        assert_eq!(
+            parse_pam_setting("auth required pam_unix.so deny=3\n", "deny"),
+            None
+        );
+        assert_eq!(
+            parse_pam_setting("# pam_faillock.so deny=3\n", "deny"),
+            None
+        );
     }
 
     #[test]
@@ -378,22 +389,35 @@ When                Type  Source   Valid
 
     #[test]
     fn the_budget_line_is_always_there() {
-        let b = |remaining| Budget { remaining, unlock_in: None };
+        let b = |remaining| Budget {
+            remaining,
+            unlock_in: None,
+        };
         // Ten left is not a warning, but the window says so all the same.
         assert_eq!(
             b(10).status(),
-            Some(("10 attempt(s) left before the account locks".to_owned(), false))
+            Some((
+                "10 attempt(s) left before the account locks".to_owned(),
+                false
+            ))
         );
-        assert_eq!(b(0).status(), None, "a locked account speaks through refusal");
+        assert_eq!(
+            b(0).status(),
+            None,
+            "a locked account speaks through refusal"
+        );
     }
 
     #[test]
     fn only_three_or_fewer_turn_the_line_red() {
         let warned = |remaining| {
-            Budget { remaining, unlock_in: None }
-                .status()
-                .expect("not locked")
-                .1
+            Budget {
+                remaining,
+                unlock_in: None,
+            }
+            .status()
+            .expect("not locked")
+            .1
         };
         assert!(!warned(5));
         assert!(!warned(4));
@@ -404,13 +428,30 @@ When                Type  Source   Valid
 
     #[test]
     fn refusal_speaks_only_when_locked() {
-        assert_eq!(Budget { remaining: 1, unlock_in: None }.refusal(), None);
         assert_eq!(
-            Budget { remaining: 0, unlock_in: None }.refusal().as_deref(),
+            Budget {
+                remaining: 1,
+                unlock_in: None
+            }
+            .refusal(),
+            None
+        );
+        assert_eq!(
+            Budget {
+                remaining: 0,
+                unlock_in: None
+            }
+            .refusal()
+            .as_deref(),
             Some("account is locked out")
         );
         assert_eq!(
-            Budget { remaining: 0, unlock_in: Some(90) }.refusal().as_deref(),
+            Budget {
+                remaining: 0,
+                unlock_in: Some(90)
+            }
+            .refusal()
+            .as_deref(),
             Some("account locked, 90s to go")
         );
     }

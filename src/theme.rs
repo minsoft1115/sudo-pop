@@ -98,9 +98,7 @@ fn load_polkit() -> Option<Polkit> {
 
 /// Map a parsed shell.toml to the polkit colors, resolving `section.key`
 /// references (e.g. `border = "hyprland.active-border"`) to their hex.
-fn polkit_overlay(
-    sections: &HashMap<String, HashMap<String, String>>,
-) -> Option<Polkit> {
+fn polkit_overlay(sections: &HashMap<String, HashMap<String, String>>) -> Option<Polkit> {
     let p = sections.get("polkit")?;
     let color = |key: &str| p.get(key).and_then(|raw| resolve(sections, raw, 3));
     Some(Polkit {
@@ -339,7 +337,11 @@ accent           = "#7aa2f7"
         let p = polkit_overlay(&parse_sections(SHELL_SAMPLE)).unwrap();
         assert_eq!(p.background, parse_hex("#1a1b26"));
         assert_eq!(p.text, parse_hex("#a9b1d6"));
-        assert_eq!(p.text_error, parse_hex("#f7768e"), "the failure color comes from the theme");
+        assert_eq!(
+            p.text_error,
+            parse_hex("#f7768e"),
+            "the failure color comes from the theme"
+        );
         assert_eq!(p.accent, parse_hex("#7aa2f7"));
     }
 
@@ -362,7 +364,9 @@ accent           = "#7aa2f7"
     #[test]
     fn a_present_shell_toml_polkit_section_resolves() {
         let Some(path) = shell_path() else { return };
-        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
         let sections = parse_sections(&text);
         if sections.contains_key("polkit") {
             let p = polkit_overlay(&sections).expect("a [polkit] section must map");

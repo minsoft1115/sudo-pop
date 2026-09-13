@@ -101,16 +101,19 @@ mod tests {
 
     fn uid_attr(n: u32) -> HashMap<String, OwnedValue> {
         let mut m = HashMap::new();
-        m.insert("uid".to_owned(), OwnedValue::try_from(Value::U32(n)).unwrap());
+        m.insert(
+            "uid".to_owned(),
+            OwnedValue::try_from(Value::U32(n)).unwrap(),
+        );
         m
     }
 
     #[test]
     fn only_unix_user_uids_are_collected() {
         let ids = vec![
-            ("unix-group".to_owned(), uid_attr(0)),    // wrong kind -> skipped
+            ("unix-group".to_owned(), uid_attr(0)), // wrong kind -> skipped
             ("unix-user".to_owned(), uid_attr(1000)),
-            ("unix-user".to_owned(), HashMap::new()),  // no uid attr -> skipped
+            ("unix-user".to_owned(), HashMap::new()), // no uid attr -> skipped
             ("unix-user".to_owned(), uid_attr(0)),
         ];
         assert_eq!(unix_user_uids(&ids), vec![1000, 0]);

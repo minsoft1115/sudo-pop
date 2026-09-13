@@ -27,7 +27,7 @@ use futures_lite::StreamExt;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, Proxy, connection};
 
-use sudo_pop::{HANDLED, agent, init, prompt, wrapper, paths, askpass};
+use sudo_pop::{HANDLED, agent, askpass, init, paths, prompt, wrapper};
 
 use agent::Agent;
 
@@ -45,9 +45,6 @@ const AGENT_PATH: &str = "/org/minsoft1115/sudo_pop/AuthenticationAgent";
 fn tracing() -> bool {
     std::env::var_os("SUDO_POP_DEBUG").is_some_and(|v| !v.is_empty())
 }
-
-
-
 
 /// Ask a property of one object, as a string.
 async fn get_string(
@@ -98,7 +95,10 @@ async fn session_id(conn: &Connection) -> Option<(String, &'static str)> {
 
     // SAFETY: getuid cannot fail.
     let uid = unsafe { libc::getuid() };
-    if let Ok(path) = manager.call::<_, _, OwnedObjectPath>("GetUser", &(uid,)).await {
+    if let Ok(path) = manager
+        .call::<_, _, OwnedObjectPath>("GetUser", &(uid,))
+        .await
+    {
         let props = Proxy::new(
             conn,
             LOGIND_SERVICE,

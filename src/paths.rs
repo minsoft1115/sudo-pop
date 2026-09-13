@@ -110,7 +110,9 @@ mod tests {
     /// Point XDG_RUNTIME_DIR at a fresh empty dir for the duration of `f`, then
     /// restore it. Serialized against the other env-touching tests.
     fn with_runtime_dir<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir().join(format!("sudo-pop-paths-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
@@ -134,9 +136,18 @@ mod tests {
 
     #[test]
     fn basename_takes_the_last_component() {
-        assert_eq!(basename(&OsString::from("/a/b/askpass")), std::ffi::OsStr::new("askpass"));
-        assert_eq!(basename(&OsString::from("sudo-pop")), std::ffi::OsStr::new("sudo-pop"));
-        assert_eq!(basename(&OsString::from("/a/b/")), std::ffi::OsStr::new("b"));
+        assert_eq!(
+            basename(&OsString::from("/a/b/askpass")),
+            std::ffi::OsStr::new("askpass")
+        );
+        assert_eq!(
+            basename(&OsString::from("sudo-pop")),
+            std::ffi::OsStr::new("sudo-pop")
+        );
+        assert_eq!(
+            basename(&OsString::from("/a/b/")),
+            std::ffi::OsStr::new("b")
+        );
     }
 
     #[test]
@@ -179,7 +190,10 @@ mod tests {
     fn the_askpass_link_points_at_this_binary_and_is_reused() {
         with_runtime_dir(|_| {
             let link = ensure_askpass_symlink().unwrap();
-            assert_eq!(fs::read_link(&link).unwrap(), std::env::current_exe().unwrap());
+            assert_eq!(
+                fs::read_link(&link).unwrap(),
+                std::env::current_exe().unwrap()
+            );
             let again = ensure_askpass_symlink().unwrap();
             assert_eq!(link, again, "a correct link is reused, not recreated");
         });
@@ -192,7 +206,10 @@ mod tests {
             let link = base.join(RUNTIME_SUBDIR).join(ASKPASS_LINK);
             symlink("/nonexistent/target", &link).unwrap();
             let fixed = ensure_askpass_symlink().unwrap();
-            assert_eq!(fs::read_link(&fixed).unwrap(), std::env::current_exe().unwrap());
+            assert_eq!(
+                fs::read_link(&fixed).unwrap(),
+                std::env::current_exe().unwrap()
+            );
         });
     }
 }

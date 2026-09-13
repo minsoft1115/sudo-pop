@@ -157,9 +157,10 @@ impl Chain {
     }
 
     fn add(&mut self, face: Face, at: Position) {
-        self.defs
-            .font_data
-            .insert(face.family.clone(), Arc::new(egui::FontData::from_owned(face.bytes)));
+        self.defs.font_data.insert(
+            face.family.clone(),
+            Arc::new(egui::FontData::from_owned(face.bytes)),
+        );
 
         // Omarchy's font is a terminal face, and the prompt it renders came
         // from the terminal, so it earns both families rather than just

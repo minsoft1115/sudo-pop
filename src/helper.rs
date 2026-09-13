@@ -124,8 +124,14 @@ impl Channel {
             .stdout(Stdio::piped())
             .spawn()?;
 
-        let stdout = child.stdout.take().ok_or_else(|| std::io::Error::other("no stdout"))?;
-        let mut stdin = child.stdin.take().ok_or_else(|| std::io::Error::other("no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("no stdout"))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("no stdin"))?;
         // The cookie goes on stdin, not in argv, so it stays out of ps. stdin
         // has to be a pipe anyway: the helper refuses a tty outright.
         writeln!(stdin, "{cookie}")?;
@@ -180,7 +186,7 @@ fn attempt(channel: std::io::Result<Channel>, conv: &mut dyn Conversation) -> Ou
     loop {
         line.clear();
         match channel.reader.read_line(&mut line) {
-            Ok(0) => break,                      // EOF
+            Ok(0) => break, // EOF
             Ok(_) => {}
             Err(e) => {
                 conv.error(&format!("helper went away: {e}"));
@@ -260,6 +266,9 @@ mod tests {
     #[test]
     fn only_the_first_space_is_the_separator() {
         // The protocol drops exactly one space; any extra belongs to the body.
-        assert_eq!(split_tag("PAM_ERROR_MSG  two spaces"), ("PAM_ERROR_MSG", " two spaces"));
+        assert_eq!(
+            split_tag("PAM_ERROR_MSG  two spaces"),
+            ("PAM_ERROR_MSG", " two spaces")
+        );
     }
 }

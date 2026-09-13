@@ -222,8 +222,12 @@ mod tests {
     #[test]
     fn the_boilerplate_and_the_full_stop_go() {
         assert_eq!(
-            purpose("Authentication is required to reboot the system.", MOUNT, true)
-                .as_deref(),
+            purpose(
+                "Authentication is required to reboot the system.",
+                MOUNT,
+                true
+            )
+            .as_deref(),
             Some("reboot the system")
         );
     }
@@ -244,12 +248,20 @@ mod tests {
         assert_eq!(purpose("   ", MOUNT, true), None);
         // A message that is only the boilerplate leaves an empty line, not a
         // line containing nothing.
-        assert_eq!(purpose("Authentication is required to .", MOUNT, true), None);
+        assert_eq!(
+            purpose("Authentication is required to .", MOUNT, true),
+            None
+        );
     }
 
     #[test]
     fn a_long_sentence_is_cut_short() {
-        let shown = purpose(&format!("Authentication is required to {}", "x".repeat(200)), MOUNT, true).unwrap();
+        let shown = purpose(
+            &format!("Authentication is required to {}", "x".repeat(200)),
+            MOUNT,
+            true,
+        )
+        .unwrap();
         assert!(shown.chars().count() <= MAX_PURPOSE_CHARS, "{shown}");
         assert!(shown.ends_with('…'));
     }

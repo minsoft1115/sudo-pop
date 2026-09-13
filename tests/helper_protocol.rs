@@ -59,7 +59,10 @@ fn run(mode: &str, answers: &[&str]) -> (Outcome, Scripted) {
     let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         std::env::set_var("SUDO_POP_HELPER_BIN", fake_helper());
-        std::env::set_var("SUDO_POP_HELPER_SOCKET", "/nonexistent/sudo-pop-test.socket");
+        std::env::set_var(
+            "SUDO_POP_HELPER_SOCKET",
+            "/nonexistent/sudo-pop-test.socket",
+        );
         std::env::set_var("FAKE_HELPER_MODE", mode);
     }
     let mut conv = Scripted::new(answers);
@@ -186,6 +189,10 @@ fn a_silent_socket_falls_back_to_the_fork_helper() {
         preamble.starts_with("tester\ncookie-1234\n"),
         "the socket door got the wrong preamble: {preamble:?}"
     );
-    assert_eq!(outcome, Outcome::Success, "the fork fallback should succeed");
+    assert_eq!(
+        outcome,
+        Outcome::Success,
+        "the fork fallback should succeed"
+    );
     let _ = std::fs::remove_file(&socket);
 }

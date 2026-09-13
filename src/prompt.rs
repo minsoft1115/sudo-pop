@@ -11,10 +11,10 @@
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+use crate::attempts::{self, MAX_ATTEMPTS};
 use crate::gui::{self, FromUi, Subject, ToUi};
 use crate::helper::{self, Conversation, Outcome};
 use crate::secret::Secret;
-use crate::attempts::{self, MAX_ATTEMPTS};
 use crate::{harden, invocation};
 
 /// Exit codes. The daemon turns these back into a D-Bus answer, so the
@@ -233,7 +233,8 @@ mod tests {
             &mut rec,
             |_conv| {
                 calls += 1;
-                it.next().expect("run_attempts asked more times than scripted")
+                it.next()
+                    .expect("run_attempts asked more times than scripted")
             },
             &mut get_budget,
         );
@@ -286,10 +287,9 @@ mod tests {
         ]
         .into_iter();
 
-        let (last, calls, rec) = drive_with_budget(
-            vec![Outcome::Failed, Outcome::Success],
-            || budgets.next().flatten(),
-        );
+        let (last, calls, rec) = drive_with_budget(vec![Outcome::Failed, Outcome::Success], || {
+            budgets.next().flatten()
+        });
         assert_eq!(last, Outcome::Success);
         assert_eq!(calls, 2);
         assert_eq!(
@@ -303,18 +303,15 @@ mod tests {
 
     #[test]
     fn lockout_during_retries_stops_immediately() {
-        let mut budgets = vec![
-            Some(attempts::Budget {
-                remaining: 0,
-                unlock_in: Some(60),
-            }),
-        ]
+        let mut budgets = vec![Some(attempts::Budget {
+            remaining: 0,
+            unlock_in: Some(60),
+        })]
         .into_iter();
 
-        let (last, calls, rec) = drive_with_budget(
-            vec![Outcome::Failed, Outcome::Failed],
-            || budgets.next().flatten(),
-        );
+        let (last, calls, rec) = drive_with_budget(vec![Outcome::Failed, Outcome::Failed], || {
+            budgets.next().flatten()
+        });
         // When the account locks mid-conversation, stop prompting immediately.
         assert_eq!(last, Outcome::Cancelled);
         assert_eq!(calls, 1, "must not attempt a second time when locked");
@@ -323,18 +320,15 @@ mod tests {
 
     #[test]
     fn a_spent_budget_alarms_with_error_color() {
-        let mut budgets = vec![
-            Some(attempts::Budget {
-                remaining: 3,
-                unlock_in: None,
-            }),
-        ]
+        let mut budgets = vec![Some(attempts::Budget {
+            remaining: 3,
+            unlock_in: None,
+        })]
         .into_iter();
 
-        let (last, calls, rec) = drive_with_budget(
-            vec![Outcome::Failed, Outcome::Success],
-            || budgets.next().flatten(),
-        );
+        let (last, calls, rec) = drive_with_budget(vec![Outcome::Failed, Outcome::Success], || {
+            budgets.next().flatten()
+        });
         assert_eq!(last, Outcome::Success);
         assert_eq!(calls, 2);
         assert_eq!(

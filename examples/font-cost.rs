@@ -64,9 +64,15 @@ fn main() {
     });
 
     println!("\n-- laying out one line --");
-    time("ascii,  primary chain    ", 5, || layout(&with_primary, ASCII));
-    time("korean, primary chain    ", 5, || layout(&with_primary, KOREAN));
-    time("korean, chain + fallback ", 5, || layout(&with_both, KOREAN));
+    time("ascii,  primary chain    ", 5, || {
+        layout(&with_primary, ASCII)
+    });
+    time("korean, primary chain    ", 5, || {
+        layout(&with_primary, KOREAN)
+    });
+    time("korean, chain + fallback ", 5, || {
+        layout(&with_both, KOREAN)
+    });
 
     println!("\n-- what the two launches add up to --");
     time("ascii  launch (fc+read+parse+layout)", 5, || {
@@ -128,11 +134,7 @@ fn time(label: &str, runs: u32, mut f: impl FnMut()) {
         best = best.min(d);
         total += d;
     }
-    println!(
-        "{label}  min {:>8.2?}   mean {:>8.2?}",
-        best,
-        total / runs
-    );
+    println!("{label}  min {:>8.2?}   mean {:>8.2?}", best, total / runs);
 }
 
 fn fc_match(pattern: &str) -> Option<(String, PathBuf)> {
