@@ -362,8 +362,8 @@ run0: Failed to start transient service unit: Connection timed out
 ```
 
 거절과 구별된다 — 거절은 `Access denied` 다. 25초는 sd-bus 의 기본 메서드 타임아웃이고,
-**우리가 늘릴 수 없는 값이다.** 포기한 뒤 polkitd 는 `CancelAuthentication` 을 보내 온다
-(그것도 실물로 받았다).
+**에이전트가 늘릴 수 없는 값이다.** 포기한 뒤 polkitd 는 `CancelAuthentication` 을 보내 온다
+(그것도 실물로 받았다). 시계가 실은 둘이고 어느 쪽이 먼저 우는지는 뒤에 따로 쟀다 (§23).
 
 여기서 두 가지가 따라 나온다.
 
@@ -1401,8 +1401,8 @@ Hyprland `openwindow` 이벤트 기준). 1초 단위 표시에는 무시할 수 
 
 25초라는 값은 **우리 것이 아니다.** sd-bus(`run0`·`systemctl`)와 GDBus(udisks·
 NetworkManager)의 기본 메서드 타임아웃이고, 자기 타임아웃을 지정하는 호출자는 이 값과
-다르다. 그래서 창이 그리는 것은 약속이 아니라 카운트다운이다 — 자체 백스톱 30초는 그대로
-두고, 요청이 실제로 끝나는 것은 polkitd 의 취소다.
+다르다 (어느 프로세스의 시계인지는 §23). 그래서 창이 그리는 것은 약속이 아니라
+카운트다운이다 — 자체 백스톱 30초는 그대로 두고, 요청이 실제로 끝나는 것은 polkitd 의 취소다.
 
 ### 19-2. 실측 — 표시가 맞는가
 
@@ -1725,3 +1725,126 @@ stdin·stdout·stderr 를 `/dev/null` 로 준다. 쿠키 파이프는 이미 비
 (`wait_sensor_free`). 한 번 헛짚었다 — 이 유닛은 사는 내내 `activating (start)` 로 보여서
 `--state=active` 로는 안 잡힌다. `--all` 로 받아 `active`·`activating` 둘을 본다. 그 뒤 61/61.
 사용자 문서에는 "취소 직후 30초는 지문 대신 비밀번호를 묻는다" 로 남긴다.
+
+---
+
+## 23. 25초는 누구의 시계인가 — 실측
+
+§3-6 은 "sd-bus 기본 타임아웃 25초, 우리가 못 늘린다" 로 끝났다. 지문 대기가 붙고 나니
+(§22) 25초 안에 지문 30초가 들어가지 않는 문제가 실제가 됐고, 그 값이 **어느 프로세스**의
+시계인지 정확히 알아야 했다. 사용자 쪽에서 "25초에 끊는 게 우리 창이냐 run0 이냐" 는 질문도
+나왔다. 2026-09-13, systemd 261.2 · polkit 127 에서 쟀다.
+
+### 23-1. 시계는 둘이고, 마감은 둘 중 짧은 쪽이다
+
+`run0` 요청 하나에 sd-bus 메서드 호출이 두 번 겹쳐 있다.
+
+```
+run0 ──StartTransientUnit──▶ PID 1 ──CheckAuthorization──▶ polkitd ──▶ 우리 에이전트
+      (run0 의 시계)                (PID 1 의 시계)
+```
+
+둘 다 기본값이 25초이고 둘 다 `SYSTEMD_BUS_TIMEOUT` 을 읽는데, **각자 자기 환경에서** 읽는다.
+어느 쪽이 먼저 울었는지는 오류 문구로 구별된다.
+
+| 문구 | 누가 포기했나 |
+|---|---|
+| `Connection timed out` | run0 자신. 동기 호출이 `-ETIMEDOUT` 으로 돌아온 것 |
+| `Method call timed out` | PID 1. polkitd 에 건 비동기 호출이 만료돼 그 오류를 run0 에 되돌려 준 것 |
+| `Access denied` | 아무도 포기하지 않았다. 인증이 실패·취소로 끝났다 |
+
+§20-4 의 표에서 req2 와 req3 가 다른 문구로 죽은 것이 이것이었다.
+
+run0 의 시계만 바꿔 보면 PID 1 의 시계가 드러난다.
+
+```
+SYSTEMD_BUS_TIMEOUT=5  run0 …   → 5,007ms  Connection timed out     (run0 이 먼저)
+SYSTEMD_BUS_TIMEOUT=90 run0 …   → 25s      Method call timed out    (PID 1 이 먼저)
+```
+
+**`run0` 옵션이나 `systemd-run` 옵션으로는 어느 쪽도 못 바꾼다.** `pkexec` 는 이 경로가 아니라
+polkitd 에 직접 물으므로 마감이 없다 — 창이 40초 넘게 살아 있었다. §20-3 의 `pkcheck` 와 같은
+부류다.
+
+### 23-2. 커널 cmdline 은 이 머신의 PID 1 에 닿지 않는다
+
+PID 1 의 환경을 바꾸려고 처음에는 커널 cmdline 에 `SYSTEMD_BUS_TIMEOUT=120` 을 넣었다
+(limine 드롭인, `limine-update`). 커널은 모르는 `KEY=VALUE` 를 init 의 환경으로 넘기므로 될
+것 같았고, 재부팅 뒤 `/proc/cmdline` 에도 있었다. 그런데 run0 은 여전히 25초에
+`Method call timed out` 이었다.
+
+원인은 initrd 다. Omarchy 의 `/etc/mkinitcpio.conf.d/omarchy_hooks.conf` 가 HOOKS 를
+`base udev plymouth … encrypt …` 로 덮어써서 systemd 가 아닌 busybox initrd 이고, 그
+`/usr/lib/initcpio/init` 은 진짜 init 으로 넘어가기 직전에 환경을 통째로 비운다.
+
+```sh
+exec env -i \
+    "TERM=$TERM" \
+    /usr/bin/switch_root /new_root "$init" "$@"
+```
+
+커널이 준 값은 initrd 의 busybox 까지만 살고 실제 systemd 는 받지 못한다. 즉 그 테스트는
+가설을 반증한 것이 아니라 **값이 도달하지 않은 무효 테스트**였다. 확인하려던
+`/proc/1/environ` 은 root 소유 0600 이라 `sudo cmd </proc/1/environ` 로는 못 연다 —
+리다이렉션은 sudo 가 아니라 셸이 열기 때문이다. `sudo sh -c "tr '\0' '\n' </proc/1/environ"`
+으로 읽어야 한다.
+
+### 23-3. `ManagerEnvironment=` 가 PID 1 의 환경이다
+
+systemd 가 문서로 주는 길이 있다. `system.conf` 의 `[Manager] ManagerEnvironment=` 는
+매니저 **자기** 프로세스의 환경에 들어간다. main.c 의 `setenv_manager_environment()` 가
+`putenv_dup` 로 넣으므로 sd-bus 의 `secure_getenv("SYSTEMD_BUS_TIMEOUT")` 이 그대로 본다.
+두 가지를 알고 써야 한다.
+
+- man 페이지대로 이 값은 `/proc/1/environ` 에 **보이지 않는다.** 확인은 동작으로만 된다
+- `daemon-reload` 로는 부족하다. sd-bus 는 파싱한 타임아웃을 버스 객체에 캐시하므로
+  버스를 새로 만드는 `daemon-reexec` 이 필요하다
+
+```
+/etc/systemd/system.conf.d/90-bus-timeout-test.conf
+[Manager]
+ManagerEnvironment=SYSTEMD_BUS_TIMEOUT=120
+```
+
+드롭인을 넣고 `systemctl daemon-reexec` 한 뒤 두 번 쟀다.
+
+| 실행 | 지속 | 끝 | 끊은 쪽 |
+|---|---|---|---|
+| `run0 --background= true` | **25,028ms** | `Connection timed out` | run0 자신의 시계 |
+| `SYSTEMD_BUS_TIMEOUT=120 run0 --background= true` | **60.3s** | `Access denied` | 우리 창의 30초 백스톱 |
+
+둘째 줄이 답이다. PID 1 의 25초가 사라지자 창은 `pam_fprintd` 의 지문 대기 30초를 다 쓰고
+비밀번호 단계로 넘어갔고, 거기서 우리 백스톱(§3-6, 30초)이 취소해 60초에 끝났다. 저널도
+같은 말을 한다 — 22:53:20 헬퍼 시작, 22:54:20 `pam_unix(polkit-1:auth): conversation failed`,
+곧이어 polkitd 의 `FAILED to authenticate`.
+
+첫째 줄이 사용자 질문의 답이다. **25초에 끊는 것은 우리가 아니라 run0 이다.** 우리 코드에
+25초에 창을 닫는 곳은 없다 — `src/agent.rs` 의 `CALLER_TIMEOUT` 은 `SUDO_POP_LEFT_MS` 로
+카운트다운을 그리는 값일 뿐이고, 창이 스스로 닫는 것은 비밀번호 단계의 30초 백스톱 하나다
+(지문 단계에는 백스톱이 없다, §22-2). 마감이 둘 중 짧은 쪽이므로 PID 1 만 늘리면 run0 의
+25초가 남고, 셸에서 `SYSTEMD_BUS_TIMEOUT` 을 앞에 붙여야 둘 다 넘어간다.
+
+### 23-4. 무엇을 하지 않는가
+
+- **설치가 `ManagerEnvironment=` 를 쓰지 않는다.** "설치 때 root 로 드롭인을 쓰면 어떻게
+  되나" 를 따져 봤다. 되기는 된다 — 위 실측이 그것이다. 그러나 문제의 절반만 풀고 시스템
+  전체에 손을 댄다.
+  - PID 1 만 늘려서는 사용자가 체감하는 것이 없다. run0·systemctl 자신의 25초가 남아
+    `Connection timed out` 으로 똑같이 끊긴다. 세션 환경의 `SYSTEMD_BUS_TIMEOUT` 까지 올려야
+    하는데, 그 변수는 사용자가 실행하는 모든 sd-bus 클라이언트의 모든 호출에 적용된다
+  - GDBus 호출자(udisks·NetworkManager·GUI 앱)는 env 를 읽지 않아 어느 방법으로도 못 늘린다.
+    "지문에 30초를 준다" 가 경로마다 참·거짓이 갈린다
+  - 지금 설치는 전부 사용자 단위다 (§6). root 단계가 처음 생기고, 제거 때도 root 로 지우고
+    다시 `daemon-reexec` 해야 한다. PID 1 재실행은 설치 도구가 하기에 무겁다
+  - PID 1 의 이 값은 폴킷 호출만이 아니라 PID 1 이 클라이언트로 거는 모든 호출에 적용된다.
+    polkitd 가 멈추면 유닛 시작 요청이 25초 대신 120초 동안 PID 1 안에 매달린다
+  - Omarchy 가 같은 디렉터리에 자기 드롭인을 두므로 업데이트 때의 관계를 우리가 계속 책임져야
+    한다
+
+  하려면 문서의 **옵트인 시스템 조정**으로만 적고, 두 시계를 함께 올려야 한다는 것과 GUI
+  호출자에는 효과가 없다는 것을 같이 적는다. 실측에 쓴 드롭인과 limine 드롭인은 둘 다 지웠다
+- 창은 계속 "호출자의 시계를 그리되 약속하지 않는다" (§19-1·§20-3). 이번 실측이 그 결정을
+  뒷받침한다 — 같은 `run0` 도 환경에 따라 5초·25초·60초가 된다
+- 지문 30초가 25초 안에 안 들어가는 문제는 **아직 열려 있다.** 호출자 쪽 시계는 위에서 본
+  대로 우리 손 밖이므로, 남는 손잡이는 `pam_fprintd` 줄의 `timeout=` 뿐이다. 지금은
+  [`fingerprint.md`](fingerprint.md) §7 대로 두 단계 모두에 호출자 25초를 그리기만 한다
