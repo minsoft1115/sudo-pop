@@ -9,7 +9,7 @@
 //! The helper conversation runs on a second thread because the window owns the
 //! main one (winit allows a single event loop per process).
 
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
 use crate::attempts::{self, MAX_ATTEMPTS};
 use crate::gui::{self, FromUi, Subject, ToUi};
@@ -28,6 +28,9 @@ pub const EXIT_CANCELLED: i32 = 2;
 struct WindowConversation {
     to_ui: Sender<ToUi>,
     from_ui: Receiver<FromUi>,
+    /// Typed while PAM was still in `pam_fprintd` after a wrong password.
+    /// `cancelled` must not wipe it — the next `ask` is that password.
+    pending: std::sync::Mutex<Option<Secret>>,
 }
 
 impl Conversation for WindowConversation {
@@ -38,6 +41,16 @@ impl Conversation for WindowConversation {
                 echo,
             })
             .ok()?;
+        if let Some(mut secret) = self.pending.lock().ok().and_then(|mut g| g.take()) {
+            // The stash was typed into a password field, so it answers a
+            // password prompt and nothing else. An echoed prompt (a username,
+            // a one-time code) may be logged by the module that asked; a
+            // password must never travel that way.
+            if !echo {
+                return Some(secret);
+            }
+            secret.wipe();
+        }
         match self.from_ui.recv() {
             Ok(FromUi::Answer(secret)) => Some(secret),
             _ => None,
@@ -55,11 +68,29 @@ impl Conversation for WindowConversation {
     fn update_attempts(&mut self, attempts: Option<(String, bool)>) {
         let _ = self.to_ui.send(ToUi::Attempts(attempts));
     }
+
+    fn cancelled(&self) -> bool {
+        match self.from_ui.try_recv() {
+            Ok(FromUi::Cancel) | Err(TryRecvError::Disconnected) => true,
+            Ok(FromUi::Answer(secret)) => {
+                if let Ok(mut g) = self.pending.lock()
+                    && let Some(mut old) = g.replace(secret)
+                {
+                    old.wipe();
+                }
+                false
+            }
+            Err(TryRecvError::Empty) => false,
+        }
+    }
 }
 
 /// Drive up to `MAX_ATTEMPTS` authentications, re-prompting after a wrong
 /// password and stopping on anything else. The cap is per cookie, so this is
 /// where "three tries then give up" for one request lives.
+///
+/// A retry opens a new helper, so PAM starts at `pam_fprintd` again. The
+/// window stays on the password field; it does not go back to the sensor.
 ///
 /// `authenticate` is a parameter so the loop can be tested without a helper, a
 /// window, or a password.
@@ -89,7 +120,7 @@ fn run_attempts_with(
                     }
                     conv.update_attempts(b.status());
                 }
-                conv.error("Wrong");
+                conv.error(attempts::WRONG_PASSWORD);
             }
             _ => break,
         }
@@ -148,6 +179,13 @@ pub fn run() -> ! {
     // Kept for the window before `username` is moved into the worker.
     let user_display = username.clone();
 
+    // Decided before the helper is connected: this spawns the lid probe, and
+    // a child should not be forked out of a process that is mid-conversation.
+    let fingerprint_wait = crate::fingerprint::should_wait();
+    if std::env::var_os("SUDO_POP_DEBUG").is_some_and(|v| !v.is_empty()) {
+        eprintln!("sudo-pop: fingerprint_wait={fingerprint_wait}");
+    }
+
     let (to_ui_tx, to_ui_rx) = channel::<ToUi>();
     let (from_ui_tx, from_ui_rx) = channel::<FromUi>();
 
@@ -155,6 +193,7 @@ pub fn run() -> ! {
         let mut conv = WindowConversation {
             to_ui: to_ui_tx.clone(),
             from_ui: from_ui_rx,
+            pending: std::sync::Mutex::new(None),
         };
         let last = run_attempts(&mut conv, |conv| {
             helper::authenticate(&username, &cookie, conv)
@@ -174,6 +213,7 @@ pub fn run() -> ! {
         user: (!user_display.is_empty()).then_some(user_display),
         attempts,
         deadline,
+        fingerprint_wait,
     };
 
     if let Err(e) = gui::run(subject, to_ui_rx, from_ui_tx) {
@@ -184,11 +224,17 @@ pub fn run() -> ! {
     }
 
     let outcome = worker.join().unwrap_or(Outcome::Failed);
-    std::process::exit(match outcome {
+    std::process::exit(exit_for(outcome))
+}
+
+/// D-Bus-facing code for one finished prompt. Wrong passwords must not be a
+/// D-Bus error: polkitd would re-issue and the next child would start at the
+/// fingerprint again.
+fn exit_for(outcome: Outcome) -> i32 {
+    match outcome {
         Outcome::Success => EXIT_SUCCESS,
-        Outcome::Failed => EXIT_FAILED,
-        Outcome::Cancelled | Outcome::RefusedWithoutPrompt => EXIT_CANCELLED,
-    })
+        Outcome::Failed | Outcome::Cancelled | Outcome::RefusedWithoutPrompt => EXIT_CANCELLED,
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +288,14 @@ mod tests {
     }
 
     #[test]
+    fn spent_password_tries_end_the_request_without_a_dbus_error() {
+        assert_eq!(exit_for(Outcome::Success), EXIT_SUCCESS);
+        assert_eq!(exit_for(Outcome::Failed), EXIT_CANCELLED);
+        assert_eq!(exit_for(Outcome::Cancelled), EXIT_CANCELLED);
+        assert_eq!(exit_for(Outcome::RefusedWithoutPrompt), EXIT_CANCELLED);
+    }
+
+    #[test]
     fn a_right_answer_stops_after_one_attempt() {
         let (last, calls, rec) = drive(vec![Outcome::Success]);
         assert_eq!(last, Outcome::Success);
@@ -261,7 +315,7 @@ mod tests {
         let (last, calls, rec) = drive(vec![Outcome::Failed, Outcome::Success]);
         assert_eq!(last, Outcome::Success);
         assert_eq!(calls, 2);
-        assert_eq!(rec.errors, vec!["Wrong".to_owned()]);
+        assert_eq!(rec.errors, vec![attempts::WRONG_PASSWORD.to_owned()]);
     }
 
     #[test]
@@ -316,6 +370,51 @@ mod tests {
         assert_eq!(last, Outcome::Cancelled);
         assert_eq!(calls, 1, "must not attempt a second time when locked");
         assert!(rec.errors.is_empty(), "no 'Wrong' when locked");
+    }
+
+    #[test]
+    fn a_password_typed_during_a_fingerprint_retry_is_kept() {
+        let (to_ui_tx, to_ui_rx) = channel();
+        let (from_ui_tx, from_ui_rx) = channel();
+        let mut conv = WindowConversation {
+            to_ui: to_ui_tx,
+            from_ui: from_ui_rx,
+            pending: std::sync::Mutex::new(None),
+        };
+        let mut secret = Secret::new();
+        secret.buffer_mut().push_str("hunter2");
+        from_ui_tx.send(FromUi::Answer(secret)).unwrap();
+        assert!(!conv.cancelled(), "a typed password is not a cancel");
+        let got = conv.ask("Password:", false).expect("stashed answer");
+        assert_eq!(got.as_bytes(), b"hunter2");
+        drop(to_ui_rx);
+    }
+
+    #[test]
+    fn a_stashed_password_never_answers_an_echoed_prompt() {
+        let (to_ui_tx, to_ui_rx) = channel();
+        let (from_ui_tx, from_ui_rx) = channel();
+        let mut conv = WindowConversation {
+            to_ui: to_ui_tx,
+            from_ui: from_ui_rx,
+            pending: std::sync::Mutex::new(None),
+        };
+        let mut secret = Secret::new();
+        secret.buffer_mut().push_str("hunter2");
+        from_ui_tx.send(FromUi::Answer(secret)).unwrap();
+        assert!(!conv.cancelled());
+        // The window closes before anything else is typed, so `ask` for an
+        // echoed prompt gets neither the stash nor a fresh answer.
+        drop(from_ui_tx);
+        assert!(
+            conv.ask("Username:", true).is_none(),
+            "a password typed for a hidden field must not be handed to an echoed prompt"
+        );
+        assert!(
+            conv.pending.lock().unwrap().is_none(),
+            "and it is wiped, not kept for later"
+        );
+        drop(to_ui_rx);
     }
 
     #[test]

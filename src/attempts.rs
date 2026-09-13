@@ -18,6 +18,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Prompts allowed per sudo command, out of the ten sudo would otherwise give.
 pub const MAX_ATTEMPTS: u32 = 3;
 
+/// What the window says after a rejected password. ASCII, like `Checking...`.
+pub const WRONG_PASSWORD: &str = "Wrong password";
+
 /// At or below this many remaining failures the standing line turns to the
 /// error colour. Above it the same line is drawn quietly.
 pub const WARN_AT_OR_BELOW: u32 = 3;

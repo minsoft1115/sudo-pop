@@ -61,10 +61,12 @@ askpass 판별은 `argv[0]` 으로 한다. `current_exe` 는 심볼릭 링크를
 | 성공 | 정상 리턴 | 0 |
 | 사용자가 취소 | **정상 리턴** | 2 |
 | 프롬프트 전에 거절됨 (잠긴 계정·깨진 PAM) | **정상 리턴** | 2 |
-| 그 외 실패 | `Error.Failed` | 1 |
+| 비밀번호 오답 한도(§2-4) 소진 | **정상 리턴** | 2 |
+| 창을 못 띄움 | `Error.Failed` | 1 |
 
-**취소와 "묻지도 못한 실패" 를 에러로 돌려주면 안 된다.** polkitd 가 요청을 다시 발행해서
-빈 창이 무한히 다시 뜬다.
+**취소와 "묻지도 못한 실패", 오답 한도를 에러로 돌려주면 안 된다.** polkitd 가 요청을 다시
+발행해서 빈 창이 무한히 다시 뜬다. 정상 리턴이면서 헬퍼 응답이 없으면 polkitd 는 미인가로
+끝낸다 — 권한이 생기는 길은 헬퍼가 root 로 보내는 응답뿐이다.
 
 ### 2-3. 발신자 검증
 
@@ -86,6 +88,9 @@ polkitd 의 고유 이름을 **읽기 전에 `NameOwnerChanged` 를 구독한다
 
 `cookie` 하나가 sudo 명령 하나다. 자식이 쿠키당 하나 뜨고 재시도를 자기가 돌리므로
 상한(`MAX_ATTEMPTS = 3`)은 자연히 쿠키 단위가 된다. 잠긴 계정이면 묻지 않는다.
+비밀번호를 그 횟수만큼 틀리면 요청을 **끝낸다** (종료 코드 2). D-Bus 에러로 돌리면
+polkitd 가 창을 다시 띄우고 지문부터 시작한다. 이 상한은 창에 숫자로 띄우지 않는다 —
+창의 상시 줄은 공유 faillock 잔여이고, 그쪽이 사용자가 정말 알아야 하는 숫자다.
 
 faillock 카운터는 **sudo·polkit·로그인이 공유한다.** polkit 에서 틀린 것이 sudo 를 잠근다.
 
@@ -104,7 +109,8 @@ faillock 카운터는 **sudo·polkit·로그인이 공유한다.** polkit 에서
 - app-id 는 `sudo-askpass`. `assets/sudo-pop.lua` 의 규칙이 이 이름으로 매칭한다
 - 규칙: `float`·`center`·`dim_around`·`stay_focused`·`pin`·**`no_screen_share`**.
   **`size` 규칙은 두지 않는다** — 두면 클라이언트가 요청한 폭을 덮어쓴다
-- 폭은 보여 줄 줄에 맞춰 **400~800**, 높이는 200 고정. 창을 만들기 전에 같은 폰트 체인으로
+- 폭은 보여 줄 줄에 맞춰 **400~800**. 높이는 비밀번호 칸일 때 **200**, 지문 대기일 때 168.
+  비밀번호를 묻게 되면 같은 창이 200 으로 늘어난다. 창을 만들기 전에 같은 폰트 체인으로
   실제 폭을 잰다 (`font::Chain::measure`)
 - **입력칸은 창을 따라 늘어나지 않는다.** 400 창에서의 폭 그대로 가운데에 선다 — 창이
   넓어지는 이유는 명령이 길어서지 비밀번호가 길어서가 아니다 (`rationale.md` §21)
@@ -128,7 +134,15 @@ faillock 카운터는 **sudo·polkit·로그인이 공유한다.** polkit 에서
 **그 밖**
 
 - 이벤트 루프는 프로세스당 하나만 만들 수 있다. 창이 메인 스레드를 갖고 대화가 옆 스레드로 간다
-- 자체 타임아웃 30초. **폴킷 호출자는 25초에 포기한다** — 그 뒤는 백스톱일 뿐이다
+- 자체 타임아웃 30초는 **`Prompt` 가 온 뒤에만** 돈다. 지문 대기(비밀번호를 묻기 전)를
+  끊지 않기 위함이다. **폴킷 호출자는 25초에 포기한다** — 그 뒤는 백스톱일 뿐이다
+- 지문과 비밀번호는 **단계가 다르다** (횟수·시계·문구가 서로 새지 않음). winit 이벤트
+  루프는 프로세스당 하나라 OS 창은 하나이고, 첫 `Prompt` 이후 비밀번호 단계로만 간다.
+  지문: 168, 글리프, `Touch the sensor` 또는 PAM 의 마지막 실패 문구. 횟수는 **세지
+  않는다** — `pam_fprintd` 는 시도를 소모하는 실패와 안 하는 재스캔 안내를 같은
+  `PAM_ERROR_MSG` 로 보내므로 우리가 센 숫자는 모듈과 어긋난다. 비밀번호: 200, 칸,
+  지나가는 줄 + 상시 faillock 줄. 호출자 25초 배지는 **두 단계 모두** 그린다. 호출자의
+  시계라 센서에서 흘린 초는 비밀번호에서 없는 초다 ([`fingerprint.md`](fingerprint.md))
 - 테마 색은 `colors.toml` 에 더해 **`shell.toml` 의 `[polkit]` 섹션**을 읽어 시스템 창과 맞춘다 (실패색 `text-error` 포함)
 - 폰트 체인은 Omarchy 의 monospace 면이 앞이고, **우리가 쓰지 않은 글자**(cmdline·polkit
   message·PAM 프롬프트)에 ASCII 밖 문자가 있을 때만 `fc-match :charset=` 으로 한 면을
@@ -174,6 +188,7 @@ src/prompt.rs      --agent-prompt — 하드닝 + 창 + 대화 + 종료 코드
 src/askpass.rs     askpass 모드 — 같은 창, 목적지만 sudo 의 fd
 src/wrapper.rs     라우터
 src/gui.rs         창 (요청당 하나, 채널로 갱신)
+src/fingerprint.rs polkit PAM 에 `pam_fprintd.so` 가 있는지, 덮개가 닫혔는지 (읽기만)
 src/init.rs        설치 모드
 src/secret.rs      mlock + zeroize 버퍼, sudo 용 fd 격리
 src/harden.rs · theme.rs · font.rs · invocation.rs · attempts.rs · paths.rs · sudo_args.rs
@@ -230,7 +245,7 @@ cargo run --release --example font-cost   폰트 체인 비용 실측 (rationale
 | | |
 |---|---|
 | 실패 피드백 (흔들림·색 플래시) | `Wrong` 한 줄로 대신하고 있다 |
-| 지문 (`pam_fprintd`) | 이 머신에 `fprintd` 가 없다. PAM 파일은 `/etc` 와 `/usr/lib` 둘 다 봐야 한다 |
+| 지문 (`pam_fprintd`) | 구현됨. 사양: [`fingerprint.md`](fingerprint.md). 등록은 Omarchy 셋업 |
 | 신원 선택 UI | 관리자가 여럿인 환경에서만 의미가 있다 |
 | 레이어셸 서피스 | 전체화면 위 동작이 문제가 될 때 (`rationale.md` §2-4) |
 | 대기 중인 요청 수 표시 | 큐에 밀린 요청이 있다는 것을 창이 알려 주지 않는다 (`rationale.md` §21-5) |

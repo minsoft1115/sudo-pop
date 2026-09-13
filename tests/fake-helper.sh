@@ -26,6 +26,35 @@ case "$mode" in
   echo-on)      printf 'PAM_PROMPT_ECHO_ON Username:\n'; read -r answer || true; echo SUCCESS ;;
   info)         printf 'PAM_TEXT_INFO Place your finger\n'; ask "Password:"; echo SUCCESS ;;
   error-then-ok) printf 'PAM_ERROR_MSG Try again\n'; ask "Password:"; echo SUCCESS ;;
+  # Fingerprint success: a notice, then SUCCESS, never a password prompt.
+  finger-ok)    printf 'PAM_TEXT_INFO Place your finger\n'; echo SUCCESS ;;
+  # One failed swipe, then a match, still no password.
+  finger-retry) printf 'PAM_TEXT_INFO Place your finger\n'
+                printf 'PAM_ERROR_MSG Verification failed\n'
+                printf 'PAM_TEXT_INFO Place your finger\n'
+                echo SUCCESS ;;
+  # Fingerprint gives up, then the password is always rejected.
+  finger-then-fail)
+    printf 'PAM_TEXT_INFO Place your finger\n'
+    printf 'PAM_ERROR_MSG Verification failed\n'
+    ask "Password:"
+    echo FAILURE ;;
+  # Fingerprint gives up, then PAM asks for a password.
+  finger-then-pw) printf 'PAM_TEXT_INFO Place your finger\n'
+                printf 'PAM_ERROR_MSG Verification failed\n'
+                printf 'PAM_ERROR_MSG Verification failed\n'
+                printf 'PAM_ERROR_MSG Verification failed\n'
+                ask "Password:"; echo SUCCESS ;;
+  # Notice, then silence, until stdin closes or we are killed. `exec` flushes
+  # the line so the parent sees it before we hang. stdout stays open and
+  # quiet, like pam_fprintd at the reader: redirecting it would hang up the
+  # pipe and turn the wait into an EOF, which is not the case being modelled.
+  finger-hang)  printf 'PAM_TEXT_INFO Place your finger\n'
+                exec cat ;;
+  # Two lines in one write, then a wait for the answer. The reader must not
+  # poll the descriptor for a line it already holds in its buffer.
+  burst)        printf 'PAM_TEXT_INFO Place your finger\nPAM_PROMPT_ECHO_OFF Password:\n'
+                read -r answer || answer=""; echo SUCCESS ;;
   # Answers only to one specific password, so a test can drive both outcomes.
   check)        ask "Password:"
                 if [ "$answer" = "${FAKE_HELPER_PASSWORD:-open-sesame}" ]; then echo SUCCESS; else echo FAILURE; fi ;;

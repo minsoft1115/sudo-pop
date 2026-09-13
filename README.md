@@ -47,7 +47,7 @@ all of it measured on this machine, not asserted:
 | Counts down the caller's 25-second deadline | ✓ | ✗ |
 | `sudo` and polkit prompts in one window | ✓ | sudo untouched |
 | Theme colors, matched to the system dialog | ✓ | ✓ |
-| Fingerprint | ✗ | ✓ |
+| Fingerprint | ✓ PAM passthrough + wait icon | ✓ |
 
 Two of these — refusing non-polkit callers, and naming the command behind a
 `run0` request — are things neither the shell's agent nor hyprpolkitagent does.
@@ -111,8 +111,9 @@ sudo-pop --init
 
 You gain the hardening, the screen-share exclusion, and the command line of
 whatever is asking; the theme colors carry over, since sudo-pop reads the shell's
-own `[polkit]` palette. You give up its fingerprint path. `--init` tells you which
-agent holds the seat whenever you run it.
+own `[polkit]` palette. Fingerprint wait uses the same PAM stack Omarchy set up —
+the window shows a sensor icon until PAM asks for a password. `--init` tells you
+which agent holds the seat whenever you run it.
 
 ## Uninstall
 
@@ -149,6 +150,7 @@ A few things that follow from being a polkit agent rather than a plain askpass:
 | | |
 |---|---|
 | [docs/plan.md](docs/plan.md) | what it is and what the implementation must hold to |
+| [docs/fingerprint.md](docs/fingerprint.md) | fingerprint: PAM passthrough and the wait UI |
 | [docs/rationale.md](docs/rationale.md) | why, what was measured, what was rejected |
 | [docs/audit.md](docs/audit.md) | a full review of the current code and what it fixed |
 | `old/` | the previous implementation — a sudo askpass wrapper — kept whole, with its own docs |

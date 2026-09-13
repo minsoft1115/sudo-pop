@@ -13,11 +13,23 @@
 //! end -- a refusal before any prompt must not be reported as an error, or
 //! polkitd re-issues the request and the window reopens forever.
 
-use std::io::{BufRead, BufReader, Write};
-
-use crate::secret::Secret;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use crate::secret::Secret;
+
+/// How long to wait for the helper to say something before looking for a
+/// cancel.
+///
+/// Fingerprint wait sits in `read_line` rather than `ask`, so a cancel has to
+/// wake this loop. The wait is a `poll()` on the descriptor, not a read
+/// timeout: a read timeout is a socket option and does nothing on the fork
+/// helper's pipe, and it can hand back half a line. `poll()` works on both
+/// doors and `read_line` only runs once a whole line is on its way.
+const POLL_WAIT: Duration = Duration::from_millis(100);
 
 const SOCKET: &str = "/run/polkit/agent-helper.socket";
 const HELPERS: [&str; 2] = [
@@ -90,26 +102,36 @@ pub trait Conversation {
     fn error(&mut self, text: &str);
     /// Updates the standing budget / remaining attempts shown on the prompt.
     fn update_attempts(&mut self, _attempts: Option<(String, bool)>) {}
+    /// True when the window has closed. Polled between helper reads so a
+    /// fingerprint wait (no `ask` yet) can still end as a cancel.
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 
 /// Reading and writing are separate ends on purpose: the socket is cloned and
 /// the forked helper has two pipes, so answering never borrows the reader.
 struct Channel {
-    reader: Box<dyn BufRead>,
+    reader: BufReader<Box<dyn Read>>,
     writer: Box<dyn Write>,
+    /// The descriptor `reader` reads from, for `poll()`. Owned by `reader`, so
+    /// it lives exactly as long as this struct.
+    read_fd: RawFd,
     child: Option<Child>,
 }
 
 impl Channel {
     fn socket(username: &str, cookie: &str) -> std::io::Result<Self> {
         let stream = UnixStream::connect(socket_path())?;
-        let reader = BufReader::new(stream.try_clone()?);
+        let reader = stream.try_clone()?;
+        let read_fd = reader.as_raw_fd();
         let mut writer = stream;
         write!(writer, "{username}\n{cookie}\n")?;
         writer.flush()?;
         Ok(Channel {
-            reader: Box::new(reader),
+            reader: BufReader::new(Box::new(reader)),
             writer: Box::new(writer),
+            read_fd,
             child: None,
         })
     }
@@ -128,6 +150,7 @@ impl Channel {
             .stdout
             .take()
             .ok_or_else(|| std::io::Error::other("no stdout"))?;
+        let read_fd = stdout.as_raw_fd();
         let mut stdin = child
             .stdin
             .take()
@@ -138,10 +161,37 @@ impl Channel {
         stdin.flush()?;
 
         Ok(Channel {
-            reader: Box::new(BufReader::new(stdout)),
+            reader: BufReader::new(Box::new(stdout)),
             writer: Box::new(stdin),
+            read_fd,
             child: Some(child),
         })
+    }
+
+    /// Wait up to `POLL_WAIT` for the helper to write something (or hang up).
+    /// `Ok(false)` is "nothing yet, look for a cancel and come back".
+    fn readable(&self) -> std::io::Result<bool> {
+        // A burst of lines can land in the buffer in one read. Polling the
+        // descriptor then would wait for a helper that has already spoken and
+        // is itself waiting for us.
+        if !self.reader.buffer().is_empty() {
+            return Ok(true);
+        }
+        let mut pfd = libc::pollfd {
+            fd: self.read_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout = POLL_WAIT.as_millis() as libc::c_int;
+        // SAFETY: one pollfd, and the descriptor is owned by `self.reader`,
+        // which outlives this call.
+        let n = unsafe { libc::poll(&mut pfd, 1, timeout) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // POLLHUP / POLLERR are not in `events` but are always reported; a
+        // read then returns EOF or the error, which is what the loop wants.
+        Ok(n > 0)
     }
 
     /// Write the password and its newline as two raw writes.
@@ -184,10 +234,26 @@ fn attempt(channel: std::io::Result<Channel>, conv: &mut dyn Conversation) -> Ou
     let mut saw_prompt = false;
     let mut line = String::new();
     loop {
+        // Returning here drops `channel`: the socket closes, or the forked
+        // helper is killed. Either way PAM stops listening to the sensor, so a
+        // finger placed after Esc cannot authorise what was just cancelled.
+        if conv.cancelled() {
+            return Outcome::Cancelled;
+        }
+        match channel.readable() {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => {
+                conv.error(&format!("helper went away: {e}"));
+                break;
+            }
+        }
         line.clear();
         match channel.reader.read_line(&mut line) {
             Ok(0) => break, // EOF
             Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => {
                 conv.error(&format!("helper went away: {e}"));
                 break;

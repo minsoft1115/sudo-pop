@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod askpass;
 pub mod attempts;
+pub mod fingerprint;
 pub mod font;
 pub mod gui;
 pub mod harden;

@@ -166,12 +166,13 @@ sudo-pop 의 subject-pid 경로는 그 한계를 우회하지만, 공짜는 아�
 `PAM_TEXT_INFO` 를 표시하고, PAM 이 비밀번호를 물을 때까지 입력 필드를 숨긴다. 즉
 fprintd 가 PAM 스택에 있으면 **전용 UI 없이도 지문이 동작한다.**
 
-`sudo-pop` 도 전용 UI 는 없다 — 비밀번호가 아닌 PAM 모듈은 1차 범위 밖이고,
-`PAM_TEXT_INFO` 로 안내만 하고 통과시킨다 (§11). 감지 코드는 두 PAM 경로를 다 보도록
-계획돼 있고(§2-3), UI 는 이 머신에 센서가 생겼을 때로 미뤄 뒀다 (§8-1).
+`sudo-pop` 은 PAM 통과에 대기 UI 를 붙인다. `/etc/pam.d/polkit-1` 이 없으면
+`/usr/lib/pam.d/polkit-1` 도 보고, 덮개가 열려 있으면 칸 대신 지문 글리프를 그린다.
+횟수는 세지 않고 헬퍼가 준 `PAM_*` 문구만 보여 준다. 등록은 Omarchy 셋업에 맡긴다
+([`fingerprint.md`](fingerprint.md)).
 
-**평가: 실사용 기준 hyprpolkitagent ≈ sudo-pop (둘 다 PAM 통과), omarchy 는 기능표의 ✓ 가
-Arch 에서 동작하지 않는다.**
+**평가: 실사용 기준 sudo-pop 이 omarchy 의 Arch 감지 구멍을 피하고, 전용 아이콘은
+둘 다 그린다. hyprpolkitagent 는 PAM 통과만 한다.**
 
 ### 2-5. 코드 반경과 견고성
 

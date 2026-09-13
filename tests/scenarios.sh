@@ -6,7 +6,8 @@
 #   ./tests/scenarios.sh                  run them
 #   ./tests/scenarios.sh --keep           leave the agent registered at the end
 #   ./tests/scenarios.sh --with-password  also open a foot window for the one
-#                                         case that needs a human to type
+#                                         case that needs a human (password or
+#                                         fingerprint, whichever PAM asks)
 #   ./tests/scenarios.sh --restart-polkitd  also restart polkitd and check the
 #                                         agent follows it (needs one password)
 #
@@ -90,6 +91,69 @@ trap cleanup EXIT INT TERM
 
 windows() { hyprctl clients -j 2>/dev/null | jq '[.[]|select(.class=="sudo-askpass")]|length'; }
 wait_window() { local i; for i in $(seq 1 40); do [ "$(windows)" -gt 0 ] && return 0; sleep 0.25; done; return 1; }
+
+# Same order as fingerprint.rs: /etc wins, then /usr/lib.
+polkit_pam_file() {
+  if [ -f /etc/pam.d/polkit-1 ]; then echo /etc/pam.d/polkit-1
+  elif [ -f /usr/lib/pam.d/polkit-1 ]; then echo /usr/lib/pam.d/polkit-1
+  fi
+}
+
+polkit_pam_has_fprint() {
+  local f; f=$(polkit_pam_file)
+  [ -n "$f" ] || return 1
+  awk '
+    {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      if (line == "" || line ~ /^#/) next
+      n = split(line, a, /[ \t]+/)
+      if (n < 1 || a[1] != "auth") next
+      if (line ~ /pam_fprintd\.so/) { found = 1; exit }
+    }
+    END { exit !found }
+  ' "$f"
+}
+
+# Matches gui.rs: send Escape to the prompt once it has focus.
+esc_prompt() {
+  local i attempt closed=no
+  for i in $(seq 1 20); do
+    [ "$(hyprctl activewindow -j | jq -r .class)" = "sudo-askpass" ] && break
+    sleep 0.25
+  done
+  for attempt in 1 2 3; do
+    hyprctl dispatch 'hl.dsp.send_shortcut({ mods = 0, key = "escape", window = "class:sudo-askpass" })' >/dev/null 2>&1
+    for i in $(seq 1 12); do [ "$(windows)" = 0 ] && { closed=yes; break; }; sleep 0.25; done
+    [ "$closed" = yes ] && return 0
+  done
+  return 1
+}
+
+FPRINT_PAM=no
+FPRINT_WAIT=no
+if polkit_pam_has_fprint; then
+  FPRINT_PAM=yes
+  if ! /usr/bin/omarchy-hw-laptop-closed >/dev/null 2>&1; then
+    FPRINT_WAIT=yes
+  fi
+fi
+
+# 취소되거나 죽은 요청의 소켓 헬퍼(polkit-agent-helper@*.service, root)는 우리가 끊어도
+# pam_fprintd 타임아웃(기본 30초)까지 센서를 쥐고 있다. 그 사이의 다음 요청은 fprintd 가
+# "Device was already claimed" 로 거절해 지문 없이 곧장 비밀번호 칸이 뜬다 —
+# 168 을 재야 하는 시험은 앞 절이 남긴 헬퍼가 끝날 때까지 기다린다 (rationale §22-5).
+wait_sensor_free() {
+  [ "$FPRINT_WAIT" = yes ] || return 0
+  local i
+  # 이 유닛은 사는 내내 `activating (start)` 로 보인다 — `--state=active` 는 못 잡는다.
+  for i in $(seq 1 80); do
+    systemctl list-units 'polkit-agent-helper@*' --all --plain --no-legend 2>/dev/null \
+      | awk '$3 == "active" || $3 == "activating" { found = 1 } END { exit !found }' || return 0
+    sleep 0.5
+  done
+  return 1
+}
 
 # 화면 캡처 제외는 창의 열림 애니메이션이 끝난 뒤에야 안정된다. 여러 번 찍어
 # 최소 색 수를 본다 — 규칙이 걸리면 곧 4 색으로 떨어진다.
@@ -224,6 +288,7 @@ echo "$out" | grep -q "routing to run0" \
 # =============================================================================
 head_ "5. 창 — 규칙과 Esc 취소"
 "$BIN" --init >/dev/null 2>&1     # 창 규칙이 깔려 있어야 한다
+wait_sensor_free || bad "앞 절의 헬퍼가 센서를 놓지 않는다 (30초 초과)"
 sleep 60 & SUBJECT=$!
 ( echo test-cookie | SUDO_POP_USER="$USER" SUDO_POP_SUBJECT_PID=$SUBJECT SUDO_POP_MESSAGE=scenario \
     "$BIN" --agent-prompt >"$WORK/prompt.log" 2>&1; echo "exit=$?" >>"$WORK/prompt.log" ) &
@@ -231,10 +296,11 @@ if wait_window; then
   win=$(hyprctl clients -j | jq '.[]|select(.class=="sudo-askpass")')
   [ "$(echo "$win" | jq -r .floating)" = "true" ] && ok "창이 떠 있다 (floating)" || bad "floating 이 아니다"
   [ "$(echo "$win" | jq -r .pinned)" = "true" ]   && ok "창이 고정된다 (pin)"    || bad "pin 이 아니다"
-  # 폭은 보여 줄 줄에 맞춰 400~800 사이에서 정해진다. 높이는 고정이다.
+  # 폭은 보여 줄 줄에 맞춰 400~800. 높이는 비밀번호 200, 지문 대기 168.
   ww=$(echo "$win" | jq -r '.size[0]'); wh=$(echo "$win" | jq -r '.size[1]')
-  { [ "$ww" -ge 400 ] && [ "$ww" -le 800 ] && [ "$wh" = 200 ]; } \
-    && ok "창 크기가 규칙대로 (${ww}x${wh})" || bad "창 크기가 다르다" "${ww}x${wh}"
+  if [ "$FPRINT_WAIT" = yes ]; then expect_h=168; else expect_h=200; fi
+  { [ "$ww" -ge 400 ] && [ "$ww" -le 800 ] && [ "$wh" = "$expect_h" ]; } \
+    && ok "창 크기가 규칙대로 (${ww}x${wh})" || bad "창 크기가 다르다" "${ww}x${wh} (want ${expect_h})"
 
   # 화면 공유 제외: 창 영역을 찍으면 내용이 없어야 한다
   geom=$(echo "$win" | jq -r '"\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"')
@@ -459,22 +525,30 @@ if start_agent; then
   # 자체 백스톱. pkcheck 는 자기 타임아웃이 없어서 폴킷이 25초에 취소해 주지
   # 않는다 — 창을 닫는 것이 우리 30초뿐인 유일한 경우다. 이것이 안 돌면 창이
   # 영영 남는다. 30초를 기다리는 값이 그래서 있다.
-  pkcheck --action-id "$MOUNT" --process $$ --allow-user-interaction >/dev/null 2>&1 &
-  PKC2=$!
-  if wait_window; then
-    t0=$(date +%s)
-    gone=no
-    for i in $(seq 1 80); do [ "$(windows)" = 0 ] && { gone=yes; break; }; sleep 0.5; done
-    took=$(( $(date +%s) - t0 ))
-    if [ "$gone" = yes ] && [ "$took" -ge 25 ] && [ "$took" -le 38 ]; then
-      ok "호출자가 포기하지 않아도 자체 백스톱이 창을 닫는다 (${took}초)"
-    else
-      bad "백스톱이 예상대로 돌지 않았다" "closed=$gone took=${took}초"
-    fi
+  #
+  # 지문 대기 중에는 Prompt 가 오기 전이라 백스톱이 안 돈다. pam_fprintd 가
+  # ~30초 뒤에 비밀번호로 넘긴 다음에야 30초가 시작되므로, 여기서 1분을
+  # 기다리지 않는다.
+  if [ "$FPRINT_WAIT" = yes ]; then
+    ok "지문 대기 중이라 창 백스톱 시험을 건너뜀 (Prompt 전에 안 돔)"
   else
-    bad "두 번째 창이 뜨지 않아 백스톱을 못 봄"
+    pkcheck --action-id "$MOUNT" --process $$ --allow-user-interaction >/dev/null 2>&1 &
+    PKC2=$!
+    if wait_window; then
+      t0=$(date +%s)
+      gone=no
+      for i in $(seq 1 80); do [ "$(windows)" = 0 ] && { gone=yes; break; }; sleep 0.5; done
+      took=$(( $(date +%s) - t0 ))
+      if [ "$gone" = yes ] && [ "$took" -ge 25 ] && [ "$took" -le 38 ]; then
+        ok "호출자가 포기하지 않아도 자체 백스톱이 창을 닫는다 (${took}초)"
+      else
+        bad "백스톱이 예상대로 돌지 않았다" "closed=$gone took=${took}초"
+      fi
+    else
+      bad "두 번째 창이 뜨지 않아 백스톱을 못 봄"
+    fi
+    kill $PKC2 2>/dev/null
   fi
-  kill $PKC2 2>/dev/null
   for p in $(agent_children); do kill "$p" 2>/dev/null; done
   kill "$AGENT" 2>/dev/null; AGENT=""
 else
@@ -482,17 +556,175 @@ else
 fi
 
 # =============================================================================
+head_ "11. 지문 대기"
+# 손가락이 없어도 되는 것만 기본으로 돈다. 맞춤/틀림/안 댐은 --with-password.
+if [ "$FPRINT_PAM" = yes ]; then
+  ok "polkit PAM 이 지문을 쓰도록 설정돼 있다 ($(polkit_pam_file))"
+else
+  ok "polkit PAM 에 pam_fprintd 가 없다 — 지문 UI 없이 칸부터"
+fi
+if [ "$FPRINT_WAIT" = yes ]; then
+  ok "덮개가 열려 있어 지문 대기를 켠다"
+elif [ "$FPRINT_PAM" = yes ]; then
+  ok "덮개가 닫혀 있어 지문 UI 를 건너뛴다"
+fi
+
+"$BIN" --init >/dev/null 2>&1
+wait_sensor_free || bad "앞 절의 헬퍼가 센서를 놓지 않는다 (30초 초과)"
+sleep 60 & FPSUB=$!
+rm -f "$WORK/fp-prompt.log"
+( echo test-cookie | SUDO_POP_DEBUG=1 SUDO_POP_USER="$USER" \
+    SUDO_POP_SUBJECT_PID=$FPSUB SUDO_POP_MESSAGE=fingerprint \
+    "$BIN" --agent-prompt >"$WORK/fp-prompt.log" 2>&1; echo "exit=$?" >>"$WORK/fp-prompt.log" ) &
+if wait_window; then
+  if [ "$FPRINT_WAIT" = yes ]; then
+    grep -q "fingerprint_wait=true" "$WORK/fp-prompt.log" \
+      && ok "창이 지문 대기로 뜬다" \
+      || bad "fingerprint_wait=true 가 로그에 없다" "$(cat "$WORK/fp-prompt.log")"
+  else
+    grep -q "fingerprint_wait=false" "$WORK/fp-prompt.log" \
+      && ok "지문 대기를 켜지 않는다" \
+      || bad "fingerprint_wait=false 가 로그에 없다" "$(cat "$WORK/fp-prompt.log")"
+  fi
+  if esc_prompt; then
+    ok "대기 중 Esc 로 창이 닫힌다"
+  else
+    bad "Esc 후에도 창이 남아 있다"
+  fi
+  sleep 1
+  grep -q "exit=2" "$WORK/fp-prompt.log" \
+    && ok "지문 대기 취소는 종료 코드 2" \
+    || bad "종료 코드가 2 가 아니다" "$(cat "$WORK/fp-prompt.log")"
+else
+  bad "지문 시나리오 창이 뜨지 않았다" "$(cat "$WORK/fp-prompt.log" 2>/dev/null)"
+fi
+kill $FPSUB 2>/dev/null
+for p in $(agent_children); do kill "$p" 2>/dev/null; done
+
+if [ "$FPRINT_WAIT" = yes ]; then
+  omarchy-plugin-disable omarchy.polkit >/dev/null 2>&1; sleep 1
+  # --init 이 유닛을 켜 자리를 쥐고 있으면 아래 start_agent 가 거절된다.
+  systemctl --user stop sudo-pop-agent.service 2>/dev/null
+  if start_agent; then
+    wait_sensor_free || bad "앞 절의 헬퍼가 센서를 놓지 않는다 (30초 초과)"
+    rm -f "$WORK/run0-fp.txt"
+    ( timeout 20 run0 --background= true </dev/null >"$WORK/run0-fp.out" 2>&1
+      echo "exit=$?" >>"$WORK/run0-fp.txt" ) &
+    RFP=$!
+    if wait_window; then
+      ok "run0 지문 대기에 창이 뜬다"
+      if esc_prompt; then
+        ok "run0 지문 대기에서 Esc 로 닫힌다"
+      else
+        bad "run0 창이 Esc 로 안 닫힌다"
+      fi
+      sleep 2
+      [ "$(windows)" = 0 ] \
+        && ok "취소 후 빈 창이 다시 안 뜬다" \
+        || bad "빈 창이 다시 떴다 — 취소를 에러로 돌린 재발행"
+      wait "$RFP" 2>/dev/null
+      if grep -q "^exit=0$" "$WORK/run0-fp.txt" 2>/dev/null; then
+        bad "Esc 했는데 run0 가 성공했다" "$(cat "$WORK/run0-fp.txt")"
+      else
+        ok "Esc 하면 run0 가 실패로 끝난다"
+      fi
+    else
+      bad "run0 지문 대기 창이 뜨지 않았다" "$(tail -3 "$WORK/agent.log")"
+    fi
+    kill "$AGENT" 2>/dev/null; AGENT=""
+  else
+    bad "에이전트가 등록되지 않아 run0 지문 취소를 건너뜀"
+  fi
+fi
+for p in $(agent_children); do kill "$p" 2>/dev/null; done
+
+# =============================================================================
+head_ "12. 비밀번호 한도 — 창이 지문으로 다시 안 뜬다"
+# 가짜 헬퍼로 지문 단계를 빨리 지나 칸에서 세 번 틀린다. 릴리스는 헬퍼 오버라이드가
+# 없어서 debug 바이너리를 쓴다. wtype 이 없으면 건너뛴다.
+DBG="$ROOT/target/debug/sudo-pop"
+FAKE="$ROOT/tests/fake-helper.sh"
+if ! command -v wtype >/dev/null; then
+  ok "wtype 이 없어 비밀번호 한도 재발행 시험을 건너뜀"
+elif [ ! -x "$FAKE" ]; then
+  bad "tests/fake-helper.sh 가 없다"
+else
+  [ -x "$DBG" ] || cargo build -q
+  omarchy-plugin-disable omarchy.polkit >/dev/null 2>&1; sleep 1
+  systemctl --user stop sudo-pop-agent.service 2>/dev/null
+  SUDO_POP_DEBUG=1 \
+    SUDO_POP_HELPER_BIN="$FAKE" \
+    SUDO_POP_HELPER_SOCKET="/nonexistent/sudo-pop-scenario.socket" \
+    FAKE_HELPER_MODE=finger-then-fail \
+    "$DBG" --agent >"$WORK/agent-fail.log" 2>&1 &
+  FAILAGENT=$!
+  AGENT=$FAILAGENT
+  sleep 2
+  pkcheck --action-id "$MOUNT" --process $$ --allow-user-interaction >/dev/null 2>&1 &
+  PKCFAIL=$!
+  if wait_window; then
+    # 가짜 헬퍼가 지문 줄을 보내고 칸을 연다.
+    sleep 2
+    typed=0
+    for i in 1 2 3; do
+      hyprctl dispatch focuswindow class:sudo-askpass >/dev/null 2>&1
+      sleep 0.3
+      wtype -s 40 'not-the-password'
+      wtype -k Return
+      typed=$((typed + 1))
+      sleep 1.5
+    done
+    gone=no
+    for i in $(seq 1 20); do [ "$(windows)" = 0 ] && { gone=yes; break; }; sleep 0.25; done
+    if [ "$gone" = yes ]; then
+      ok "비밀번호 ${typed}회 오답 후 창이 닫힌다"
+    else
+      bad "한도가 차도 창이 남아 있다"
+    fi
+    sleep 2
+    [ "$(windows)" = 0 ] \
+      && ok "오답 한도 후 빈 창이 다시 안 뜬다" \
+      || bad "창이 다시 떴다 — 실패를 D-Bus 에러로 돌려 재발행"
+    wait "$PKCFAIL" 2>/dev/null
+    pkc=$?
+    if [ "$pkc" -eq 0 ]; then
+      bad "한도가 찼는데 pkcheck 가 성공했다"
+    else
+      ok "한도가 차면 권한 요청은 실패한다"
+    fi
+  else
+    bad "비밀번호 한도 시험 창이 뜨지 않았다" "$(tail -5 "$WORK/agent-fail.log")"
+    kill $PKCFAIL 2>/dev/null
+  fi
+  kill $FAILAGENT 2>/dev/null; AGENT=""
+  for p in $(agent_children); do kill "$p" 2>/dev/null; done
+fi
+
+# =============================================================================
 # 비밀번호가 필요한 케이스. 사람이 있어야 하므로 foot 창을 띄워 맡긴다.
+# 지문이 켜져 있으면 센서가 먼저다 — 맞으면 칸이 안 뜨고, 안 되면 칸으로 바뀐다.
 if [ "$WITH_PASSWORD" = 1 ]; then
-  head_ "11. 성공 경로 (직접 입력)"
+  head_ "13. 성공 경로 (직접 입력)"
   "$BIN" --init >/dev/null 2>&1
   omarchy-plugin-disable omarchy.polkit >/dev/null 2>&1; sleep 1
-  systemctl --user restart sudo-pop-agent.service 2>/dev/null || start_agent
-  sleep 1
-  foot -a sudo-pop-scenario bash -lc "echo '창이 뜨면 비밀번호를 입력하세요 (25초 안).'; \
-      run0 --background= true; echo \"run0 exit=\$?\" | tee $WORK/run0.txt; sleep 3" >/dev/null 2>&1
-  grep -q "run0 exit=0" "$WORK/run0.txt" 2>/dev/null \
-    && ok "인증에 성공하면 명령이 실행된다" || bad "성공 경로가 확인되지 않았다" "$(cat "$WORK/run0.txt" 2>/dev/null)"
+  # 설치된 ~/.local/bin 이 아니라 방금 빌드한 $BIN 이 창을 그리게 한다.
+  systemctl --user stop sudo-pop-agent.service 2>/dev/null
+  if start_agent; then
+    sleep 1
+    wait_sensor_free || bad "앞 절의 헬퍼가 센서를 놓지 않는다 (30초 초과)"
+    if [ "$FPRINT_WAIT" = yes ]; then
+      hint='지문을 대세요'
+    else
+      hint='비밀번호를 입력하세요'
+    fi
+    foot -a sudo-pop-scenario bash -lc "echo '$hint'; \
+        run0 --background= true; echo \"run0 exit=\$?\" | tee $WORK/run0.txt; sleep 3" >/dev/null 2>&1
+    grep -q "run0 exit=0" "$WORK/run0.txt" 2>/dev/null \
+      && ok "인증에 성공하면 명령이 실행된다" || bad "성공 경로가 확인되지 않았다" "$(cat "$WORK/run0.txt" 2>/dev/null)"
+    kill "$AGENT" 2>/dev/null; AGENT=""
+  else
+    bad "에이전트가 등록되지 않아 성공 경로를 건너뜀"
+  fi
 fi
 
 # =============================================================================

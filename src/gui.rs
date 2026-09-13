@@ -1,15 +1,15 @@
-//! The password window.
+//! The authentication window.
 //!
 //! One window per authentication request, not per attempt. PAM asks through
 //! the helper as many times as it likes -- a wrong password, an extra prompt,
 //! a message to show -- and the window stays put while the text on it changes.
-//! That is the difference from the sudo path, where sudo forked a fresh
-//! askpass process for every attempt.
 //!
-//! The event loop therefore cannot block: the helper conversation runs on
-//! another thread and the two sides talk over channels. winit allows exactly
-//! one event loop per process (`EventLoopError::RecreationAttempt`), so this is
-//! the only place in the program that draws.
+//! Fingerprint and password are separate *phases* of that one window:
+//! different clocks, different layout, and nothing counted in one is shown in
+//! the other. winit allows exactly one event loop per process
+//! (`EventLoopError::RecreationAttempt`), so they cannot be two OS windows.
+//! The first Prompt ends the fingerprint phase for good; PAM may try the
+//! sensor again on a wrong-password retry, but this process never goes back.
 //!
 //! Our own labels stay ASCII on purpose. The text we did not write -- the
 //! command line, polkit's message, PAM's prompts -- can be in any script, so
@@ -29,6 +29,10 @@ use crate::theme;
 pub const APP_ID: &str = "sudo-askpass";
 
 const WINDOW_HEIGHT: f32 = 200.0;
+
+/// Fingerprint wait has no field. Shorter than the password layout, but tall
+/// enough for the glyph and the sensor hint.
+const FINGERPRINT_HEIGHT: f32 = 168.0;
 
 /// The window is as wide as the lines it has to show, between these.
 ///
@@ -103,6 +107,43 @@ fn countdown(left: Duration) -> Option<u64> {
 /// a box, so this assumes the target platform (Omarchy) it is built for.
 const LOCK_GLYPH: &str = "\u{f023}";
 
+/// Nerd Font `nf-md-fingerprint` (`U+F0237`). omarchy.polkit writes this as
+/// the JS surrogate pair `\udb80\ude37`. `U+F0597` is `weather-rainy`.
+const FINGERPRINT_GLYPH: &str = "\u{f0237}";
+
+/// Short ASCII hint. pam_fprintd's own sentence is a paragraph; this is the
+/// same kind of label as `for {user}` / `Wrong`.
+const FINGERPRINT_HINT: &str = "Touch the sensor";
+
+fn window_height(fingerprint: bool) -> f32 {
+    if fingerprint {
+        FINGERPRINT_HEIGHT
+    } else {
+        WINDOW_HEIGHT
+    }
+}
+
+/// Fingerprint and password do not share counters, clocks, or messages.
+enum Phase {
+    Fingerprint {
+        /// The last thing PAM said went wrong at the sensor, drawn in place
+        /// of the hint. We do not count these: pam_fprintd sends the same
+        /// kind of message for a bad swipe it does not charge a try for.
+        notice: Option<String>,
+    },
+    Password {
+        /// Our own 30s backstop, fresh with every prompt. `None` only while
+        /// nothing has been asked yet, which is the fingerprint case.
+        backstop: Option<Instant>,
+        /// An answer is with the helper; the field is inert until it comes back.
+        waiting: bool,
+        focus_set: bool,
+        notice: Option<(String, bool)>,
+        prompt: String,
+        echo: bool,
+    },
+}
+
 /// Give up a little after the caller does.
 ///
 /// polkit callers stop waiting at 25 seconds (sd-bus method timeout) and
@@ -152,6 +193,9 @@ pub struct Subject {
     /// the caller really does leave, and the window is the only place that can
     /// say so before it happens.
     pub deadline: Option<Instant>,
+    /// The polkit PAM stack will try a fingerprint before asking for a
+    /// password, and the lid is open. The field stays hidden until `Prompt`.
+    pub fingerprint_wait: bool,
 }
 
 impl Subject {
@@ -202,12 +246,15 @@ pub fn run(subject: Subject, to_ui: Receiver<ToUi>, from_ui: Sender<FromUi>) -> 
     chain.cover(subject.purpose.as_deref().unwrap_or_default());
     chain.cover(&subject.message);
     let width = fitted_width(&chain, &subject);
+    let height = window_height(subject.fingerprint_wait);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id(APP_ID)
             .with_title(APP_ID)
-            .with_inner_size([width, WINDOW_HEIGHT])
+            .with_inner_size([width, height])
+            .with_min_inner_size([width, height])
+            .with_max_inner_size([width, height])
             .with_decorations(false)
             .with_resizable(false),
         ..Default::default()
@@ -226,7 +273,7 @@ pub fn run(subject: Subject, to_ui: Receiver<ToUi>, from_ui: Sender<FromUi>) -> 
                 });
                 cc.egui_ctx.set_visuals(theme.visuals());
             }
-            Ok(Box::new(Window::new(subject, chain, to_ui, from_ui)))
+            Ok(Box::new(Window::new(subject, chain, to_ui, from_ui, width)))
         }),
     )
     .map_err(|e| format!("cannot open the password window: {e}"))
@@ -237,14 +284,10 @@ struct Window {
     chain: font::Chain,
     to_ui: Receiver<ToUi>,
     from_ui: Sender<FromUi>,
-    prompt: String,
-    echo: bool,
-    notice: Option<(String, bool)>,
     password: Secret,
-    /// An answer is with the helper; the field is inert until it comes back.
-    waiting: bool,
-    focus_set: bool,
-    deadline: Instant,
+    width: f32,
+    phase: Phase,
+    came_from_fingerprint: bool,
 }
 
 impl Window {
@@ -253,19 +296,46 @@ impl Window {
         chain: font::Chain,
         to_ui: Receiver<ToUi>,
         from_ui: Sender<FromUi>,
+        width: f32,
     ) -> Self {
+        let came_from_fingerprint = subject.fingerprint_wait;
+        let phase = if subject.fingerprint_wait {
+            Phase::Fingerprint { notice: None }
+        } else {
+            // A password window is armed from the moment it opens: a helper
+            // that never gets round to asking must not leave it up forever.
+            Phase::Password {
+                backstop: Some(Instant::now() + TIMEOUT),
+                waiting: false,
+                focus_set: false,
+                notice: None,
+                prompt: "Password:".into(),
+                echo: false,
+            }
+        };
         Self {
             subject,
             chain,
             to_ui,
             from_ui,
-            prompt: "Password:".into(),
-            echo: false,
-            notice: None,
             password: Secret::new(),
+            width,
+            phase,
+            came_from_fingerprint,
+        }
+    }
+
+    fn enter_password(&mut self, ctx: &egui::Context, text: String, echo: bool) {
+        self.phase = Phase::Password {
+            backstop: Some(Instant::now() + TIMEOUT),
             waiting: false,
             focus_set: false,
-            deadline: Instant::now() + TIMEOUT,
+            notice: None,
+            prompt: text,
+            echo,
+        };
+        if self.came_from_fingerprint {
+            self.resize(ctx, WINDOW_HEIGHT);
         }
     }
 
@@ -276,21 +346,63 @@ impl Window {
             match self.to_ui.try_recv() {
                 Ok(ToUi::Prompt { text, echo }) => {
                     self.cover(ctx, &text);
-                    self.prompt = text;
-                    self.echo = echo;
-                    self.waiting = false;
-                    self.focus_set = false;
-                    // A new question deserves a fresh deadline.
-                    self.deadline = Instant::now() + TIMEOUT;
+                    match &mut self.phase {
+                        Phase::Fingerprint { .. } => self.enter_password(ctx, text, echo),
+                        // The notice stays: a re-prompt follows `Wrong
+                        // password` within milliseconds, and clearing it here
+                        // would wipe the line before a frame draws it. It
+                        // goes when the next answer is submitted.
+                        Phase::Password {
+                            waiting,
+                            focus_set,
+                            prompt,
+                            echo: echo_slot,
+                            backstop,
+                            ..
+                        } => {
+                            *prompt = text;
+                            *echo_slot = echo;
+                            *waiting = false;
+                            *focus_set = false;
+                            // A new question deserves a fresh deadline.
+                            *backstop = Some(Instant::now() + TIMEOUT);
+                        }
+                    }
                 }
                 Ok(ToUi::Info(text)) => {
                     self.cover(ctx, &text);
-                    self.notice = Some((text, false));
+                    if !self.came_from_fingerprint
+                        && let Phase::Password { notice, .. } = &mut self.phase
+                    {
+                        *notice = Some((text, false));
+                    }
                 }
                 Ok(ToUi::Error(text)) => {
                     self.cover(ctx, &text);
-                    self.notice = Some((text, true));
-                    self.waiting = false;
+                    let wrong = text == crate::attempts::WRONG_PASSWORD;
+                    match &mut self.phase {
+                        Phase::Fingerprint { notice } => *notice = Some(text),
+                        Phase::Password {
+                            waiting,
+                            focus_set,
+                            notice,
+                            ..
+                        } => {
+                            // Every error is shown: PAM's own words, a helper
+                            // that went away, a locked account. Only a rejected
+                            // password frees the field, though -- any other
+                            // error can arrive while an answer is still on
+                            // its way to a helper that is busy at the sensor.
+                            *notice = Some((text, true));
+                            if wrong {
+                                *waiting = false;
+                                *focus_set = false;
+                            }
+                        }
+                    }
+                    if wrong {
+                        self.password.wipe();
+                    }
                 }
                 Ok(ToUi::Attempts(attempts)) => {
                     self.subject.attempts = attempts;
@@ -313,6 +425,10 @@ impl Window {
     /// Whole seconds until the caller gives up, or `None` where nothing is
     /// counting. Rounded up so the last second reads `1s` rather than `0s`
     /// for its whole length.
+    ///
+    /// This is the caller's clock, not ours, so it runs through both phases:
+    /// the seconds a fingerprint wait uses up are seconds the password no
+    /// longer has, and the window is the only place that can say so.
     fn seconds_left(&self) -> Option<u64> {
         let deadline = self.subject.deadline?;
         countdown(deadline.saturating_duration_since(Instant::now()))
@@ -320,17 +436,167 @@ impl Window {
 
     fn submit(&mut self) {
         let password = std::mem::take(&mut self.password);
-        // Sending moves the buffer; nothing is copied and nothing is left here.
         let _ = self.from_ui.send(FromUi::Answer(password));
         self.password = Secret::new();
-        self.waiting = true;
-        self.notice = None;
+        if let Phase::Password {
+            waiting, notice, ..
+        } = &mut self.phase
+        {
+            *waiting = true;
+            *notice = None;
+        }
     }
 
     fn cancel(&mut self, ctx: &egui::Context) {
         self.password.wipe();
         let _ = self.from_ui.send(FromUi::Cancel);
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn backstop_hit(&self) -> bool {
+        match self.phase {
+            Phase::Password {
+                backstop: Some(t), ..
+            } => Instant::now() >= t,
+            _ => false,
+        }
+    }
+
+    /// The sensor wait: a glyph and a short hint, or PAM's last complaint in
+    /// the hint's place. No field, no count -- pam_fprintd keeps its own tally
+    /// and does not publish it, and the faillock line does not apply here.
+    fn draw_fingerprint_phase(&self, ui: &mut egui::Ui) {
+        let Phase::Fingerprint { notice } = &self.phase else {
+            return;
+        };
+        let color = if notice.is_some() {
+            ui.visuals().error_fg_color
+        } else {
+            ui.visuals().hyperlink_color
+        };
+        ui.add(egui::Label::new(
+            egui::RichText::new(FINGERPRINT_GLYPH)
+                .size(28.0)
+                .family(egui::FontFamily::Monospace)
+                .color(color),
+        ));
+        ui.add_space(6.0);
+        match notice {
+            Some(text) => {
+                ui.label(egui::RichText::new(text).size(11.0).color(color));
+            }
+            None => {
+                ui.label(egui::RichText::new(FINGERPRINT_HINT).size(11.0).weak());
+            }
+        }
+    }
+
+    /// Returns true when the user submitted a non-empty password.
+    fn draw_password_phase(&mut self, ui: &mut egui::Ui) -> bool {
+        let (waiting, echo, prompt, notice) = match &self.phase {
+            Phase::Password {
+                waiting,
+                echo,
+                prompt,
+                notice,
+                ..
+            } => (*waiting, *echo, prompt.clone(), notice.clone()),
+            Phase::Fingerprint { .. } => return false,
+        };
+
+        if echo && !prompt.is_empty() {
+            ui.label(
+                egui::RichText::new(&prompt)
+                    .size(11.5)
+                    .color(ui.visuals().text_color().gamma_multiply(0.5)),
+            );
+            ui.add_space(8.0);
+        }
+
+        let entered = ui
+            .horizontal(|ui| {
+                let slack = ui.available_width() - FIELD_ROW_WIDTH;
+                ui.add_space((slack / 2.0).max(0.0));
+                let field_h = ui.text_style_height(&egui::TextStyle::Monospace) + 16.0;
+                ui.add_sized(
+                    [LOCK_WIDTH, field_h],
+                    egui::Label::new(
+                        egui::RichText::new(LOCK_GLYPH)
+                            .size(18.0)
+                            .family(egui::FontFamily::Monospace)
+                            .color(ui.visuals().hyperlink_color),
+                    ),
+                );
+                ui.add_space(LOCK_GAP);
+                let field = ui.add_enabled(
+                    !waiting,
+                    egui::TextEdit::singleline(self.password.buffer_mut())
+                        .password(!echo)
+                        .char_limit(crate::secret::MAX_CHARS)
+                        .font(egui::TextStyle::Monospace)
+                        .margin(egui::Margin::symmetric(10, 8))
+                        .desired_width(FIELD_ROW_WIDTH - LOCK_WIDTH - LOCK_GAP),
+                );
+                if let Phase::Password {
+                    focus_set, waiting, ..
+                } = &mut self.phase
+                    && !*waiting
+                    && !*focus_set
+                {
+                    field.request_focus();
+                    *focus_set = true;
+                }
+                let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if entered && !waiting && self.password.is_empty() {
+                    field.request_focus();
+                }
+                entered
+            })
+            .inner;
+
+        ui.add_space(14.0);
+        let transient = match (&notice, waiting) {
+            (Some((text, error)), _) => Some((text.as_str(), *error)),
+            (None, true) => Some(("Checking...", false)),
+            (None, false) => None,
+        };
+        match transient {
+            Some((text, true)) => {
+                ui.label(
+                    egui::RichText::new(text)
+                        .size(11.0)
+                        .color(ui.visuals().error_fg_color),
+                );
+            }
+            Some((text, false)) => {
+                ui.label(egui::RichText::new(text).size(11.0).weak());
+            }
+            None => {
+                ui.label(egui::RichText::new(" ").size(11.0));
+            }
+        }
+
+        // The standing line: how much of the shared faillock budget is left,
+        // true for as long as the window is open and re-read after every
+        // wrong answer. It is never taken away to make room for a notice.
+        if let Some((text, low)) = &self.subject.attempts {
+            ui.add_space(2.0);
+            let text = egui::RichText::new(text).size(11.0);
+            ui.label(if *low {
+                text.color(ui.visuals().error_fg_color)
+            } else {
+                text.weak()
+            });
+        }
+
+        entered && !waiting && !self.password.is_empty()
+    }
+
+    fn resize(&self, ctx: &egui::Context, height: f32) {
+        let size = egui::vec2(self.width, height);
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
     }
 }
 
@@ -347,10 +613,19 @@ impl eframe::App for Window {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
+        // The switch from the sensor layout to the field asked for 200 once;
+        // ask again only while the compositor still reports the old height,
+        // not every frame for the rest of the window's life.
+        if matches!(self.phase, Phase::Password { .. }) && self.came_from_fingerprint {
+            let shown = ctx.input(|i| i.viewport().inner_rect.map(|r| r.height()));
+            if shown.is_some_and(|h| (h - WINDOW_HEIGHT).abs() > 1.0) {
+                self.resize(&ctx, WINDOW_HEIGHT);
+            }
+        }
         // Nothing wakes this loop when the helper speaks, so look often.
         ctx.request_repaint_after(Duration::from_millis(50));
 
-        if Instant::now() >= self.deadline
+        if self.backstop_hit()
             || ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.viewport().close_requested())
         {
             self.cancel(&ctx);
@@ -401,100 +676,11 @@ impl eframe::App for Window {
                                 .color(ui.visuals().text_color().gamma_multiply(0.5)),
                         );
                     }
-                    ui.add_space(18.0);
-
-                    // A prompt that is not a plain password (an OTP, a question)
-                    // still needs its words; a password is spoken by the lock alone.
-                    if self.echo && !self.prompt.is_empty() {
-                        ui.label(
-                            egui::RichText::new(&self.prompt)
-                                .size(11.5)
-                                .color(ui.visuals().text_color().gamma_multiply(0.5)),
-                        );
-                        ui.add_space(8.0);
-                    }
-
-                    // A lock glyph in front of the field, like the system dialog --
-                    // no "Password:" label.
-                    let entered = ui
-                        .horizontal(|ui| {
-                            // Hold the row at its narrow-window width, centred.
-                            let slack = ui.available_width() - FIELD_ROW_WIDTH;
-                            ui.add_space((slack / 2.0).max(0.0));
-                            // Centre the glyph in a box the height of the field,
-                            // so it lines up with the input rather than riding high.
-                            let field_h = ui.text_style_height(&egui::TextStyle::Monospace) + 16.0;
-                            ui.add_sized(
-                                [LOCK_WIDTH, field_h],
-                                egui::Label::new(
-                                    egui::RichText::new(LOCK_GLYPH)
-                                        .size(18.0)
-                                        .family(egui::FontFamily::Monospace)
-                                        .color(ui.visuals().hyperlink_color),
-                                ),
-                            );
-                            ui.add_space(LOCK_GAP);
-                            let field = ui.add_enabled(
-                                !self.waiting,
-                                egui::TextEdit::singleline(self.password.buffer_mut())
-                                    .password(!self.echo)
-                                    .char_limit(crate::secret::MAX_CHARS)
-                                    .font(egui::TextStyle::Monospace)
-                                    .margin(egui::Margin::symmetric(10, 8))
-                                    .desired_width(FIELD_ROW_WIDTH - LOCK_WIDTH - LOCK_GAP),
-                            );
-                            if !self.focus_set && !self.waiting {
-                                field.request_focus();
-                                self.focus_set = true;
-                            }
-                            let entered =
-                                field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            // An empty line reads as a wrong password and costs an
-                            // attempt, so keep the window open instead of submitting.
-                            if entered && !self.waiting && self.password.is_empty() {
-                                field.request_focus();
-                            }
-                            entered
-                        })
-                        .inner;
-
-                    // Two lines under the field, and they say different kinds
-                    // of thing. The first is what just happened -- a wrong
-                    // password, something PAM wants shown -- and comes and
-                    // goes. The second is how much of the shared faillock
-                    // budget is left, which is true for as long as the window
-                    // is open and so is never taken away to make room.
-                    ui.add_space(14.0);
-                    let transient = match (&self.notice, self.waiting) {
-                        (Some((text, error)), _) => Some((text.as_str(), *error)),
-                        (None, true) => Some(("Checking...", false)),
-                        // Keeps the line's height so the budget below it does
-                        // not jump when a notice arrives.
-                        (None, false) => None,
-                    };
-                    match transient {
-                        Some((text, true)) => ui.label(
-                            egui::RichText::new(text)
-                                .size(11.0)
-                                .color(ui.visuals().error_fg_color),
-                        ),
-                        Some((text, false)) => {
-                            ui.label(egui::RichText::new(text).size(11.0).weak())
-                        }
-                        None => ui.label(egui::RichText::new(" ").size(11.0)),
-                    };
-
-                    if let Some((text, low)) = &self.subject.attempts {
-                        ui.add_space(2.0);
-                        let text = egui::RichText::new(text).size(11.0);
-                        ui.label(if *low {
-                            text.color(ui.visuals().error_fg_color)
-                        } else {
-                            text.weak()
-                        });
-                    }
-
-                    if entered && !self.waiting && !self.password.is_empty() {
+                    let fingerprint = matches!(self.phase, Phase::Fingerprint { .. });
+                    ui.add_space(if fingerprint { 10.0 } else { 18.0 });
+                    if fingerprint {
+                        self.draw_fingerprint_phase(ui);
+                    } else if self.draw_password_phase(ui) {
                         self.submit();
                     }
                 });
@@ -571,5 +757,18 @@ mod tests {
         assert!(ceil_secs(Duration::from_millis(4500)) <= HURRY_AT_OR_BELOW);
         assert!(ceil_secs(Duration::from_millis(5000)) <= HURRY_AT_OR_BELOW);
         assert!(ceil_secs(Duration::from_millis(5001)) > HURRY_AT_OR_BELOW);
+    }
+
+    #[test]
+    fn the_fingerprint_glyph_is_md_fingerprint_not_weather() {
+        assert_eq!(FINGERPRINT_GLYPH, "\u{f0237}");
+        assert_ne!(FINGERPRINT_GLYPH, "\u{f0597}");
+    }
+
+    #[test]
+    fn fingerprint_wait_uses_a_shorter_window() {
+        assert_eq!(window_height(true), FINGERPRINT_HEIGHT);
+        assert_eq!(window_height(false), WINDOW_HEIGHT);
+        assert_eq!(WINDOW_HEIGHT, 200.0);
     }
 }

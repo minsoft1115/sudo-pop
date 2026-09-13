@@ -91,7 +91,7 @@ omarchy plugin disable omarchy.polkit
 
 | 교체하면 얻는 것 | 교체하면 잃는 것 |
 |---|---|
-| 하드닝 — 코어덤프·스왑·화면 공유·로그로 비밀번호가 새지 않음 | 지문 인증 경로 (이 머신은 `fprintd` 미설치라 지금은 무의미하다) |
+| 하드닝 — 코어덤프·스왑·화면 공유·로그로 비밀번호가 새지 않음 | 레이어셸 Overlay 의 배타 포커스 |
 | sudo 와 polkit 프롬프트가 **같은 창**이 된다 | 테마 연동 (`shell.toml` 의 `[polkit]` 색) |
 | 우리가 고칠 수 있는 코드 | Omarchy 가 계속 손봐 주는 코드 |
 
@@ -844,7 +844,8 @@ askpass 모드도 돌아왔다. 창 코드는 에이전트와 **같은 것을 �
 ### 남은 결정 — 사람이 정할 것
 
 **`omarchy.polkit` 을 교체할 것인가** (§2-1). 기술 문제가 아니라 취향과 우선순위 문제다.
-하드닝과 창 일원화를 얻고, 지문 경로와 테마 연동을 잃는다. 이 결정 전까지 §8 의 5단계
+하드닝과 창 일원화를 얻는다. 지문 대기 UI 는 이후에 PAM 통과로 붙였다
+([`fingerprint.md`](fingerprint.md)). 이 결정 전까지 §8 의 5단계
 (유닛 enable)는 **의미가 없다** — 켜도 등록이 거부된다. 1~4단계는 그와 무관하게 진행할 수
 있다: 다른 에이전트가 있는 채로도 **등록 시도까지는** 확인할 수 있고, 그 실패를 보는 것이
 곧 §6 의 충돌 처리 검증이다.
@@ -855,8 +856,7 @@ askpass 모드도 돌아왔다. 창 코드는 에이전트와 **같은 것을 �
 
 - polkit **정책 파일**(`.rules`, `.policy`)을 쓰거나 고치지 않는다. 우리는 물어보는 쪽이지
   누가 무엇을 할 수 있는지 정하는 쪽이 아니다
-- 지문·FIDO 등 비밀번호가 아닌 PAM 모듈의 UI 는 1차 범위 밖이다. `PAM_TEXT_INFO` 로
-  안내만 하고 통과시킨다
+- FIDO 전용 UI 는 범위 밖이다. 지문 대기는 [`fingerprint.md`](fingerprint.md)
 - 시스템 데몬으로 만들지 않는다. 사용자 세션 전용이다
 
 ---
@@ -1645,3 +1645,83 @@ winit 의 "프로세스당 이벤트 루프 하나" 는 요청마다 자식을 �
   을 읽지 않으므로 진짜 PAM 이 돌았고, 반복하다 **faillock 이 10건에 닿아 계정이 잠겼다**
   (`account locked, 119s to go`). `faillock --reset` 으로 풀었다. 창 모양만 볼 때는
   디버그 빌드를 쓸 것 — 같은 화면이고 카운터를 안 태운다
+
+---
+
+## 22. 지문 대기를 붙이고 두 번 고친 것
+
+### 22-1. 지문 횟수를 세려다 그만두다
+
+첫 구현은 PAM 줄의 `max-tries` 를 읽어 `N of M left` 를 그렸다. `pam_fprintd` 1.94.5 소스로
+확인하니 성립하지 않는 숫자였다.
+
+| 모듈이 보내는 것 | 태그 | 시도를 소모하나 |
+|---|---|---|
+| `Failed to match fingerprint` | `PAM_ERROR_MSG` | 예 |
+| `swipe too short` · `finger not centered` · `remove and retry` | **`PAM_ERROR_MSG`** | **아니오** |
+| `Verification timed out` | `PAM_TEXT_INFO` | 그 자리에서 포기 |
+
+`PAM_ERROR_MSG` 를 세면 잘못 댄 손가락 한 번에 한도가 줄고, 헬퍼 프로토콜에는 정수가 없다.
+`max-tries` 도 음수는 무제한이고 0 은 기본 3 으로 접히는 등 모듈 쪽 규칙을 따로 알아야 했다.
+숫자를 안 만드는 쪽으로 돌렸다 ([`fingerprint.md`](fingerprint.md) §8). 비밀번호 단계의
+"이번 창 3회" 표시도 같이 뺐다 — 그 자리는 공유 faillock 잔여의 것이고 (§19), 3회 상한은
+사용자가 알아야 할 숫자가 아니다.
+
+### 22-2. 파이프에는 읽기 타임아웃이 없다
+
+지문 대기는 `ask()` 가 아니라 `read_line` 에 있어서, Esc 가 읽기 루프를 깨워야 한다. 첫
+구현은 `SO_RCVTIMEO` 였다. 소켓 헬퍼에는 먹지만 fork 헬퍼의 stdout 은 파이프라
+`setsockopt` 가 `ENOTSOCK` 으로 실패한다 — 이 머신에서 확인했다. 그 경로에서는 Esc 뒤에도
+워커가 읽기에 묶여 있고, 헬퍼와 `pam_fprintd` 는 센서를 계속 듣는다. 창은 사라졌는데
+손가락이 닿으면 헬퍼가 root 로 응답을 보내고, 뒤늦게 자식이 exit 2 로 끝나면 polkitd 는
+"응답이 이미 왔는가" 만 보므로 **취소한 명령이 실행된다.** 가짜 헬퍼 시험이 이것을 못
+잡은 이유는 두 가지였다: 취소 플래그를 `info()` 안에서 켜서 블로킹 읽기 전에 검사가
+통과했고, `finger-hang` 모드가 `exec cat >/dev/null` 로 stdout 을 닫아 대기가 아니라 EOF 를
+모델링하고 있었다.
+
+`poll()` 로 바꿨다. 두 문 모두에서 돌고, 줄이 통째로 도착한 뒤에만 `read_line` 을 하므로
+타임아웃이 줄을 반으로 자르는 일도 없다. `BufReader` 버퍼에 이미 줄이 있으면 `poll()` 을
+건너뛴다 — 헬퍼가 두 줄을 한 번에 쓰고 답을 기다리면 디스크립터는 조용하기 때문이다.
+시험은 `info()` 300ms 뒤에 취소를 켜고 3초 안에 `Cancelled` 로 끝나는지 본다.
+
+### 22-3. 보관한 비밀번호는 비밀번호 프롬프트에만
+
+오답 뒤 재시도에서 PAM 이 센서를 다시 도는 동안 친 비밀번호는 버리지 않고 다음 `ask()` 에
+넘긴다. 처음에는 프롬프트가 무엇이든 넘겼다. echo-on 프롬프트(사용자명·OTP)는 그 답을
+로그에 남기는 모듈이 있으므로, echo-off 에만 넘기고 아니면 지운다. Omarchy 스택에서는 다음
+프롬프트가 항상 비밀번호라 지금은 터지지 않지만, 스택이 바뀌어도 유출이 되면 안 된다.
+
+### 22-4. 하드닝된 자식에서 자식을 띄울 때
+
+덮개 프로브(`omarchy-hw-laptop-closed`)는 헬퍼 대화가 시작되기 **전에** 한 번 띄우고,
+stdin·stdout·stderr 를 `/dev/null` 로 준다. 쿠키 파이프는 이미 비어 있고 비밀번호는 아직
+없어서 실제로 새는 것은 없었지만, 대화 중인 프로세스에서 fd 를 물려주며 fork 할 이유도
+없다.
+
+### 22-5. 실기기 — 취소한 소켓 헬퍼가 센서를 30초 쥔다
+
+이 머신에 지문(EgisTec EH57E)을 등록하고 시나리오를 돌리니 5번의 높이 단언이 168 대신 200 을
+봤다. 저널이 이유를 말해 줬다.
+
+```
+20:58:07  polkit-agent-helper@37 시작          ← 3번 절의 첫 요청. 호출자가 포기해 자식은 죽음
+20:58:12  fprintd: Claim ... Device was already claimed   ← 이후 요청들
+20:58:23  fprintd: Claim ... Device was already claimed
+20:58:27  fprintd: Claim ... Device was already claimed
+20:58:37  polkit-agent-helper@37 Deactivated   ← pam_fprintd 기본 타임아웃 30초
+```
+
+소켓 헬퍼는 polkitd 가 root 로 띄우는 systemd 유닛이고, `pam_fprintd` 는 D-Bus 로 verify 를
+기다리는 동안 stdio 를 보지 않는다. 우리가 소켓을 닫아도 다음 읽기·쓰기까지 모른다. 그동안
+센서는 그 헬퍼의 것이라 다음 요청의 `pam_fprintd` 는 즉시 실패하고 `sufficient` 를 지나
+`pam_unix` 가 바로 프롬프트를 보낸다 — 창은 168 로 열렸다가 곧 200 이 된다.
+
+**권한은 새지 않는다.** 그 헬퍼가 뒤늦게 매치해 `AuthenticationAgentResponse2` 를 보내도
+쿠키의 세션은 자식이 exit 2 로 끝난 순간 사라졌다. 문제는 30초 동안 지문이 안 되는 것
+뿐이고, root 유닛이라 우리가 죽일 수 없다. fork 헬퍼는 반대다 — 우리 자식이고 실제 uid 가
+우리라 `kill` 이 되고, 죽으면 fprintd 가 claim 을 놓는다.
+
+시험은 168 을 재기 전에 `polkit-agent-helper@*` 유닛이 없어질 때까지 기다리게 했다
+(`wait_sensor_free`). 한 번 헛짚었다 — 이 유닛은 사는 내내 `activating (start)` 로 보여서
+`--state=active` 로는 안 잡힌다. `--all` 로 받아 `active`·`activating` 둘을 본다. 그 뒤 61/61.
+사용자 문서에는 "취소 직후 30초는 지문 대신 비밀번호를 묻는다" 로 남긴다.

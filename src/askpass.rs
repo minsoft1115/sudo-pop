@@ -93,6 +93,7 @@ pub fn run(prompt: Option<OsString>) -> ! {
         attempts,
         // sudo waits for us as long as we take; there is no deadline to show.
         deadline: None,
+        fingerprint_wait: false,
     };
 
     if let Err(e) = gui::run(subject, to_ui_rx, from_ui_tx) {

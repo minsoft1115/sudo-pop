@@ -116,6 +116,128 @@ fn messages_reach_the_window() {
     assert_eq!(conv.errors, vec!["Try again".to_owned()]);
 }
 
+#[test]
+fn fingerprint_success_without_a_prompt_is_success() {
+    let (outcome, conv) = run("finger-ok", &[]);
+    assert_eq!(outcome, Outcome::Success);
+    assert!(
+        conv.prompts.is_empty(),
+        "fingerprint must not ask for a password"
+    );
+    assert_eq!(conv.infos, vec!["Place your finger".to_owned()]);
+}
+
+#[test]
+fn a_failed_swipe_then_a_match_still_does_not_ask() {
+    let (outcome, conv) = run("finger-retry", &[]);
+    assert_eq!(outcome, Outcome::Success);
+    assert!(conv.prompts.is_empty());
+    assert_eq!(conv.errors, vec!["Verification failed".to_owned()]);
+    assert_eq!(conv.infos.len(), 2);
+}
+
+#[test]
+fn fingerprint_exhaustion_falls_through_to_a_password() {
+    let (outcome, conv) = run("finger-then-pw", &["hunter2"]);
+    assert_eq!(outcome, Outcome::Success);
+    assert_eq!(conv.prompts, vec![("Password:".to_owned(), false)]);
+    assert_eq!(conv.errors.len(), 3);
+}
+
+/// Cancels after the notice, while the helper is still sitting on the reader.
+struct CancelAfterInfo {
+    infos: Vec<String>,
+    flag: bool,
+}
+
+impl Conversation for CancelAfterInfo {
+    fn ask(&mut self, _prompt: &str, _echo: bool) -> Option<Secret> {
+        None
+    }
+    fn info(&mut self, text: &str) {
+        self.infos.push(text.to_owned());
+        self.flag = true;
+    }
+    fn error(&mut self, _text: &str) {}
+    fn cancelled(&self) -> bool {
+        self.flag
+    }
+}
+
+/// Cancels some time *after* the notice, while the helper is silent: the
+/// read loop has to wake up on its own to notice, which is the fork-helper
+/// case (a pipe, where a socket read timeout would do nothing).
+struct CancelLater {
+    since: Option<std::time::Instant>,
+    after: std::time::Duration,
+}
+
+impl Conversation for CancelLater {
+    fn ask(&mut self, _prompt: &str, _echo: bool) -> Option<Secret> {
+        None
+    }
+    fn info(&mut self, _text: &str) {
+        self.since.get_or_insert_with(std::time::Instant::now);
+    }
+    fn error(&mut self, _text: &str) {}
+    fn cancelled(&self) -> bool {
+        self.since.is_some_and(|t| t.elapsed() >= self.after)
+    }
+}
+
+#[test]
+fn a_cancel_while_the_fork_helper_is_silent_wakes_the_read_loop() {
+    let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        std::env::set_var("SUDO_POP_HELPER_BIN", fake_helper());
+        std::env::set_var(
+            "SUDO_POP_HELPER_SOCKET",
+            "/nonexistent/sudo-pop-test.socket",
+        );
+        std::env::set_var("FAKE_HELPER_MODE", "finger-hang");
+    }
+    let mut conv = CancelLater {
+        since: None,
+        after: std::time::Duration::from_millis(300),
+    };
+    let t0 = std::time::Instant::now();
+    let outcome = authenticate("tester", "cookie-1234", &mut conv);
+    assert_eq!(outcome, Outcome::Cancelled);
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(3),
+        "the loop must wake on the poll interval, not wait for the helper: {:?}",
+        t0.elapsed()
+    );
+}
+
+#[test]
+fn two_lines_in_one_write_are_both_read_before_the_next_wait() {
+    let (outcome, conv) = run("burst", &["hunter2"]);
+    assert_eq!(outcome, Outcome::Success);
+    assert_eq!(conv.infos, vec!["Place your finger".to_owned()]);
+    assert_eq!(conv.prompts, vec![("Password:".to_owned(), false)]);
+}
+
+#[test]
+fn cancelling_during_a_fingerprint_wait_does_not_leave_the_helper() {
+    let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        std::env::set_var("SUDO_POP_HELPER_BIN", fake_helper());
+        std::env::set_var(
+            "SUDO_POP_HELPER_SOCKET",
+            "/nonexistent/sudo-pop-test.socket",
+        );
+        std::env::set_var("FAKE_HELPER_MODE", "finger-hang");
+    }
+    let mut conv = CancelAfterInfo {
+        infos: Vec::new(),
+        flag: false,
+    };
+    let outcome = authenticate("tester", "cookie-1234", &mut conv);
+    assert_eq!(outcome, Outcome::Cancelled);
+    assert_eq!(conv.infos, vec!["Place your finger".to_owned()]);
+}
+
 /// The username and the cookie have to arrive, and the cookie must travel on
 /// stdin rather than in argv where anything on the machine could read it.
 #[test]

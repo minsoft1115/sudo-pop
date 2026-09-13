@@ -270,7 +270,9 @@ impl Agent {
 
         // A pidfd for the child, so a cancel signals this exact process even
         // after its pid could be recycled. If it cannot be opened the cancel
-        // path falls back to the 30s window backstop rather than a stale kill.
+        // path falls back to the window's 30s backstop rather than a stale
+        // kill -- except during a fingerprint wait, which has no backstop
+        // before PAM asks; there only the caller's own cancel ends it.
         let pid = child.id();
         // SAFETY: plain syscall; the child is alive here, freshly spawned.
         let pidfd =

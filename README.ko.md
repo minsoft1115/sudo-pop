@@ -45,7 +45,7 @@ QML 서비스다. 그걸 교체하는 건 실제 선택이니, 무엇이 달라�
 | 호출자의 25초 마감을 카운트다운 | ✓ | ✗ |
 | `sudo` 와 polkit 프롬프트가 한 창 | ✓ | sudo 는 그대로 |
 | 시스템 다이얼로그와 맞춘 테마색 | ✓ | ✓ |
-| 지문 | ✗ | ✓ |
+| 지문 | ✓ PAM 통과 + 대기 아이콘 | ✓ |
 
 이 중 둘 — 폴킷 아닌 호출자 거절, `run0` 요청 뒤의 명령 표시 — 은 omarchy 도
 hyprpolkitagent 도 하지 않는다.
@@ -103,7 +103,8 @@ sudo-pop --init
 ```
 
 하드닝·화면 공유 제외·무엇이 묻는지 보여 주는 명령줄을 얻는다. 테마색은 그대로 따라온다 —
-sudo-pop 이 셸의 `[polkit]` 팔레트를 읽어 같은 색을 쓴다. 지문 경로는 내준다. `--init` 은
+sudo-pop 이 셸의 `[polkit]` 팔레트를 읽어 같은 색을 쓴다. 지문 대기는 Omarchy 가 넣어 둔
+PAM 스택을 그대로 쓴다. 창은 비밀번호를 묻기 전까지 센서 아이콘을 보여 준다. `--init` 은
 지금 어느 에이전트가 자리를 쥐고 있는지 실행할 때마다 알려 준다.
 
 ## 제거
@@ -140,6 +141,7 @@ askpass 가 아니라 polkit 에이전트라서 따라 나오는 것들이다:
 | | |
 |---|---|
 | [docs/plan.md](docs/plan.md) | 무엇이며 구현이 무엇을 지켜야 하는가 |
+| [docs/fingerprint.md](docs/fingerprint.md) | 지문: PAM 통과와 대기 UI |
 | [docs/rationale.md](docs/rationale.md) | 왜 그렇게 했는지, 무엇을 재 봤는지, 무엇을 기각했는지 |
 | [docs/audit.md](docs/audit.md) | 지금 코드 전수 점검과 무엇을 고쳤는지 |
 | `old/` | 옛 구현(sudo askpass 래퍼)을 문서째 그대로 남겨 뒀다 |
