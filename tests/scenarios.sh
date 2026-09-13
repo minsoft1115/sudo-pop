@@ -15,6 +15,10 @@
 # gets it back -- even if a case fails or the run is interrupted.
 set -u
 
+# 에이전트는 호출자의 SYSTEMD_BUS_TIMEOUT 을 읽어 카운트다운을 줄인다 (rationale §23-5).
+# 개발 셸에 실험 값이 남아 있으면 3번의 "25초에 붙어 있다" 가 엉뚱하게 깨지므로 지운다.
+unset SYSTEMD_BUS_TIMEOUT
+
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/target/release/sudo-pop"
 WORK="$(mktemp -d)"
@@ -269,6 +273,48 @@ if [ -n "$AGENT" ]; then
     for i in $(seq 1 24); do [ "$(windows)" = 0 ] && { closed=yes; break; }; sleep 0.5; done
     [ "$closed" = yes ] && ok "호출자가 포기하면 창이 닫힌다" || bad "창이 남아 있다"
     grep -q "CancelAuthentication" "$WORK/agent.log" && ok "취소가 처리된다" || bad "취소 로그가 없다"
+
+    # 호출자의 시계 (rationale §23-5). run0 은 자기 SYSTEMD_BUS_TIMEOUT 만큼만 기다리고,
+    # 에이전트는 subject 의 environ 에서 그 값을 읽어 카운트다운을 줄인다 — 줄이기만 한다.
+    # 5초짜리: 로그의 출발점이 5초이고, 창은 우리 백스톱(30초)이 아니라 run0 이 포기한
+    # 직후 polkitd 의 취소로 닫혀야 한다.
+    for i in $(seq 1 20); do [ "$(windows)" = 0 ] && break; sleep 0.5; done
+    t0=$SECONDS
+    ( SYSTEMD_BUS_TIMEOUT=5 timeout 10 run0 --background= true </dev/null >/dev/null 2>&1 ) & R3=$!
+    if wait_window; then
+      waits=$(grep -o 'caller waits [0-9]* ms' "$WORK/agent.log" | tail -1 | grep -o '[0-9]*')
+      last=$(grep -o 'left       : [0-9]* ms' "$WORK/agent.log" | tail -1 | grep -o '[0-9]*')
+      [ "${waits:-0}" = 5000 ] && ok "호출자의 5초를 읽는다 (caller waits ${waits}ms)" \
+                               || bad "호출자 시계를 못 읽었다" "caller waits ${waits:-없음}"
+      if [ -n "$last" ] && [ "$last" -le 5000 ] && [ "$last" -ge 4000 ]; then
+        ok "카운트다운이 5초에서 출발한다 (${last}ms)"
+      else
+        bad "5초짜리의 남은 시간이 이상하다" "left=${last:-없음}"
+      fi
+      closed=no
+      for i in $(seq 1 20); do [ "$(windows)" = 0 ] && { closed=yes; break; }; sleep 0.5; done
+      took=$((SECONDS - t0))
+      if [ "$closed" = yes ] && [ "$took" -le 9 ]; then
+        ok "run0 이 5초에 포기하면 창이 곧 닫힌다 (${took}s)"
+      else
+        bad "창이 백스톱까지 남아 있다" "closed=$closed took=${took}s"
+      fi
+    else
+      bad "5초짜리 요청에 창이 뜨지 않았다"
+    fi
+    kill $R3 2>/dev/null; wait $R3 2>/dev/null
+
+    # 120초짜리: PID 1 의 시계는 못 읽으므로 25초를 넘겨 주지 않는다.
+    ( SYSTEMD_BUS_TIMEOUT=120 timeout 6 run0 --background= true </dev/null >/dev/null 2>&1 ) & R4=$!
+    if wait_window; then
+      waits=$(grep -o 'caller waits [0-9]* ms' "$WORK/agent.log" | tail -1 | grep -o '[0-9]*')
+      [ "${waits:-0}" = 25000 ] && ok "호출자가 120초를 줘도 25초만 센다 (caller waits ${waits}ms)" \
+                                || bad "25초를 넘겨 받았다" "caller waits ${waits:-없음}"
+    else
+      bad "120초짜리 요청에 창이 뜨지 않았다"
+    fi
+    kill $R4 2>/dev/null; wait $R4 2>/dev/null
+    for i in $(seq 1 20); do [ "$(windows)" = 0 ] && break; sleep 0.5; done
   else
     bad "창이 뜨지 않았다" "$(tail -3 "$WORK/agent.log")"
   fi

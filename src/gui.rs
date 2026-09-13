@@ -183,8 +183,9 @@ pub struct Subject {
     /// Whose password is being asked. The helper's prompt never says.
     pub user: Option<String>,
     /// The standing budget line and whether it is low enough to alarm, from
-    /// `attempts::Budget::status`. It does not change while the window is up,
-    /// so it is a property of the request rather than a message on the channel.
+    /// `attempts::Budget::status`. Read once for the window and re-read after
+    /// every wrong answer (`ToUi::Attempts`), since the shared faillock tally
+    /// is what moved.
     pub attempts: Option<(String, bool)>,
     /// When the caller stops waiting, on the paths where one does.
     ///

@@ -122,32 +122,49 @@ fn bus_timeout_in(environ: &[u8]) -> Option<Duration> {
 }
 
 /// systemd's time syntax, the part of it a timeout can be written in: a bare
-/// number is seconds, else each whitespace-separated part is a number (with an
-/// optional fraction) and a unit, and the parts add up. `0` is `None` because
-/// sd-bus falls back to its default for it; `infinity` is `None` because a
-/// caller with no clock cannot shorten ours.
+/// number is seconds, else each part is a number (with an optional fraction)
+/// and a unit, with whitespace allowed between and around them, and the parts
+/// add up. `0` is `None` because sd-bus falls back to its default for it;
+/// `infinity` is `None` because a caller with no clock cannot shorten ours.
+/// Anything systemd would reject is `None` too, so a caller we cannot follow
+/// is shown the default rather than a guess.
 fn parse_sec(text: &str) -> Option<Duration> {
     let text = text.trim();
     if text.is_empty() || text == "infinity" {
         return None;
     }
     let mut total = Duration::ZERO;
-    for part in text.split_whitespace() {
-        let digits = part
+    let mut rest = text;
+    let mut first = true;
+    while !rest.is_empty() {
+        let digits = rest
             .find(|c: char| !c.is_ascii_digit() && c != '.')
-            .unwrap_or(part.len());
-        let (number, unit) = part.split_at(digits);
+            .unwrap_or(rest.len());
+        let (number, after) = rest.split_at(digits);
         let number: f64 = number.parse().ok()?;
+        let after = after.trim_start();
+        let unit_len = after
+            .find(|c: char| !c.is_ascii_alphabetic() && c != 'µ')
+            .unwrap_or(after.len());
+        let (unit, after) = after.split_at(unit_len);
+        // A bare number is seconds only when it is the whole value, as in
+        // systemd: after a unit has been given, every part needs one.
+        if unit.is_empty() && !first {
+            return None;
+        }
+        first = false;
         let usec_per_unit: f64 = match unit {
             "" | "s" | "sec" | "second" | "seconds" => 1_000_000.0,
             "ms" | "msec" => 1_000.0,
             "us" | "usec" | "µs" => 1.0,
+            "ns" | "nsec" => 0.001,
             "m" | "min" | "minute" | "minutes" => 60_000_000.0,
             "h" | "hr" | "hour" | "hours" => 3_600_000_000.0,
             "d" | "day" | "days" => 86_400_000_000.0,
             _ => return None,
         };
         total += Duration::from_micros((number * usec_per_unit) as u64);
+        rest = after.trim_start();
     }
     (total > Duration::ZERO).then_some(total)
 }
@@ -450,15 +467,26 @@ mod tests {
         assert_eq!(parse_sec("1min"), Some(Duration::from_secs(60)));
         assert_eq!(parse_sec("2h"), Some(Duration::from_secs(7200)));
         assert_eq!(parse_sec(" 1min 30s "), Some(Duration::from_secs(90)));
+        assert_eq!(
+            parse_sec("5 s"),
+            Some(Duration::from_secs(5)),
+            "systemd allows a space before the unit"
+        );
+        assert_eq!(parse_sec("1 min 30 s"), Some(Duration::from_secs(90)));
+        assert_eq!(parse_sec("5000000000ns"), Some(Duration::from_secs(5)));
         assert_eq!(parse_sec("0"), None, "sd-bus treats 0 as unset");
+        assert_eq!(parse_sec("0.0004ms"), None, "rounds to nothing, so unset");
         assert_eq!(parse_sec("infinity"), None, "no clock cannot shorten ours");
         assert_eq!(parse_sec(""), None);
         assert_eq!(parse_sec("abc"), None);
+        assert_eq!(parse_sec("-5"), None, "systemd rejects a sign");
+        assert_eq!(parse_sec("5S"), None, "units are case-sensitive");
         assert_eq!(
             parse_sec("5 apples"),
             None,
             "an unknown unit is not a guess"
         );
+        assert_eq!(parse_sec("5s5"), None, "a number needs a unit after it");
     }
 
     #[test]
@@ -475,33 +503,44 @@ mod tests {
     }
 
     /// A child of ours with the variable set, read the way a real subject is.
-    fn sleeping_child(timeout: Option<&str>) -> std::process::Child {
-        let mut cmd = std::process::Command::new("sleep");
-        cmd.arg("30").env_remove("SYSTEMD_BUS_TIMEOUT");
-        if let Some(t) = timeout {
-            cmd.env("SYSTEMD_BUS_TIMEOUT", t);
+    /// Killed on drop, so a failed assertion does not leave it around.
+    struct Sleeper(std::process::Child);
+
+    impl Sleeper {
+        fn with(timeout: Option<&str>) -> Self {
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("30").env_remove("SYSTEMD_BUS_TIMEOUT");
+            if let Some(t) = timeout {
+                cmd.env("SYSTEMD_BUS_TIMEOUT", t);
+            }
+            Sleeper(cmd.spawn().expect("sleep is available"))
         }
-        cmd.spawn().expect("sleep is available")
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     #[test]
     fn a_callers_own_clock_shortens_the_countdown_but_never_lengthens_it() {
-        let mut short = sleeping_child(Some("5"));
-        let mut long = sleeping_child(Some("120"));
-        let mut none = sleeping_child(None);
+        let short = Sleeper::with(Some("5"));
+        let long = Sleeper::with(Some("120"));
+        let none = Sleeper::with(None);
 
-        assert_eq!(caller_timeout(short.id()), Duration::from_secs(5));
+        assert_eq!(caller_timeout(short.pid()), Duration::from_secs(5));
         assert_eq!(
-            caller_timeout(long.id()),
+            caller_timeout(long.pid()),
             CALLER_TIMEOUT,
             "PID 1's clock is still 25 s, so more is not on offer"
         );
-        assert_eq!(caller_timeout(none.id()), CALLER_TIMEOUT);
+        assert_eq!(caller_timeout(none.pid()), CALLER_TIMEOUT);
         assert_eq!(caller_timeout(0), CALLER_TIMEOUT, "no subject, no reading");
-
-        for child in [&mut short, &mut long, &mut none] {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
     }
 }

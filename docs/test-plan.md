@@ -71,6 +71,11 @@
   북키핑을 `remember_cancelled`/`take_cancelled` 로 추출해 결정적으로 검증: 큐된 취소가
   기억되고 한 번만 소비되며, 집합이 256 으로 유계인지. 창-안-뜸은 begin 이 `take_cancelled`
   를 보고 즉시 `Ok` 하는 직결 로직이라 이 북키핑이 곧 그 보장이다
+- **9. `agent.rs` 호출자의 시계 [완료]** (3개 + scenarios 3) — `parse_sec` 가 systemd 시간
+  문법을 sd-bus 와 같게 읽는지(공백·`0`·`infinity`·부호·대소문자), environ 블록에서 첫
+  항목만 고르는지, `sleep` 자식 셋(`=5`·`=120`·없음)이 5·25·25 로 읽히는지. 실제 polkit
+  subject 를 거치는 경로는 scenarios 3 이 `SYSTEMD_BUS_TIMEOUT=5`/`=120` run0 으로 본다
+  — 로그의 `caller waits`, 5초 출발, run0 포기 직후 창 닫힘, 25초 상한
 
 ---
 
