@@ -8,57 +8,20 @@
 //! same `PAM_ERROR_MSG` for a bad swipe it charges a try for and one it does
 //! not, so any count we kept would drift from the module's.
 
-use std::fs;
-use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 
-const ETC_PAM: &str = "/etc/pam.d/polkit-1";
-const USR_PAM: &str = "/usr/lib/pam.d/polkit-1";
 const LID: &str = "/usr/bin/omarchy-hw-laptop-closed";
 
-/// True when an `auth` line in the polkit PAM stack names `pam_fprintd.so`.
+/// Whether this machine's polkit PAM stack will try a fingerprint: an `auth`
+/// line naming `pam_fprintd.so`, in `/etc/pam.d/polkit-1` (or the vendor copy
+/// in `/usr/lib/pam.d` when `/etc` has none) or in anything it includes.
 ///
-/// Commented lines and non-auth groups (`account` / `session`) do not count.
-/// The module need not be first: a clamshell `pam_exec` gate may precede it.
-pub fn configured_from_pam(raw: &str) -> bool {
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some(kind) = line.split_whitespace().next() else {
-            continue;
-        };
-        if kind != "auth" {
-            continue;
-        }
-        if line.contains("pam_fprintd.so") {
-            return true;
-        }
-    }
-    false
-}
-
-/// `/etc` wins when it exists, matching PAM's own search order.
-pub fn choose_pam_path(etc_exists: bool, usr_exists: bool) -> Option<&'static str> {
-    if etc_exists {
-        Some(ETC_PAM)
-    } else if usr_exists {
-        Some(USR_PAM)
-    } else {
-        None
-    }
-}
-
-fn pam_path() -> Option<&'static str> {
-    choose_pam_path(Path::new(ETC_PAM).is_file(), Path::new(USR_PAM).is_file())
-}
-
-/// Whether this machine's polkit PAM stack will try a fingerprint.
+/// Omarchy puts the line in `polkit-1` itself; a hand-made stack may put it in
+/// `system-auth` and include that. Both are the same stack to PAM, so both
+/// are the same answer here (`pam::auth_stack_names`, shared with the faillock
+/// check so the two cannot disagree about what the stack contains).
 pub fn configured() -> bool {
-    pam_path()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .is_some_and(|raw| configured_from_pam(&raw))
+    crate::pam::auth_stack_names(crate::attempts::POLKIT_SERVICE, "pam_fprintd")
 }
 
 /// `omarchy-hw-laptop-closed` exits 0 when the lid is shut.
@@ -94,61 +57,67 @@ pub fn should_wait() -> bool {
 mod tests {
     use super::*;
 
+    use crate::pam::{auth_stack_names_with, stack};
+
+    fn configured_in(files: &[(&str, &str)]) -> bool {
+        auth_stack_names_with(&stack(files), "polkit-1", "pam_fprintd", 0)
+    }
+
     #[test]
     fn an_auth_line_naming_pam_fprintd_is_configured() {
-        assert!(configured_from_pam("auth sufficient pam_fprintd.so\n"));
+        assert!(configured_in(&[(
+            "polkit-1",
+            "auth sufficient pam_fprintd.so\n"
+        )]));
     }
 
     #[test]
     fn a_clamshell_gate_in_front_still_counts() {
-        let raw = "\
-auth  [success=1 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed
+        assert!(configured_in(&[(
+            "polkit-1",
+            "auth  [success=1 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed
 auth  sufficient pam_fprintd.so
 auth  required pam_unix.so
-";
-        assert!(configured_from_pam(raw));
+",
+        )]));
     }
 
     #[test]
-    fn a_commented_module_does_not_count() {
-        assert!(!configured_from_pam("# auth sufficient pam_fprintd.so\n"));
-        assert!(!configured_from_pam("auth required pam_unix.so\n"));
+    fn a_line_reached_through_an_include_counts() {
+        // Stock polkit-1 includes system-auth; a hand-made stack may put the
+        // fingerprint there rather than in polkit-1 itself.
+        assert!(configured_in(&[
+            ("polkit-1", "#%PAM-1.0\nauth include system-auth\n"),
+            (
+                "system-auth",
+                "auth sufficient pam_fprintd.so\nauth required pam_unix.so\n"
+            ),
+        ]));
+        assert!(
+            !configured_in(&[
+                ("polkit-1", "#%PAM-1.0\nauth include system-auth\n"),
+                ("system-auth", crate::pam::SYSTEM_AUTH),
+            ]),
+            "stock Arch without a fingerprint line anywhere"
+        );
     }
 
     #[test]
-    fn account_and_session_lines_do_not_count() {
-        let raw = "\
+    fn account_and_session_lines_and_comments_do_not_count() {
+        assert!(!configured_in(&[(
+            "polkit-1",
+            "# auth sufficient pam_fprintd.so
 account  required pam_fprintd.so
 session  required pam_fprintd.so
 auth     required pam_unix.so
-";
-        assert!(!configured_from_pam(raw));
+",
+        )]));
     }
 
     #[test]
-    fn empty_or_missing_text_is_not_configured() {
-        assert!(!configured_from_pam(""));
-        assert!(!configured_from_pam("   \n# nothing\n"));
-    }
-
-    #[test]
-    fn max_tries_on_the_line_does_not_change_the_answer() {
-        // We do not parse the number. Presence of the module is the whole fact.
-        assert!(configured_from_pam(
-            "auth sufficient pam_fprintd.so max-tries=1 timeout=10\n"
-        ));
-    }
-
-    #[test]
-    fn etc_wins_over_usr_when_both_exist() {
-        assert_eq!(choose_pam_path(true, true), Some(ETC_PAM));
-        assert_eq!(choose_pam_path(true, false), Some(ETC_PAM));
-    }
-
-    #[test]
-    fn usr_is_used_only_when_etc_is_absent() {
-        assert_eq!(choose_pam_path(false, true), Some(USR_PAM));
-        assert_eq!(choose_pam_path(false, false), None);
+    fn a_missing_file_is_not_configured() {
+        assert!(!configured_in(&[]));
+        assert!(!configured_in(&[("polkit-1", "   \n# nothing\n")]));
     }
 
     #[test]

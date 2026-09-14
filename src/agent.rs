@@ -10,7 +10,7 @@
 //! an exit code.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_process::{Command, Stdio};
@@ -35,7 +35,7 @@ pub struct Agent {
     /// Cookie -> pidfd of the child asking about it, so a cancel can signal the
     /// exact process. A pidfd, not a bare pid: once the child exits the pid can
     /// be recycled, and a stale kill would land on a stranger.
-    pub running: Mutex<HashMap<String, i32>>,
+    pub running: Arc<Mutex<HashMap<String, i32>>>,
     /// Cookies cancelled before their turn came up. The queued request checks
     /// this after taking the lock and ends without drawing a window.
     pub cancelled: Mutex<HashSet<String>>,
@@ -47,7 +47,7 @@ impl Agent {
             polkitd: Mutex::new(polkitd),
             once,
             turn: async_lock::Mutex::new(()),
-            running: Mutex::new(HashMap::new()),
+            running: Arc::new(Mutex::new(HashMap::new())),
             cancelled: Mutex::new(HashSet::new()),
         }
     }
@@ -168,6 +168,15 @@ fn parse_sec(text: &str) -> Option<Duration> {
     }
     (total > Duration::ZERO).then_some(total)
 }
+
+/// How long a cancelled child gets to leave on its own before SIGKILL.
+///
+/// SIGTERM is a request: the child turns it into a cancel so the helper
+/// channel is dropped cleanly (`prompt::TERMINATED`). A child whose window
+/// loop is stuck would ignore that, so the cancel is made certain by a second,
+/// unconditional signal a little later. The child normally exits within one
+/// frame, well inside this.
+const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 /// Per-request tracing goes to the journal, so it is off unless asked for.
 /// Only the security-relevant lines (a refused sender, an error) log always.
@@ -311,6 +320,22 @@ impl Agent {
             if tracing() {
                 println!("  closed the prompt for that cookie");
             }
+            // Escalate if the child is still registered after the grace
+            // period. Looked up by cookie under the lock, never by the fd
+            // value: `ask` removes the entry before closing the fd, so a
+            // hit here is this request's own live pidfd and nothing else.
+            let running = Arc::clone(&self.running);
+            std::thread::spawn(move || {
+                std::thread::sleep(CANCEL_GRACE);
+                if let Ok(map) = running.lock()
+                    && let Some(&pidfd) = map.get(&cookie)
+                {
+                    pidfd_signal(pidfd, libc::SIGKILL);
+                    if tracing() {
+                        println!("  prompt ignored SIGTERM; killed");
+                    }
+                }
+            });
             return;
         }
         // Not started yet (still queued) or already gone. Remember it so the

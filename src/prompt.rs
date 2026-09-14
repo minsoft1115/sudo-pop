@@ -9,6 +9,7 @@
 //! The helper conversation runs on a second thread because the window owns the
 //! main one (winit allows a single event loop per process).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
 use crate::attempts::{self, MAX_ATTEMPTS};
@@ -23,6 +24,36 @@ use crate::{harden, invocation};
 pub const EXIT_SUCCESS: i32 = 0;
 pub const EXIT_FAILED: i32 = 1;
 pub const EXIT_CANCELLED: i32 = 2;
+
+/// Set by the SIGTERM handler. polkitd's cancel reaches this process as a
+/// SIGTERM from the agent (`agent.rs`), and dying on the spot would skip
+/// `Channel`'s drop: the socket helper would notice only at its next write,
+/// and a forked setuid helper would not be killed at all, leaving PAM at the
+/// sensor for the rest of its timeout. So the signal only raises this flag;
+/// the window and the helper loop both poll it and take the same road as Esc.
+pub static TERMINATED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_terminate(_: libc::c_int) {
+    // Async-signal-safe: a relaxed store and nothing else.
+    TERMINATED.store(true, Ordering::Relaxed);
+}
+
+/// Turn SIGTERM into a cancel rather than an immediate death. A second
+/// SIGTERM is the same flag again; the agent escalates to SIGKILL on its own
+/// if this process does not leave in time.
+fn cancel_on_sigterm() {
+    // SAFETY: installing a handler that only touches an atomic.
+    unsafe {
+        let handler: extern "C" fn(libc::c_int) = on_terminate;
+        libc::signal(libc::SIGTERM, handler as usize as libc::sighandler_t);
+    }
+}
+
+/// True once SIGTERM has arrived. Read by the window each frame and by the
+/// helper loop between reads.
+pub fn terminated() -> bool {
+    TERMINATED.load(Ordering::Relaxed)
+}
 
 /// Bridge between the helper thread and the window.
 struct WindowConversation {
@@ -70,6 +101,9 @@ impl Conversation for WindowConversation {
     }
 
     fn cancelled(&self) -> bool {
+        if terminated() {
+            return true;
+        }
         match self.from_ui.try_recv() {
             Ok(FromUi::Cancel) | Err(TryRecvError::Disconnected) => true,
             Ok(FromUi::Answer(secret)) => {
@@ -133,6 +167,7 @@ fn run_attempts_with(
 /// Entry point for prompt mode. Never returns.
 pub fn run() -> ! {
     harden::apply();
+    cancel_on_sigterm();
     if std::env::var_os("SUDO_POP_DEBUG").is_some_and(|v| !v.is_empty()) {
         harden::report();
     }
@@ -244,6 +279,25 @@ fn exit_for(outcome: Outcome) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sigterm_reads_as_a_cancel_to_the_helper_loop() {
+        let (to_ui, _rx) = channel::<ToUi>();
+        let (_tx, from_ui) = channel::<FromUi>();
+        let conv = WindowConversation {
+            to_ui,
+            from_ui,
+            pending: std::sync::Mutex::new(None),
+        };
+        assert!(!conv.cancelled(), "nothing has happened yet");
+        TERMINATED.store(true, Ordering::Relaxed);
+        let seen = conv.cancelled();
+        TERMINATED.store(false, Ordering::Relaxed);
+        assert!(
+            seen,
+            "the flag alone ends the wait, without a window message"
+        );
+    }
 
     /// Records what the window was told; answers nothing (the scripted
     /// `authenticate` never asks it to).

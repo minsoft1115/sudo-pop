@@ -1754,6 +1754,35 @@ claimed` 충돌이 몇 번 난 뒤 libfprint 장치가 fprintd 안에서 열린 
 
 ---
 
+### 22-7. 자체 리뷰의 F-1·F-3 을 고치다
+
+[`review-2026-09-14.md`](review-2026-09-14.md) 의 발견 중 둘을 고쳤다.
+
+**F-1 — polkitd 취소가 헬퍼를 고아로 남기던 것.** 에이전트의 취소는 자식에 SIGTERM 이었고
+자식에는 핸들러가 없어 즉시 죽었다. `Channel` 의 drop 이 돌지 않으니 소켓 헬퍼는 다음 쓰기까지
+모르고, fork 헬퍼(setuid 배포판)는 PAM 이 끝날 때까지 살았다. `PR_SET_PDEATHSIG` 는 답이 아니다
+— setuid 바이너리를 exec 하면 커널이 지운다. 대신 자식이 SIGTERM 을 받아 플래그만 세우고
+(`prompt::TERMINATED`, async-signal-safe 한 원자 저장 하나), 창의 프레임 루프와 헬퍼 읽기 루프가
+그 플래그를 Esc 와 같은 길로 보낸다: `FromUi::Cancel` → `Outcome::Cancelled` → 채널 drop →
+소켓 닫힘 또는 fork 자식 `kill` (실제 uid 가 우리라 setuid 헬퍼도 죽는다). 종료 코드는 2 로
+전과 같다. 창 루프가 멈춘 자식이 이것을 무시할 수 있으므로 에이전트는 2초 뒤 쿠키로 다시
+찾아 아직 등록돼 있으면 SIGKILL 을 보낸다 — pidfd 값이 아니라 쿠키로 찾고, `ask` 가 항목을
+지운 뒤에 fd 를 닫으므로 다른 요청의 fd 를 맞힐 수 없다. 전에 있던 "즉시 죽는다" 보장은 2초
+늦게 그대로 남는다.
+
+**F-3 — `fingerprint::configured()` 가 include 를 안 따라가던 것.** PAM 스택을 읽는 함수를
+`src/pam.rs` 하나로 합쳤다. `auth_stack_names(service, module)` 가 `/etc/pam.d` 다음
+`/usr/lib/pam.d` 를 보고 `include`·`substack`·`@include` 를 깊이 8 까지 따라간다. 지문 감지는
+`"pam_fprintd"`, faillock 검사는 `"pam_faillock"` 으로 같은 함수를 부른다. 지문 줄이
+`system-auth` 에 있는 수동 구성에서 칸이 보인 채 30초 "Checking..." 이 뜨던 경우가 사라진다.
+시험은 in-memory `pam.d` 로 stock Arch·Omarchy 파일·include 된 지문·`substack`/`@include`·
+account 줄·주석·고리·빈 파일을 가른다.
+
+시나리오 3 (run0 포기 → polkitd 취소 → SIGTERM) 이 F-1 의 소켓 경로를 실물로 지나고, 창이 곧
+닫히는 것과 종료 코드 2 를 그대로 본다. fork 경로는 이 머신에 없다.
+
+---
+
 ## 23. 25초는 누구의 시계인가 — 실측
 
 §3-6 은 "sd-bus 기본 타임아웃 25초, 우리가 못 늘린다" 로 끝났다. 지문 대기가 붙고 나니

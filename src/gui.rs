@@ -626,7 +626,11 @@ impl eframe::App for Window {
         // Nothing wakes this loop when the helper speaks, so look often.
         ctx.request_repaint_after(Duration::from_millis(50));
 
+        // SIGTERM from the agent (polkitd cancelled) takes the same road as
+        // Esc, so the helper thread drops its channel before this process
+        // ends -- see `prompt::TERMINATED`.
         if self.backstop_hit()
+            || crate::prompt::terminated()
             || ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.viewport().close_requested())
         {
             self.cancel(&ctx);

@@ -14,6 +14,7 @@ pub mod harden;
 pub mod helper;
 pub mod init;
 pub mod invocation;
+pub mod pam;
 pub mod paths;
 pub mod prompt;
 pub mod secret;

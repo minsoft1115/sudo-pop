@@ -152,11 +152,16 @@ Omarchy 셋업은 1 을 만든다. 1 이 없는 머신은 지문이 설정되지
 수동 구성은 1 이 없을 때 잡히게 한다 — [`rationale.md`](rationale.md) §2-3 의 함정
 (omarchy.polkit 은 1 만 봐서 Arch 기본 경로를 놓친다) 을 이쪽에서 피한다.
 
-`fingerprintConfiguredFromPam(raw) -> bool`:
+읽기는 `pam::auth_stack_names("polkit-1", "pam_fprintd")` 하나이고, faillock 검사
+(`attempts.rs`, rationale §24) 와 같은 함수다. 두 답이 서로 다른 파일을 보고 어긋날 수 없다.
+규칙:
 
 - `#` 줄과 빈 줄을 건너뛴다
-- `auth` 로 시작하는 줄만 본다 (`account`/`session` 에 같은 문자열이 있어도 무시)
-- 그 줄에 `pam_fprintd.so` 가 있으면 참
+- `auth`·`-auth` 줄만 본다 (`account`/`session` 에 같은 문자열이 있어도 무시)
+- `include`·`substack`·`@include` 는 그 서비스 파일로 따라 들어간다 (깊이 8 까지). 지문 줄이
+  `polkit-1` 이 아니라 `system-auth` 에 있는 수동 구성도 같은 스택이므로 같은 답이다
+- `[success=1 default=ignore]` 같은 대괄호 제어는 공백이 있어도 한 필드로 건너뛴다
+- 그 줄에 `pam_fprintd` 가 있으면 참
 - **첫 줄일 필요는 없다.** 덮개 게이트(`pam_exec` … `omarchy-hw-laptop-closed`) 가 앞에
   오는 것이 정상이다
 
