@@ -52,7 +52,7 @@ pub fn run(prompt: Option<OsString>) -> ! {
 
     // Asking while the account is locked can only waste the attempt, and the
     // terminal message saying so is hidden behind the dim-around rule.
-    let budget = attempts::budget();
+    let budget = attempts::budget(attempts::SUDO_SERVICE);
     if let Some(reason) = budget.as_ref().and_then(attempts::Budget::refusal) {
         eprintln!("sudo-pop: {reason}");
         std::process::exit(1);

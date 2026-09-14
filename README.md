@@ -139,7 +139,10 @@ A few things that follow from being a polkit agent rather than a plain askpass:
   five seconds. The sudo path has no limit, so nothing counts down there.
 - **polkit and sudo share one faillock counter**, so a wrong password here counts
   against both. The window says how many are left the whole time it is open,
-  in the error colour once three or fewer remain.
+  in the error colour once three or fewer remain. That holds where the PAM
+  stack being answered runs `pam_faillock`; Omarchy's fingerprint setup writes
+  an `/etc/pam.d/polkit-1` without it, and there polkit passwords neither count
+  nor lock, so the window shows no number.
 - **`/usr/bin/sudo` always reaches the real sudo.** `\sudo` doesn't — it suppresses
   the alias but not the shell function another tool in this config installs.
 

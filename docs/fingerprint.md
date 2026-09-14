@@ -282,7 +282,7 @@ sudo 경로(askpass) 는 이 계획에서 지문 UI 가 없다.
 |---|---|---|
 | 한도 | `pam_fprintd` 의 `max-tries` (기본 3). 모듈이 자기 대화 안에서 처리. 창은 모름 | 쿠키당 `MAX_ATTEMPTS = 3` |
 | 누가 세나 | 그 모듈만 | 오답 뒤 `attempts::budget()` 으로 faillock 을 **다시 읽음** |
-| 창에 보이는 것 | 글리프 + `Touch the sensor`. 실패 뒤엔 헬퍼가 준 `PAM_ERROR_MSG` 문구 그대로 | 칸 아래 faillock 잔여 (공유 카운터) |
+| 창에 보이는 것 | 글리프 + `Touch the sensor`. 실패 뒤엔 헬퍼가 준 `PAM_ERROR_MSG` 문구 그대로 | 칸 아래 faillock 잔여 (공유 카운터). polkit-1 스택에 `pam_faillock` 이 없으면 줄 없음 (rationale §24) |
 | 한도를 넘기면 | PAM 이 비밀번호를 묻고 칸이 나타남 | 그 요청을 끝냄 (exit 2) |
 
 지문 횟수를 창이 셀 수 없는 이유는 `pam_fprintd` 소스에 있다 (`rationale.md` §22).

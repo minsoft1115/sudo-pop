@@ -814,7 +814,8 @@ askpass 모드도 돌아왔다. 창 코드는 에이전트와 **같은 것을 �
   그 스택의 `pam_faillock` 은 `/run/faillock/<user>` **한 파일**에 쌓는다. 서비스 이름은
   기록만 될 뿐 칸이 갈리지 않는다. 실제로 이 머신의 기록에 `SVC polkit-1` 행이 남아 있다.
   즉 **polkit 에서 틀린 것이 sudo 를 잠근다.** `old/docs/plan.md` §4-4 의 대응이 에이전트 경로에도
-  그대로 필요하다 — 재측정은 확인용이지 판단 근거가 아니다
+  그대로 필요하다 — 재측정은 확인용이지 판단 근거가 아니다. (뒤에 뒤집혔다: Omarchy 의 지문
+  설정이 `/etc/pam.d/polkit-1` 을 새로 쓰면 `system-auth` 가 빠진다 — §24)
 
 ---
 
@@ -1873,3 +1874,82 @@ polkitd 가 subject 로 넘기는 pid 는 run0 자신이고 (저널: `system-bus
 
 지문 단계에서도 그려지는지는 자동으로 볼 수 없어 (창은 캡처에서 제외된다, §6-2) 규칙을 잠시
 끄고 실물로 봤다: `=20` 으로 띄운 창이 3초에 `18s`, 8초에 `12s` 를 지문 그림 위에 그렸다.
+
+---
+
+## 24. 잔여 횟수가 멈춘 날 — polkit-1 에서 faillock 이 빠졌다
+
+### 24-1. 관찰과 원인
+
+지문 대기가 붙은 뒤 사용자가 봤다: 비밀번호를 틀려 `Wrong password` 가 떴는데 아랫줄의
+"N attempt(s) left before the account locks" 가 그대로다. 지문 전에는 줄어들었다고 기억했고,
+그 기억이 맞았다.
+
+| 언제 | polkit 이 쓰는 PAM 파일 | faillock |
+|---|---|---|
+| ~2026-09-10 | `/usr/lib/pam.d/polkit-1` (polkit 127 패키지). `include system-auth` 넷 | 있음 — 저널에 `pam_faillock(polkit-1…)` 8-19·8-20 |
+| 2026-09-11 09:36~ | `/etc/pam.d/polkit-1`. 어느 패키지 소유도 아님 | **없음** — 그 뒤 저널에 한 건도 없음 |
+
+9월 11일에 `omarchy-setup-security-fingerprint` 가 돌았다. 그 스크립트의 polkit 부분은 두
+갈래다. `/etc/pam.d/polkit-1` 이 **있으면** 맨 위에 `pam_fprintd` 한 줄(과 덮개 게이트)을
+끼워 넣고, **없으면** heredoc 으로 새로 만든다. Arch 는 polkit-1 을 `/usr/lib/pam.d` 에만
+두므로 모든 Omarchy 머신이 둘째 갈래를 탄다. 그 heredoc 이 이것이다.
+
+```
+auth      [success=1 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed
+auth      sufficient pam_fprintd.so
+auth      required pam_unix.so
+account   required pam_unix.so
+password  required pam_unix.so
+session   required pam_unix.so
+```
+
+`include system-auth` 가 아니라 `pam_unix` 직접이다. faillock 도, system-auth 의 나머지도
+없다. PAM 은 `/etc` 를 `/usr/lib` 보다 먼저 보므로 그날부터 이 여섯 줄이 polkit 의 전부가 됐다.
+sudo 쪽은 이미 있던 `/etc/pam.d/sudo` 위에 끼워 넣는 첫째 갈래라 `include system-auth` 가
+살아 있고 faillock 이 된다 — 그래서 §9 의 "공유된다" 는 sudo 방향으로는 여전히 참이다.
+
+Omarchy 의 자체 폴킷 에이전트는 이 영향을 안 받는다. 그쪽은 횟수를 세지도 보여 주지도 않는다
+(`PolkitAgent.qml` 은 오답에 테두리를 붉게 깜빡일 뿐이다). 숫자를 보여 주는 것은 우리뿐이라
+우리만 틀리게 보였다.
+
+### 24-2. 버그인가 의도인가
+
+의도라는 증거가 없고, 실수라는 정황이 셋이다.
+
+- heredoc 은 2025-08-24 의 "Fix fido2 and fprint auth flow (#635)" 에서 생겼다. 그 전에는
+  같은 스크립트가 `/etc/pam.d/polkit-1` 을 **지웠다** (`rm -rf`) — 즉 vendor 파일로 돌아가게
+  했다. PR 설명은 "지문이 비밀번호 뒤에 붙어 있어 순서를 고쳤다", "fido2 가 polkit 에 없었다",
+  "제거가 파일을 통째로 지웠다" 셋이고, 리뷰의 유일한 논의는 fido2 의 물리 접근 우려다.
+  faillock·system-auth·잠금은 어디에도 없다
+- 같은 PR 이 sudo 에는 끼워 넣기만 했다. polkit 만 pam_unix 로 새로 쓴 이유가 설명된 곳이
+  없다. 파일이 없어서 "일단 동작하는 최소 스택" 을 적은 모양이다
+- 2026-09 현재 upstream master 도 같은 heredoc 이고, 이슈·PR 검색(polkit-1, pam, faillock)에
+  이 문제를 다룬 것이 없다. 아무도 눈치채지 못한 쪽이 더 그럴듯하다
+
+결론: **버그다.** 고치는 모양은 첫째 갈래가 만들었을 것과 같다 — `/usr/lib/pam.d/polkit-1`
+을 복사한 위에 두 줄을 끼우는 것.
+
+```
+auth      [success=1 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed
+auth      sufficient pam_fprintd.so
+auth      include system-auth
+account   include system-auth
+password  include system-auth
+session   include system-auth
+```
+
+### 24-3. 우리가 한 것 — 세지 않는 스택에는 줄을 그리지 않는다
+
+숫자 자체는 틀리지 않았다. `deny` 는 `/etc/security/faillock.conf` 에서, 실패 건수는
+`faillock --user` 에서 그대로 읽는다 (`src/attempts.rs`). 틀린 것은 전제였다 — "이 비밀번호가
+그 표를 움직인다". 그래서 `budget()` 이 서비스 이름을 받아, 답하는 PAM 스택(`/etc/pam.d`,
+없으면 `/usr/lib/pam.d`)의 `auth` 줄을 `include`·`substack`·`@include` 를 따라가며 읽고,
+`pam_faillock` 이 없으면 `None` 을 돌려준다. 줄이 없고, "잠긴 계정" 거절도 없다 — 그 스택은
+잠긴 계정의 비밀번호도 받으므로 거절이 오히려 틀린 답이다. polkit 경로는 `polkit-1`, sudo
+경로는 `sudo` 를 본다.
+
+이 머신은 위 파일을 고치면 바로 원래대로 줄어든다. 코드 쪽 고침은 같은 상태의 다른 Omarchy
+사용자를 위한 것이다. 시나리오 6(잠긴 계정 게이팅)은 스택이 세는지 먼저 보고, 세지 않는
+머신에서는 반대로 "잠긴 tally 로도 창이 뜬다" 를 확인한다. 하드코딩된 숫자는 요청당
+`MAX_ATTEMPTS = 3` 과 붉게 칠하는 문턱 3 둘뿐이고, 어느 것도 화면의 잔여 숫자가 아니다.

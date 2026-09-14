@@ -98,7 +98,9 @@ fn run_attempts(
     conv: &mut dyn Conversation,
     authenticate: impl FnMut(&mut dyn Conversation) -> Outcome,
 ) -> Outcome {
-    run_attempts_with(conv, authenticate, attempts::budget)
+    run_attempts_with(conv, authenticate, || {
+        attempts::budget(attempts::POLKIT_SERVICE)
+    })
 }
 
 fn run_attempts_with(
@@ -160,7 +162,9 @@ pub fn run() -> ! {
     // locked account only burns everyone's budget. The live tally is also the
     // cross-cookie cap: each request re-reads it, so repeated requests cannot
     // hand out three fresh attempts each once the account is close to locking.
-    let budget = attempts::budget();
+    // None of that holds where the polkit-1 stack has no pam_faillock (Omarchy
+    // after a fingerprint setup); then there is no budget to show or enforce.
+    let budget = attempts::budget(attempts::POLKIT_SERVICE);
     if let Some(reason) = budget.as_ref().and_then(attempts::Budget::refusal) {
         // Report as cancelled, not failed: a failure has polkitd re-issue the
         // request and the window would reopen forever (see helper.rs, §3-3).

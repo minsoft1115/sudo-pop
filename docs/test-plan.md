@@ -76,6 +76,11 @@
   항목만 고르는지, `sleep` 자식 셋(`=5`·`=120`·없음)이 5·25·25 로 읽히는지. 실제 polkit
   subject 를 거치는 경로는 scenarios 3 이 `SYSTEMD_BUS_TIMEOUT=5`/`=120` run0 으로 본다
   — 로그의 `caller waits`, 5초 출발, run0 포기 직후 창 닫힘, 25초 상한
+- **10. `attempts.rs` 세지 않는 스택 [완료]** (8개 + scenarios 6) — `auth_stack_names` 가
+  메모리 안의 PAM 디렉터리로 stock Arch(`include system-auth`)·Omarchy 지문 파일(pam_unix
+  직접)·끼워 넣은 sudo·`substack`/`@include`·account 줄만 있는 것·주석·없는 파일·include
+  고리를 가른다. scenarios 6 은 실제 polkit-1 스택이 세는지 먼저 보고 게이트 유무를 반대로
+  단언한다
 
 ---
 

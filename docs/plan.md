@@ -93,6 +93,9 @@ polkitd 가 창을 다시 띄우고 지문부터 시작한다. 이 상한은 창
 창의 상시 줄은 공유 faillock 잔여이고, 그쪽이 사용자가 정말 알아야 하는 숫자다.
 
 faillock 카운터는 **sudo·polkit·로그인이 공유한다.** polkit 에서 틀린 것이 sudo 를 잠근다.
+단, 답하는 PAM 스택이 `pam_faillock` 을 돌릴 때의 이야기다. Omarchy 의 지문 설정이 만든
+`/etc/pam.d/polkit-1` 에는 없어서 그 머신의 polkit 오답은 쌓이지 않고, 창은 줄을 그리지
+않는다 (rationale §24).
 
 ### 2-5. 헬퍼
 

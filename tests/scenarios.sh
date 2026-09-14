@@ -382,6 +382,30 @@ head_ "6. 잠긴 계정 게이팅 (C1)"
 # deny 는 /etc/security/faillock.conf(이 머신은 10) 에서 온다. 진짜 faillock 을
 # 태우면 sudo·로그인까지 잠기므로, tally 만 10 건으로 흉내 내는 가짜 faillock 을
 # PATH 앞에 두어 게이트만 격리한다. 실제 카운터는 건드리지 않는다.
+#
+# 게이트는 polkit-1 PAM 스택이 pam_faillock 을 실제로 돌릴 때만 선다 (rationale §24).
+# Omarchy 의 지문 설정이 만든 /etc/pam.d/polkit-1 은 system-auth 를 include 하지
+# 않아 오답이 쌓이지 않으므로, 그런 머신에서는 반대로 "잠긴 척해도 창이 뜬다" 를 본다.
+# include/substack 을 두 단계까지 따라간다 — 실제 스택은 그보다 깊지 않다.
+pam_auth_names() {  # <service> <module> [depth]
+  local f d=${3:-0} line
+  [ "$d" -gt 3 ] && return 1
+  for f in "/etc/pam.d/$1" "/usr/lib/pam.d/$1"; do [ -f "$f" ] && break; f=""; done
+  [ -z "$f" ] && return 1
+  while read -r line; do
+    case "$line" in \#*|"") continue ;; esac
+    set -- $line
+    [ "$1" = auth ] || [ "$1" = -auth ] || continue
+    if [ "$2" = include ] || [ "$2" = substack ]; then
+      pam_auth_names "$3" "$MODULE" $((d+1)) && return 0
+    elif echo "$line" | grep -q "$MODULE"; then
+      return 0
+    fi
+  done <"$f"
+  return 1
+}
+MODULE=pam_faillock
+if pam_auth_names polkit-1; then POLKIT_COUNTS=yes; else POLKIT_COUNTS=no; fi
 mkdir -p "$WORK/bin"
 cat >"$WORK/bin/faillock" <<'FAKE'
 #!/usr/bin/env bash
@@ -399,10 +423,20 @@ chmod +x "$WORK/bin/faillock"
 sleep 60 & LSUBJECT=$!
 ( echo test-cookie | PATH="$WORK/bin:$PATH" SUDO_POP_USER="$USER"     SUDO_POP_SUBJECT_PID=$LSUBJECT SUDO_POP_MESSAGE=locked     "$BIN" --agent-prompt >"$WORK/locked.log" 2>&1; echo "exit=$?" >>"$WORK/locked.log" ) &
 sleep 2
-[ "$(windows)" = 0 ] && ok "잠긴 계정이면 창을 띄우지 않는다" || bad "창이 떴다"
-# 종료 코드 2(취소)여야 polkitd 가 요청을 되던지지 않는다. 1 이면 빈 창이 반복된다.
-grep -q "exit=2" "$WORK/locked.log" && ok "잠긴 계정은 종료 코드 2 (요청 정상 종료)"   || bad "종료 코드가 2 가 아니다" "$(cat "$WORK/locked.log")"
-grep -qi "lock" "$WORK/locked.log" && ok "잠긴 계정 안내를 남긴다" || bad "안내 메시지가 없다"
+if [ "$POLKIT_COUNTS" = yes ]; then
+  [ "$(windows)" = 0 ] && ok "잠긴 계정이면 창을 띄우지 않는다" || bad "창이 떴다"
+  # 종료 코드 2(취소)여야 polkitd 가 요청을 되던지지 않는다. 1 이면 빈 창이 반복된다.
+  grep -q "exit=2" "$WORK/locked.log" && ok "잠긴 계정은 종료 코드 2 (요청 정상 종료)"   || bad "종료 코드가 2 가 아니다" "$(cat "$WORK/locked.log")"
+  grep -qi "lock" "$WORK/locked.log" && ok "잠긴 계정 안내를 남긴다" || bad "안내 메시지가 없다"
+else
+  # 이 스택은 오답을 세지 않으므로 faillock 이 뭐라 하든 게이트도 줄도 없어야 한다.
+  [ "$(windows)" = 1 ] && ok "polkit-1 에 pam_faillock 이 없으면 잠긴 tally 로도 창이 뜬다" \
+                        || bad "스택이 세지 않는데 게이트가 섰다" "windows=$(windows)"
+  grep -qi "lock" "$WORK/locked.log" && bad "세지 않는 스택에 잠금 안내를 남겼다" \
+                                      || ok "잠금 안내를 남기지 않는다"
+  esc_prompt
+  for i in $(seq 1 20); do [ "$(windows)" = 0 ] && break; sleep 0.25; done
+fi
 kill $LSUBJECT 2>/dev/null
 for p in $(agent_children); do kill "$p" 2>/dev/null; done
 
