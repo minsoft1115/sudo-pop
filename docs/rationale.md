@@ -2021,3 +2021,59 @@ askpass 를 붙이는 데는 쓰이지 않는다. `SUDO_ASKPASS` 나 `sudo -A` �
 
 **따라 나오는 것.** 업데이트 중 지문이 안 되면 그것은 sudo 의 `pam_fprintd` 이지 우리가 아니다.
 fprintd 가 막힌 상태(§22-6)면 터미널 프롬프트도 곧장 비밀번호로 간다.
+
+---
+
+## 26. 터미널 없는 에이전트의 `sudo` — 창은 안 뜨고 센서는 30초를 기다린다
+
+"터미널에서 띄운 AI 에이전트가 `sudo` 를 쓰면 sudo-pop 이 뜨나" 를 실측했다 (2026-09-14,
+Claude Code 의 셸에서 `sudo true`). 답은 **안 뜬다** 이고, 대신 생각지 못한 것이 하나 있었다.
+
+### 26-1. 왜 안 뜨나
+
+- 에이전트의 셸은 tty 가 없고 `.bashrc` 를 읽지 않는다. `--init` 이 까는 것은 대화형 셸의
+  `alias sudo='sudo-pop'` 뿐이라 alias 가 적용되지 않고, 스크립트 안의 `sudo` 는 애초에 alias 를
+  타지 않는다. 결국 `/usr/bin/sudo` 다.
+- 진짜 sudo 가 askpass 창을 띄우는 것은 `-A` 를 받았을 때, 또는 터미널이 없는데 askpass 가
+  설정돼 있을 때뿐이다. 래퍼는 `SUDO_ASKPASS` 를 자기 자식 sudo 에게만 넘기고
+  (`src/wrapper.rs` `exec_sudo`) 전역 환경에는 두지 않는다.
+
+### 26-2. 대신 일어나는 일
+
+```
+$ tty            → not a tty
+$ sudo true
+Place your right index finger on the fingerprint reader
+Verification timed out                                  ← 30초 뒤
+sudo: a terminal is required to read the password; either use the -S option
+      to read from standard input or configure an askpass helper
+```
+
+터미널이 없어도 sudo 는 PAM 스택을 끝까지 돈다. `/etc/pam.d/sudo` 는 `pam_fprintd` 가 먼저라
+**센서에서 30초를 조용히 기다리고**, 그제야 `pam_unix` 가 비밀번호를 읽으려다 터미널이 없어
+실패한다. 저널: `pam_exec` → 30초 → `pam_unix(sudo:auth): conversation failed`.
+`timeout 5` 로도 끊기지 않았다 — sudo 는 PAM 인증 중 신호를 막는다.
+
+**그 30초 동안 등록된 손가락이 닿으면 에이전트의 `sudo` 는 성공한다.** 화면에는 아무것도
+없으므로 사용자가 다른 이유로 센서를 만지면 그대로 통과된다. sudo-pop 과 무관한
+sudo + pam_fprintd 의 성질이고, `omarchy-setup-security-fingerprint` 가 sudo 에 지문을 붙인
+모든 머신이 같다. 우리가 고칠 자리는 없고, 알고 있어야 하는 사실이다.
+
+### 26-3. 전역으로 걸 수 있나 — 두 길, 둘 다 기본으로 켜지 않는다
+
+**(a) askpass 를 전역 설정.** `sudo.conf(5)` 의 `Path askpass` 는 "터미널이 없을 때 비밀번호를
+읽는 도우미" 를 시스템 전체에 지정한다 (root, `/etc/sudo.conf`). 세션 환경의 `SUDO_ASKPASS`
+(`~/.config/environment.d/`) 도 같은 자리를 채운다. 그러면 터미널 없는 `sudo` 가 실패하는 대신
+우리 askpass 창(§7 의 sudo 경로)을 띄운다. 한계 둘: askpass 는 `pam_unix` 차례에야 불리므로
+**지문 30초는 여전히 먼저, 조용히 지나간다** (창은 30초 뒤에 뜬다; 줄이려면
+`/etc/pam.d/sudo` 의 `pam_fprintd` 줄에 `timeout=` 이 필요하다). 그리고 tty 가 있는 sudo 는
+지금처럼 터미널에서 묻는다.
+
+**(b) PATH 에 `sudo` 심.** `~/.local/bin/sudo` 같은 심이 PATH 에서 `/usr/bin` 보다 앞이면
+비대화형 셸도 래퍼를 타고, 래퍼는 run0 로 보내 polkit 창(지문 단계 포함, tty 불필요)을
+띄운다. 그러나 이것은 그 PATH 를 물려받는 **모든 스크립트**의 `sudo` 를 run0 로 바꾸는 것이다
+— sudoers 가 아니라 polkit 규칙, 환경 초기화, cwd 등 의미가 다르고 Omarchy 의 업데이트
+스크립트(§25)까지 걸린다. 래퍼가 모르는 플래그는 진짜 sudo 로 넘기지만(§7-1), "sudo 를 쳤는데
+sudo 가 아니었다" 는 사용자가 골라야 할 일이다.
+
+둘 다 사용자가 알고 켜는 옵트인이다. 설치는 지금처럼 대화형 alias 만 깐다.
