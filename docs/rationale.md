@@ -1727,6 +1727,31 @@ stdin·stdout·stderr 를 `/dev/null` 로 준다. 쿠키 파이프는 이미 비
 `--state=active` 로는 안 잡힌다. `--all` 로 받아 `active`·`activating` 둘을 본다. 그 뒤 61/61.
 사용자 문서에는 "취소 직후 30초는 지문 대신 비밀번호를 묻는다" 로 남긴다.
 
+### 22-6. 실물 확인 — 실패 문구, 그리고 fprintd 가 막히는 상태
+
+2026-09-14 에 등록하지 않은 손가락으로 실측했다 (캡처 제외 규칙을 잠시 끄고 0.4초마다 찍음).
+지문 단계에서 매치가 실패하면 글리프가 오류색으로 바뀌고 힌트 자리에 pam_fprintd 의 문구
+`Failed to match fingerprint` 가 그대로 놓인다 — §22-1 대로 숫자는 없다. 문구가 같아서
+프레임으로 횟수는 셀 수 없고, 첫 실패 문구 뒤 2초쯤에 (pam_fprintd 가 자기 `max-tries` 를
+다 쓴 시점) 비밀번호 칸으로 넘어갔다. 카운트다운은 그대로 이어졌다.
+
+그 전에 한 가지가 먼저 걸렸다. 창이 `fingerprint_wait=true` 로 시작하는데도 0.2초 만에
+비밀번호 칸이 됐다. 저널에는 아무것도 없었고, 원인은 fprintd 였다.
+
+```
+$ fprintd-verify lmh
+failed to claim device: GDBus.Error:net.reactivated.Fprint.Error.Internal:
+Open failed with error: Device 1c7a:057e is already open
+```
+
+§22-5 의 "취소된 root 헬퍼가 센서를 쥔다" 가 한 단계 더 간 것이다. `Device was already
+claimed` 충돌이 몇 번 난 뒤 libfprint 장치가 fprintd 안에서 열린 채 남았고, 이후 모든 claim 이
+이 Internal 오류로 즉시 실패한다. pam_fprintd 는 이것을 저널에 남기지 않고 곧장 다음 모듈로
+넘기므로 창에는 비밀번호 칸만 보인다. 창은 PAM 이 실제로 요구하는 것을 그린 것이라 맞게
+동작한 것이고, 우리가 알 수도 고칠 수도 없다. 푸는 법은 `systemctl restart fprintd` (root)
+이거나, 요청 없이 몇 분 두어 fprintd 가 유휴 종료되게 하는 것이다. "지문이 안 뜨고 바로
+텍스트" 가 보고되면 `fprintd-verify` 부터 찔러 본다.
+
 ---
 
 ## 23. 25초는 누구의 시계인가 — 실측
