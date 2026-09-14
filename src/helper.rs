@@ -89,6 +89,11 @@ pub enum Outcome {
     /// The helper gave up before asking anything: a locked account, a broken
     /// PAM stack, or a socket helper the kernel cannot vouch for.
     RefusedWithoutPrompt,
+    /// The helper went away after asking: the answer could not be written to
+    /// it, or reading from it failed. Not a wrong password -- PAM never judged
+    /// the answer -- so no budget is spent and no `Wrong password` is shown;
+    /// a fresh helper may do better.
+    HelperGone,
     /// The user closed the prompt.
     Cancelled,
 }
@@ -99,7 +104,14 @@ pub trait Conversation {
     /// `None` means the user closed the prompt.
     fn ask(&mut self, prompt: &str, echo: bool) -> Option<Secret>;
     fn info(&mut self, text: &str);
+    /// Something on our side went wrong: the helper is unreachable, the
+    /// answer was rejected, the account is locked.
     fn error(&mut self, text: &str);
+    /// A `PAM_ERROR_MSG` from a module -- PAM's own words, which the window
+    /// may mute while a retry is back at the sensor. Ours never are.
+    fn pam_error(&mut self, text: &str) {
+        self.error(text);
+    }
     /// Updates the standing budget / remaining attempts shown on the prompt.
     fn update_attempts(&mut self, _attempts: Option<(String, bool)>) {}
     /// True when the window has closed. Polled between helper reads so a
@@ -240,12 +252,20 @@ fn attempt(channel: std::io::Result<Channel>, conv: &mut dyn Conversation) -> Ou
         if conv.cancelled() {
             return Outcome::Cancelled;
         }
+        // A read error after a prompt is the helper dying on us, not PAM
+        // rejecting anything. Before a prompt it is one more way of refusing
+        // without asking. A plain EOF keeps its meaning either way: the
+        // helper says FAILURE before it leaves, so silence after a prompt is
+        // still a failed answer.
         match channel.readable() {
             Ok(false) => continue,
             Ok(true) => {}
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => {
                 conv.error(&format!("helper went away: {e}"));
+                if saw_prompt {
+                    return Outcome::HelperGone;
+                }
                 break;
             }
         }
@@ -256,6 +276,9 @@ fn attempt(channel: std::io::Result<Channel>, conv: &mut dyn Conversation) -> Ou
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => {
                 conv.error(&format!("helper went away: {e}"));
+                if saw_prompt {
+                    return Outcome::HelperGone;
+                }
                 break;
             }
         }
@@ -270,10 +293,10 @@ fn attempt(channel: std::io::Result<Channel>, conv: &mut dyn Conversation) -> Ou
                 answer.wipe();
                 if let Err(e) = sent {
                     conv.error(&format!("cannot answer the helper: {e}"));
-                    return Outcome::Failed;
+                    return Outcome::HelperGone;
                 }
             }
-            "PAM_ERROR_MSG" => conv.error(rest),
+            "PAM_ERROR_MSG" => conv.pam_error(rest),
             "PAM_TEXT_INFO" => conv.info(rest),
             "SUCCESS" => return Outcome::Success,
             "FAILURE" => break,

@@ -55,6 +55,10 @@ case "$mode" in
   # poll the descriptor for a line it already holds in its buffer.
   burst)        printf 'PAM_TEXT_INFO Place your finger\nPAM_PROMPT_ECHO_OFF Password:\n'
                 read -r answer || answer=""; echo SUCCESS ;;
+  # Closes its stdin before asking, then lingers: the answer has nowhere to
+  # go (EPIPE). That is a helper dying mid-conversation, not a wrong password.
+  prompt-then-die) exec 0<&-
+                printf 'PAM_PROMPT_ECHO_OFF Password:\n'; sleep 5 ;;
   # Answers only to one specific password, so a test can drive both outcomes.
   check)        ask "Password:"
                 if [ "$answer" = "${FAKE_HELPER_PASSWORD:-open-sesame}" ]; then echo SUCCESS; else echo FAILURE; fi ;;

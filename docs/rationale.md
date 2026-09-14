@@ -1754,9 +1754,9 @@ claimed` 충돌이 몇 번 난 뒤 libfprint 장치가 fprintd 안에서 열린 
 
 ---
 
-### 22-7. 자체 리뷰의 F-1·F-3 을 고치다
+### 22-7. 자체 리뷰의 F-1·F-3·F-4·F-5 를 고치다
 
-[`review-2026-09-14.md`](review-2026-09-14.md) 의 발견 중 둘을 고쳤다.
+[`review-2026-09-14.md`](review-2026-09-14.md) 의 발견 중 넷을 고쳤다.
 
 **F-1 — polkitd 취소가 헬퍼를 고아로 남기던 것.** 에이전트의 취소는 자식에 SIGTERM 이었고
 자식에는 핸들러가 없어 즉시 죽었다. `Channel` 의 drop 이 돌지 않으니 소켓 헬퍼는 다음 쓰기까지
@@ -1778,8 +1778,25 @@ claimed` 충돌이 몇 번 난 뒤 libfprint 장치가 fprintd 안에서 열린 
 시험은 in-memory `pam.d` 로 stock Arch·Omarchy 파일·include 된 지문·`substack`/`@include`·
 account 줄·주석·고리·빈 파일을 가른다.
 
+**F-4 — 헬퍼가 죽은 것을 오답으로 그리던 것.** 답을 헬퍼에 쓰지 못하거나 프롬프트 뒤 읽기가
+오류로 끝나면 `Outcome::Failed` 였고, 재시도 루프가 `Wrong password` 를 띄우고 예산을 다시
+읽었다. 새 변형 `HelperGone` 을 두었다: 헬퍼가 이미 보낸 "cannot answer the helper" / "helper
+went away" 문구만 남기고, 예산을 건드리지 않고, 새 헬퍼로 한 번 더 간다. 세 번 다 죽으면
+종료 코드 2 다. 프롬프트 뒤의 **EOF** 는 그대로 `Failed` 다 — 헬퍼는 떠나기 전에 `FAILURE` 를
+말하므로 침묵은 여전히 틀린 답이고, §3-3 의 "프롬프트를 봤는가" 규칙이 바뀌지 않는다. 가짜
+헬퍼에 `prompt-then-die` 모드(stdin 을 닫고 묻고 눕는다 → EPIPE) 를 넣어 통합 시험으로 본다.
+
+**F-5 — 오답 뒤 지문 재시도 잡음이 `Wrong password` 를 덮던 것.** 헬퍼 대화에 `pam_error` 가
+생겼다. `PAM_ERROR_MSG` 는 이 길로, 우리 자신의 오류(헬퍼 사라짐·잠긴 계정·오답)는 전처럼
+`error` 로 간다 (`ToUi::PamError` 와 `ToUi::Error`). 창은 지문에서 온 요청이 오답을 받은 순간부터
+다음 프롬프트까지 `pam_error` 를 지운다 (`Phase::Password { pam_muted }`) — 그 사이의 문구는
+새 헬퍼가 센서에서 내는 `Failed to match` 류뿐이다. 우리 오류는 지우지 않는다. 지문 단계의
+`pam_error` 는 전처럼 힌트 자리로 간다. `PAM_TEXT_INFO` 는 이미 §22 에서 같은 조건으로 거르고
+있었다.
+
 시나리오 3 (run0 포기 → polkitd 취소 → SIGTERM) 이 F-1 의 소켓 경로를 실물로 지나고, 창이 곧
-닫히는 것과 종료 코드 2 를 그대로 본다. fork 경로는 이 머신에 없다.
+닫히는 것과 종료 코드 2 를 그대로 본다. fork 경로는 이 머신에 없다. F-5 의 화면은 실기기에서
+오답 뒤 손가락을 잘못 대 보는 것으로만 확인된다 — 아직 하지 않았다.
 
 ---
 

@@ -87,6 +87,25 @@ fn a_wrong_answer_is_a_failure_worth_retrying() {
 /// have polkitd hand the request straight back and the window would reopen for
 /// ever, so it has to be distinguishable.
 #[test]
+fn a_helper_that_dies_after_asking_is_not_a_wrong_password() {
+    let started = std::time::Instant::now();
+    let (outcome, conv) = run("prompt-then-die", &["whatever"]);
+    assert_eq!(outcome, Outcome::HelperGone);
+    assert_eq!(conv.prompts.len(), 1, "it did ask");
+    assert!(
+        conv.errors
+            .iter()
+            .any(|e| e.starts_with("cannot answer the helper")),
+        "the window is told why: {:?}",
+        conv.errors
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "the lingering helper is killed, not waited for"
+    );
+}
+
+#[test]
 fn a_refusal_before_any_prompt_is_not_a_failure() {
     let (outcome, conv) = run("no-prompt", &[]);
     assert_eq!(outcome, Outcome::RefusedWithoutPrompt);

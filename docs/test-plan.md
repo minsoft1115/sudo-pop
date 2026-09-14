@@ -81,6 +81,11 @@
   Omarchy 지문 파일(pam_unix 직접)·끼워 넣은 sudo·`substack`/`@include`·account/session 줄만
   있는 것·주석·없는 파일·include 고리·모듈 인자를 가른다. 지문 감지와 faillock 검사가 같은
   함수를 쓴다. scenarios 6 은 실제 polkit-1 스택이 세는지 먼저 보고 게이트 유무를 반대로 단언한다
+- **12. 헬퍼 사망과 PAM 문구 분리 [완료]** (`prompt.rs` 3개 + `helper_protocol` 1개) —
+  `HelperGone` 은 `Wrong` 없이·예산 재읽기 없이 재시도하고 세 번이면 종료 코드 2;
+  `pam_error` 와 `error` 가 `ToUi::PamError`/`ToUi::Error` 로 갈라지는지; 가짜 헬퍼
+  `prompt-then-die`(stdin 닫고 묻기 → EPIPE) 가 `HelperGone` 이고 눕는 헬퍼를 기다리지 않는지.
+  창의 `pam_muted` 는 단위 시험 대상이 아니다 (창) — 실기기 확인 필요
 - **11. `prompt.rs` SIGTERM = 취소 [완료]** (1개 + scenarios 3) — `TERMINATED` 플래그만으로
   `cancelled()` 가 참이 되는지. 실물은 scenarios 3 의 run0 포기 → polkitd 취소 → SIGTERM → 창
   닫힘·종료 코드 2. 에이전트의 2초 뒤 SIGKILL 승격은 자동 시험이 없다 (창 루프가 멈춘 자식이

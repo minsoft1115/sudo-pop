@@ -96,6 +96,10 @@ impl Conversation for WindowConversation {
         let _ = self.to_ui.send(ToUi::Error(text.to_owned()));
     }
 
+    fn pam_error(&mut self, text: &str) {
+        let _ = self.to_ui.send(ToUi::PamError(text.to_owned()));
+    }
+
     fn update_attempts(&mut self, attempts: Option<(String, bool)>) {
         let _ = self.to_ui.send(ToUi::Attempts(attempts));
     }
@@ -158,6 +162,10 @@ fn run_attempts_with(
                 }
                 conv.error(attempts::WRONG_PASSWORD);
             }
+            // The helper died with our answer unjudged. It already said so
+            // on the window; a fresh helper is the retry, and nothing was
+            // spent, so the budget is not re-read and no `Wrong` is shown.
+            Outcome::HelperGone if attempt < MAX_ATTEMPTS => {}
             _ => break,
         }
     }
@@ -272,13 +280,57 @@ pub fn run() -> ! {
 fn exit_for(outcome: Outcome) -> i32 {
     match outcome {
         Outcome::Success => EXIT_SUCCESS,
-        Outcome::Failed | Outcome::Cancelled | Outcome::RefusedWithoutPrompt => EXIT_CANCELLED,
+        Outcome::Failed
+        | Outcome::Cancelled
+        | Outcome::RefusedWithoutPrompt
+        | Outcome::HelperGone => EXIT_CANCELLED,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_helper_that_died_is_retried_without_a_wrong_password() {
+        let mut budget_reads = 0;
+        let (last, calls, rec) =
+            drive_with_budget(vec![Outcome::HelperGone, Outcome::Success], || {
+                budget_reads += 1;
+                None
+            });
+        assert_eq!(last, Outcome::Success);
+        assert_eq!(calls, 2, "a fresh helper is the retry");
+        assert!(
+            rec.errors.is_empty(),
+            "the helper's own message already went; no Wrong password: {:?}",
+            rec.errors
+        );
+        assert_eq!(budget_reads, 0, "nothing was spent, so nothing to re-read");
+    }
+
+    #[test]
+    fn a_helper_that_keeps_dying_ends_the_request_as_cancelled() {
+        let (last, calls, _) = drive(vec![Outcome::HelperGone; MAX_ATTEMPTS as usize]);
+        assert_eq!(last, Outcome::HelperGone);
+        assert_eq!(calls, MAX_ATTEMPTS as usize);
+        assert_eq!(exit_for(last), EXIT_CANCELLED, "not a D-Bus error");
+    }
+
+    #[test]
+    fn pams_words_and_ours_travel_on_different_channels() {
+        let (to_ui, rx) = channel::<ToUi>();
+        let (_tx, from_ui) = channel::<FromUi>();
+        let mut conv = WindowConversation {
+            to_ui,
+            from_ui,
+            pending: std::sync::Mutex::new(None),
+        };
+        conv.pam_error("Failed to match fingerprint");
+        conv.error("helper went away");
+        assert!(matches!(rx.recv(), Ok(ToUi::PamError(t)) if t == "Failed to match fingerprint"));
+        assert!(matches!(rx.recv(), Ok(ToUi::Error(t)) if t == "helper went away"));
+    }
 
     #[test]
     fn a_sigterm_reads_as_a_cancel_to_the_helper_loop() {

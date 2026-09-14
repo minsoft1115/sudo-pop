@@ -107,9 +107,11 @@ omarchy.polkit 과 같다: 지문일 때는 입력칸이 없고 아이콘만, �
                 ├─ PAM_TEXT_INFO             → 창 문구는 그대로 `Touch the sensor`. 상태는 대기
                 ├─ PAM_PROMPT_ECHO_*         → 비밀번호 칸. 상시 줄은 faillock
                 ├─ Wrong 후 헬퍼 재시작      → PAM 이 지문을 다시 시도해도 칸은 유지.
-                │                              지문 TEXT_INFO 는 칸을 덮지 않음
+                │                              지문 TEXT_INFO 도 PAM_ERROR_MSG 도 다음 프롬프트
+                │                              까지 칸 아래를 덮지 않음 (우리 오류는 보임)
                 ├─ Esc / 닫기 / 호출자 취소  → 헬퍼를 끊고 종료 코드 2
-                └─ FAILURE, 프롬프트 없음    → 지금과 같다 (취소로 끝. 잠긴 계정 등)
+                ├─ FAILURE, 프롬프트 없음    → 지금과 같다 (취소로 끝. 잠긴 계정 등)
+                └─ 프롬프트 뒤 헬퍼 사망     → 그 문구만, Wrong 없이, 새 헬퍼로 재시도 (HelperGone)
 ```
 
 **"지문이 끝났다" 는 신호는 오지 않는다.** `pam_fprintd` 는 `sufficient` 라서 `max-tries` 를

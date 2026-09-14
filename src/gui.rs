@@ -141,6 +141,13 @@ enum Phase {
         notice: Option<(String, bool)>,
         prompt: String,
         echo: bool,
+        /// After a wrong password the retry starts a fresh helper, and on a
+        /// fingerprint stack that helper is back at the sensor first. Its
+        /// `Failed to match` / `swipe too short` would overwrite `Wrong
+        /// password` under a field that is waiting for a password. So PAM's
+        /// words are muted from the `Wrong` until the next prompt; our own
+        /// errors (helper gone, locked) are never muted.
+        pam_muted: bool,
     },
 }
 
@@ -158,7 +165,12 @@ pub enum ToUi {
         echo: bool,
     },
     Info(String),
+    /// One of ours: the helper is unreachable, the answer was wrong, the
+    /// account is locked. Always shown.
     Error(String),
+    /// A `PAM_ERROR_MSG`: a module's own words. Shown in the fingerprint
+    /// phase in the hint's place; in the password phase unless muted.
+    PamError(String),
     Attempts(Option<(String, bool)>),
     /// The conversation is over; close.
     Done,
@@ -312,6 +324,7 @@ impl Window {
                 notice: None,
                 prompt: "Password:".into(),
                 echo: false,
+                pam_muted: false,
             }
         };
         Self {
@@ -334,6 +347,7 @@ impl Window {
             notice: None,
             prompt: text,
             echo,
+            pam_muted: false,
         };
         if self.came_from_fingerprint {
             self.resize(ctx, WINDOW_HEIGHT);
@@ -359,14 +373,17 @@ impl Window {
                             prompt,
                             echo: echo_slot,
                             backstop,
+                            pam_muted,
                             ..
                         } => {
                             *prompt = text;
                             *echo_slot = echo;
                             *waiting = false;
                             *focus_set = false;
-                            // A new question deserves a fresh deadline.
+                            // A new question deserves a fresh deadline, and
+                            // PAM is past the sensor: its words count again.
                             *backstop = Some(Instant::now() + TIMEOUT);
+                            *pam_muted = false;
                         }
                     }
                 }
@@ -378,26 +395,48 @@ impl Window {
                         *notice = Some((text, false));
                     }
                 }
+                Ok(ToUi::PamError(text)) => {
+                    match &mut self.phase {
+                        Phase::Fingerprint { notice } => {
+                            Self::cover_with(&mut self.chain, ctx, &text);
+                            *notice = Some(text);
+                        }
+                        Phase::Password {
+                            notice, pam_muted, ..
+                        } => {
+                            // A module's complaint never frees the field: it
+                            // can arrive while an answer is still on its way
+                            // to a helper that is busy at the sensor.
+                            if !*pam_muted {
+                                Self::cover_with(&mut self.chain, ctx, &text);
+                                *notice = Some((text, true));
+                            }
+                        }
+                    }
+                }
                 Ok(ToUi::Error(text)) => {
                     self.cover(ctx, &text);
                     let wrong = text == crate::attempts::WRONG_PASSWORD;
+                    let from_fingerprint = self.came_from_fingerprint;
                     match &mut self.phase {
                         Phase::Fingerprint { notice } => *notice = Some(text),
                         Phase::Password {
                             waiting,
                             focus_set,
                             notice,
+                            pam_muted,
                             ..
                         } => {
-                            // Every error is shown: PAM's own words, a helper
-                            // that went away, a locked account. Only a rejected
-                            // password frees the field, though -- any other
-                            // error can arrive while an answer is still on
-                            // its way to a helper that is busy at the sensor.
+                            // Every error of ours is shown: a helper that went
+                            // away, a locked account, a rejected password. Only
+                            // the rejected password frees the field, and on a
+                            // fingerprint stack it also mutes PAM until the
+                            // fresh helper gets past the sensor and asks.
                             *notice = Some((text, true));
                             if wrong {
                                 *waiting = false;
                                 *focus_set = false;
+                                *pam_muted = from_fingerprint;
                             }
                         }
                     }
@@ -417,8 +456,12 @@ impl Window {
     /// PAM speaks after the window is up, so text can arrive in a script the
     /// chain has no face for. A new chain takes effect on the next frame.
     fn cover(&mut self, ctx: &egui::Context, text: &str) {
-        if self.chain.cover(text) {
-            self.chain.install(ctx);
+        Self::cover_with(&mut self.chain, ctx, text);
+    }
+
+    fn cover_with(chain: &mut font::Chain, ctx: &egui::Context, text: &str) {
+        if chain.cover(text) {
+            chain.install(ctx);
             ctx.request_repaint();
         }
     }
