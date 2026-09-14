@@ -112,6 +112,14 @@ omarchy.polkit 과 같다: 지문일 때는 입력칸이 없고 아이콘만, �
                 └─ FAILURE, 프롬프트 없음    → 지금과 같다 (취소로 끝. 잠긴 계정 등)
 ```
 
+**"지문이 끝났다" 는 신호는 오지 않는다.** `pam_fprintd` 는 `sufficient` 라서 `max-tries` 를
+다 쓰면 조용히 실패로 돌아가고, PAM 은 다음 줄 `pam_unix` 로 내려간다. 그 사이 우리에게
+오는 것은 `PAM_ERROR_MSG` 문구뿐이다. 창이 비밀번호 칸으로 바뀌는 계기는 오직 `pam_unix` 가
+보내는 첫 `PAM_PROMPT_ECHO_OFF` 다. 그래서 창은 **왜** 비밀번호를 묻는지 모른다 — 지문을 다
+틀려서인지, fprintd 가 장치를 못 열어 `pam_fprintd` 가 0.2초 만에 실패해서인지 같은 화면이다
+(실측: [`rationale.md`](rationale.md) §22-6). 지문이 성공하면 프롬프트가 아예 오지 않고
+`SUCCESS` 로 창이 닫힌다.
+
 `fingerprintMode` 는 다음이 **동시에** 참일 때만이다.
 
 - PAM 스택에 `pam_fprintd.so` 가 있다 (§4) — 설정 안 됨이면 여기까지 안 온다
