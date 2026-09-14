@@ -1754,9 +1754,9 @@ claimed` 충돌이 몇 번 난 뒤 libfprint 장치가 fprintd 안에서 열린 
 
 ---
 
-### 22-7. 자체 리뷰의 F-1·F-3·F-4·F-5 를 고치다
+### 22-7. 자체 리뷰의 F-1·F-2·F-3·F-4·F-5 를 고치다
 
-[`review-2026-09-14.md`](review-2026-09-14.md) 의 발견 중 넷을 고쳤다.
+[`review-2026-09-14.md`](review-2026-09-14.md) 의 발견 중 다섯을 고쳤다.
 
 **F-1 — polkitd 취소가 헬퍼를 고아로 남기던 것.** 에이전트의 취소는 자식에 SIGTERM 이었고
 자식에는 핸들러가 없어 즉시 죽었다. `Channel` 의 drop 이 돌지 않으니 소켓 헬퍼는 다음 쓰기까지
@@ -1769,6 +1769,14 @@ claimed` 충돌이 몇 번 난 뒤 libfprint 장치가 fprintd 안에서 열린 
 찾아 아직 등록돼 있으면 SIGKILL 을 보낸다 — pidfd 값이 아니라 쿠키로 찾고, `ask` 가 항목을
 지운 뒤에 fd 를 닫으므로 다른 요청의 fd 를 맞힐 수 없다. 전에 있던 "즉시 죽는다" 보장은 2초
 늦게 그대로 남는다.
+
+**F-2 — pidfd 등록 전에 온 취소가 창을 남기던 것.** `ask()` 가 자식을 띄우고 `running` 에
+넣기까지의 수 마이크로초에 `CancelAuthentication` 이 오면, 취소는 등록된 것을 못 찾아 마커만
+남기고 `begin_authentication` 은 이미 마커 검사를 지난 뒤였다. 자식은 백스톱까지 살았다. 이제
+`ask()` 는 등록 직후 그 마커를 한 번 더 소비하고, 있으면 곧바로 SIGTERM 과 2초 뒤 SIGKILL
+승격을 건다 — 취소 메서드와 같은 `escalate_later`. 자동 시험은 없다: 그 틈을 맞히려면 spawn
+안에 손을 넣어야 한다. 논리는 "마커는 검사 전이든 등록 후든 어느 쪽에서든 한 번은 읽힌다"
+로 닫힌다.
 
 **F-3 — `fingerprint::configured()` 가 include 를 안 따라가던 것.** PAM 스택을 읽는 함수를
 `src/pam.rs` 하나로 합쳤다. `auth_stack_names(service, module)` 가 `/etc/pam.d` 다음

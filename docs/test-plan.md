@@ -86,6 +86,9 @@
   `pam_error` 와 `error` 가 `ToUi::PamError`/`ToUi::Error` 로 갈라지는지; 가짜 헬퍼
   `prompt-then-die`(stdin 닫고 묻기 → EPIPE) 가 `HelperGone` 이고 눕는 헬퍼를 기다리지 않는지.
   창의 `pam_muted` 는 단위 시험 대상이 아니다 (창) — 실기기 확인 필요
+- **13. `agent.rs` 등록 전 취소 [완료 — 자동 시험 없음]** — spawn 과 pidfd 등록 사이의 틈은
+  시험으로 맞힐 수 없다. 코드 리뷰로 닫는다: 마커는 `begin_authentication` 의 검사와 `ask()` 의
+  등록 직후 검사 중 하나에서 반드시 읽힌다
 - **11. `prompt.rs` SIGTERM = 취소 [완료]** (1개 + scenarios 3) — `TERMINATED` 플래그만으로
   `cancelled()` 가 참이 되는지. 실물은 scenarios 3 의 run0 포기 → polkitd 취소 → SIGTERM → 창
   닫힘·종료 코드 2. 에이전트의 2초 뒤 SIGKILL 승격은 자동 시험이 없다 (창 루프가 멈춘 자식이

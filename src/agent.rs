@@ -320,22 +320,7 @@ impl Agent {
             if tracing() {
                 println!("  closed the prompt for that cookie");
             }
-            // Escalate if the child is still registered after the grace
-            // period. Looked up by cookie under the lock, never by the fd
-            // value: `ask` removes the entry before closing the fd, so a
-            // hit here is this request's own live pidfd and nothing else.
-            let running = Arc::clone(&self.running);
-            std::thread::spawn(move || {
-                std::thread::sleep(CANCEL_GRACE);
-                if let Ok(map) = running.lock()
-                    && let Some(&pidfd) = map.get(&cookie)
-                {
-                    pidfd_signal(pidfd, libc::SIGKILL);
-                    if tracing() {
-                        println!("  prompt ignored SIGTERM; killed");
-                    }
-                }
-            });
+            self.escalate_later(cookie);
             return;
         }
         // Not started yet (still queued) or already gone. Remember it so the
@@ -348,6 +333,25 @@ impl Agent {
 }
 
 impl Agent {
+    /// SIGKILL the child for `cookie` if it is still registered after the
+    /// grace period. Looked up by cookie under the lock, never by the fd
+    /// value: `ask` removes the entry before closing the fd, so a hit here is
+    /// this request's own live pidfd and nothing else.
+    fn escalate_later(&self, cookie: String) {
+        let running = Arc::clone(&self.running);
+        std::thread::spawn(move || {
+            std::thread::sleep(CANCEL_GRACE);
+            if let Ok(map) = running.lock()
+                && let Some(&pidfd) = map.get(&cookie)
+            {
+                pidfd_signal(pidfd, libc::SIGKILL);
+                if tracing() {
+                    println!("  prompt ignored SIGTERM; killed");
+                }
+            }
+        });
+    }
+
     /// Run one request in a child and wait for its exit code.
     async fn ask(
         &self,
@@ -393,6 +397,17 @@ impl Agent {
         if pidfd >= 0 {
             if let Ok(mut map) = self.running.lock() {
                 map.insert(cookie.to_owned(), pidfd);
+            }
+            // A cancel that landed between begin_authentication's check and
+            // this registration found nothing to signal and left a marker
+            // instead. Consume it now, or the child would run to its backstop
+            // for a request polkitd has already dropped.
+            if self.take_cancelled(cookie) {
+                if tracing() {
+                    println!("  cancelled while starting; closing it");
+                }
+                pidfd_signal(pidfd, libc::SIGTERM);
+                self.escalate_later(cookie.to_owned());
             }
         } else {
             eprintln!("sudo-pop: cannot open pidfd for the prompt child");
