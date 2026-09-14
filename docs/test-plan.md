@@ -89,6 +89,11 @@
 - **13. `agent.rs` 등록 전 취소 [완료 — 자동 시험 없음]** — spawn 과 pidfd 등록 사이의 틈은
   시험으로 맞힐 수 없다. 코드 리뷰로 닫는다: 마커는 `begin_authentication` 의 검사와 `ask()` 의
   등록 직후 검사 중 하나에서 반드시 읽힌다
+- **14. `attempts.rs` 외부 명령 [완료]** (3개 + scenarios 6) — faillock 시각 문자열이 C 라이브러리
+  왕복(`localtime_r`/`strftime` → `strptime`/`mktime`)으로 같은 초가 되는지(시간대 무관),
+  형식이 다르면 `None` 인지, `faillock_binary()` 가 오버라이드 없이는 고정 후보만 쓰고 디버그
+  빌드에서는 `SUDO_POP_FAILLOCK_BIN` 을 받는지. scenarios 6 은 릴리스 바이너리에 그 문자열이
+  없고 debug 에는 있는 것을 `grep` 으로 보고, debug 로 가짜 tally 를 끼운다
 - **11. `prompt.rs` SIGTERM = 취소 [완료]** (1개 + scenarios 3) — `TERMINATED` 플래그만으로
   `cancelled()` 가 참이 되는지. 실물은 scenarios 3 의 run0 포기 → polkitd 취소 → SIGTERM → 창
   닫힘·종료 코드 2. 에이전트의 2초 뒤 SIGKILL 승격은 자동 시험이 없다 (창 루프가 멈춘 자식이

@@ -17,8 +17,8 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Prompts allowed per sudo command, out of the ten sudo would otherwise give.
@@ -251,10 +251,39 @@ fn parse_pam_setting(text: &str, key: &str) -> Option<u32> {
 /// Entries past `fail_interval` stay listed but flip the Valid column from `V`
 /// to `I`. Counting every row would understate the remaining budget, so only
 /// `V` rows count.
+/// Where `faillock` lives. Arch ships it in both places; a name alone would go
+/// through the prompt child's PATH, which on Omarchy's user manager puts
+/// `~/.local/bin` and the mise shims ahead of `/usr/bin` -- a place any process
+/// of the same uid can write to. It would only get to lie about the tally
+/// (no password passes through here), but the window is hardened against
+/// exactly that neighbour, so it does not get to pick the binary either.
+const FAILLOCK: [&str; 2] = ["/usr/bin/faillock", "/usr/sbin/faillock"];
+
+/// The tally reader, or `None` when the system has none (then there is no
+/// line and no refusal, as for any other parse failure).
+///
+/// The override is compiled in only for debug builds, like the helper doors
+/// in `helper.rs`: scenarios stand in a fake tally without burning the real
+/// one. A release binary never reads it -- the string is not even in it.
+fn faillock_binary() -> Option<String> {
+    #[cfg(debug_assertions)]
+    if let Ok(path) = std::env::var("SUDO_POP_FAILLOCK_BIN") {
+        return Some(path);
+    }
+    FAILLOCK
+        .iter()
+        .find(|p| Path::new(p).is_file())
+        .map(|p| (*p).to_owned())
+}
+
 fn failure_tally(user: &str) -> Option<(u32, Option<u64>)> {
-    let out = Command::new("faillock")
+    // stdin is nulled the way the lid probe's is (rationale §22-4): this can
+    // run after a wrong answer, while a retyped password sits in `pending`,
+    // and a child should inherit nothing from a process in that state.
+    let out = Command::new(faillock_binary()?)
         .arg("--user")
         .arg(user)
+        .stdin(Stdio::null())
         .output()
         .ok()?;
     if !out.status.success() {
@@ -288,16 +317,27 @@ fn parse_tally(text: &str) -> (u32, Option<(String, String)>) {
 
 /// Turn faillock's local "YYYY-MM-DD HH:MM:SS" into a unix timestamp.
 ///
-/// Shelling out to `date` keeps the local-time and DST handling with the system
-/// rather than reimplementing a calendar here for one cosmetic countdown.
+/// The C library does the calendar: `strptime` splits the fields and `mktime`
+/// applies this process's time zone, with `tm_isdst = -1` so it also decides
+/// daylight saving for that local time. That is what `date -d` did when this
+/// shelled out to it; doing it in-process spares the hardened child a fork
+/// and a PATH lookup. faillock's format is fixed in its source, so one
+/// pattern is enough; anything else is `None`, and the lock message then
+/// just omits the countdown.
 fn parse_stamp(date: &str, time: &str) -> Option<u64> {
-    let out = Command::new("date")
-        .arg("-d")
-        .arg(format!("{date} {time}"))
-        .arg("+%s")
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    let text = std::ffi::CString::new(format!("{date} {time}")).ok()?;
+    // SAFETY: an all-zero `tm` is a valid value for strptime to fill, and both
+    // strings are NUL-terminated for as long as the calls run.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        let end = libc::strptime(text.as_ptr(), c"%Y-%m-%d %H:%M:%S".as_ptr(), &mut tm);
+        if end.is_null() || *end != 0 {
+            return None;
+        }
+        tm.tm_isdst = -1;
+        let secs = libc::mktime(&mut tm);
+        (secs >= 0).then_some(secs as u64)
+    }
 }
 
 fn current_user() -> Option<String> {
@@ -459,6 +499,68 @@ When                Type  Source   Valid
         // tally says. Looked up through the real /etc, so the assertion is
         // only about the "not counted" branch.
         assert!(budget("sudo-pop-no-such-pam-service").is_none());
+    }
+
+    /// The local time of `secs`, in faillock's own format, from the same C
+    /// library `parse_stamp` uses -- so the test holds in any time zone.
+    fn local_stamp(secs: u64) -> (String, String) {
+        let t = secs as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let mut buf = [0u8; 32];
+        // SAFETY: localtime_r and strftime write only into the buffers given.
+        let n = unsafe {
+            libc::localtime_r(&t, &mut tm);
+            libc::strftime(
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                c"%Y-%m-%d %H:%M:%S".as_ptr(),
+                &tm,
+            )
+        };
+        let text = std::str::from_utf8(&buf[..n]).unwrap().to_owned();
+        let (d, t) = text.split_once(' ').unwrap();
+        (d.to_owned(), t.to_owned())
+    }
+
+    #[test]
+    fn a_faillock_stamp_round_trips_through_the_c_library() {
+        // Whole seconds now, and a fixed instant, both in this zone.
+        for secs in [now_secs(), 1_755_576_003] {
+            let (d, t) = local_stamp(secs);
+            assert_eq!(parse_stamp(&d, &t), Some(secs), "{d} {t}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_stamp_is_none_not_a_guess() {
+        assert_eq!(parse_stamp("2026-08-19", "12:00"), None, "seconds missing");
+        assert_eq!(parse_stamp("yesterday", "noon"), None);
+        assert_eq!(
+            parse_stamp("2026-08-19", "12:00:03 extra"),
+            None,
+            "trailing text"
+        );
+        assert_eq!(parse_stamp("", ""), None);
+    }
+
+    #[test]
+    fn the_tally_reader_is_a_fixed_path_unless_a_debug_build_is_told_otherwise() {
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("SUDO_POP_FAILLOCK_BIN") };
+        let found = faillock_binary();
+        assert!(
+            found.as_deref().is_none_or(|p| FAILLOCK.contains(&p)),
+            "without the override only the fixed candidates qualify: {found:?}"
+        );
+        unsafe { std::env::set_var("SUDO_POP_FAILLOCK_BIN", "/tmp/fake-faillock") };
+        assert_eq!(
+            faillock_binary().as_deref(),
+            Some("/tmp/fake-faillock"),
+            "a debug build takes the stand-in"
+        );
+        unsafe { std::env::remove_var("SUDO_POP_FAILLOCK_BIN") };
     }
 
     #[test]

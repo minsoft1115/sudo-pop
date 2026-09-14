@@ -381,7 +381,9 @@ for p in $(agent_children); do kill "$p" 2>/dev/null; done
 head_ "6. 잠긴 계정 게이팅 (C1)"
 # deny 는 /etc/security/faillock.conf(이 머신은 10) 에서 온다. 진짜 faillock 을
 # 태우면 sudo·로그인까지 잠기므로, tally 만 10 건으로 흉내 내는 가짜 faillock 을
-# PATH 앞에 두어 게이트만 격리한다. 실제 카운터는 건드리지 않는다.
+# 쓴다. 자식은 faillock 을 절대 경로로만 찾으므로 (rationale §22-8) PATH 로는 끼울 수
+# 없고, 디버그 빌드만 읽는 SUDO_POP_FAILLOCK_BIN 으로 debug 바이너리에 넘긴다 —
+# 12번이 가짜 헬퍼를 넘기는 것과 같은 문이다. 실제 카운터는 건드리지 않는다.
 #
 # 게이트는 polkit-1 PAM 스택이 pam_faillock 을 실제로 돌릴 때만 선다 (rationale §24).
 # Omarchy 의 지문 설정이 만든 /etc/pam.d/polkit-1 은 system-auth 를 include 하지
@@ -420,8 +422,19 @@ for i in $(seq 1 10); do printf '2026-08-19 12:00:%02d RHOST test V
 FAKE
 chmod +x "$WORK/bin/faillock"
 
+# 릴리스에는 그 문이 아예 없어야 한다 — 문자열조차 컴파일되지 않는다.
+DBG6="$ROOT/target/debug/sudo-pop"
+[ -x "$DBG6" ] || cargo build -q
+if grep -q SUDO_POP_FAILLOCK_BIN "$BIN"; then
+  bad "릴리스 바이너리에 SUDO_POP_FAILLOCK_BIN 이 들어 있다"
+elif grep -q SUDO_POP_FAILLOCK_BIN "$DBG6"; then
+  ok "faillock 오버라이드는 debug 에만 있고 릴리스에는 없다"
+else
+  bad "debug 바이너리에도 오버라이드가 없다 — 이 절은 가짜 faillock 을 못 끼운다"
+fi
+
 sleep 60 & LSUBJECT=$!
-( echo test-cookie | PATH="$WORK/bin:$PATH" SUDO_POP_USER="$USER"     SUDO_POP_SUBJECT_PID=$LSUBJECT SUDO_POP_MESSAGE=locked     "$BIN" --agent-prompt >"$WORK/locked.log" 2>&1; echo "exit=$?" >>"$WORK/locked.log" ) &
+( echo test-cookie | SUDO_POP_FAILLOCK_BIN="$WORK/bin/faillock" SUDO_POP_USER="$USER"     SUDO_POP_SUBJECT_PID=$LSUBJECT SUDO_POP_MESSAGE=locked     "$DBG6" --agent-prompt >"$WORK/locked.log" 2>&1; echo "exit=$?" >>"$WORK/locked.log" ) &
 sleep 2
 if [ "$POLKIT_COUNTS" = yes ]; then
   [ "$(windows)" = 0 ] && ok "잠긴 계정이면 창을 띄우지 않는다" || bad "창이 떴다"
