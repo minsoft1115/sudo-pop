@@ -1980,3 +1980,44 @@ session   include system-auth
 사용자를 위한 것이다. 시나리오 6(잠긴 계정 게이팅)은 스택이 세는지 먼저 보고, 세지 않는
 머신에서는 반대로 "잠긴 tally 로도 창이 뜬다" 를 확인한다. 하드코딩된 숫자는 요청당
 `MAX_ATTEMPTS = 3` 과 붉게 칠하는 문턱 3 둘뿐이고, 어느 것도 화면의 잔여 숫자가 아니다.
+
+---
+
+## 25. `omarchy update` 는 우리 창을 거치지 않는다 — 조사
+
+"업데이트 때 지문·비밀번호가 어떻게 들어가나" 를 스크립트로 따라갔다 (Omarchy 4.0.3,
+2026-09-14). 결론은 sudo 자신의 터미널 프롬프트이고, 우리 창은 정상 경로에서 개입하지 않는다.
+
+### 25-1. 흐름
+
+1. 바 위젯(`shell/plugins/bar/widgets/SystemUpdate.qml`)이
+   `omarchy-launch-floating-terminal-with-presentation omarchy-update` 를 부른다. 이것은
+   `xdg-terminal-exec … -e bash -c "omarchy-show-logo; omarchy-update; …"` 로 떠 있는 터미널을
+   연다. `bash -c` 라 `.bashrc` 를 읽지 않으므로 `--init` 이 깐 `alias sudo='sudo-pop'` 은
+   여기서 살아 있지 않고, 어차피 스크립트 안의 `sudo` 는 alias 를 타지 않는다 —
+   `/usr/bin/sudo` 로 간다.
+2. `omarchy-update` 는 자신을 `script -qefc` 아래에서 다시 실행해 tty 를 확보한 뒤
+   `omarchy-update-stay-awake start` 를 부른다. 거기서 stdin 이 tty 이면 **`sudo -v`** 를
+   먼저 실행한다. 이 한 번이 실제 인증이다.
+3. `sudo -v` 는 `/etc/pam.d/sudo` 를 탄다: 덮개 게이트 → `pam_fprintd` (sufficient, 터미널에
+   `Place your finger on the fingerprint reader`, 기본 30초·3회) → 실패·시간 초과면
+   `system-auth` 의 비밀번호 프롬프트가 같은 터미널에 뜬다. 이 경로는 faillock 이 적용된다
+   (§24 의 polkit-1 과 달리 `include system-auth` 가 살아 있다).
+4. 이후의 `sudo pacman -Syu`·`sudo paccache`·`sudo fwupdmgr` 등은 sudo 의 자격 증명
+   타임스탬프로 지나간다. 만료되면 같은 터미널 프롬프트가 다시 나온다.
+
+### 25-2. 우리 창이 뜨는 유일한 경우
+
+stdin 이 tty 가 아니면 `omarchy-update-stay-awake` 는 `sudo` 대신 **`pkexec systemd-inhibit`**
+를 쓴다. 그때만 polkit 을 거쳐 우리 창이 뜬다 — 지문 먼저, 그다음 비밀번호, pkexec 라 25초
+마감은 없다 (§23-1). 바 위젯이나 메뉴에서 시작하면 항상 tty 가 있어 이 갈래는 타지 않는다.
+
+### 25-3. 헤더와 askpass
+
+각 스크립트 머리의 `# omarchy:requires-sudo=true` 는 `omarchy` CLI 가 명령 목록과 JSON 에
+표시하려고 읽는 메타데이터다 (`bin/omarchy` 의 `COMMAND_REQUIRES_SUDO`). 미리 인증을 받거나
+askpass 를 붙이는 데는 쓰이지 않는다. `SUDO_ASKPASS` 나 `sudo -A` 는 업데이트 스크립트 어디에도
+없다. 즉 sudo-pop 의 askpass 경로(§7)도, polkit 경로도 업데이트와는 무관하다.
+
+**따라 나오는 것.** 업데이트 중 지문이 안 되면 그것은 sudo 의 `pam_fprintd` 이지 우리가 아니다.
+fprintd 가 막힌 상태(§22-6)면 터미널 프롬프트도 곧장 비밀번호로 간다.
