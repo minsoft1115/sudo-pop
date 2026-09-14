@@ -1879,6 +1879,8 @@ polkitd 가 subject 로 넘기는 pid 는 run0 자신이고 (저널: `system-bus
 
 ## 24. 잔여 횟수가 멈춘 날 — polkit-1 에서 faillock 이 빠졌다
 
+증거와 경위를 upstream 보고용으로 모은 것은 [`omarchy-polkit-pam.md`](omarchy-polkit-pam.md).
+
 ### 24-1. 관찰과 원인
 
 지문 대기가 붙은 뒤 사용자가 봤다: 비밀번호를 틀려 `Wrong password` 가 떴는데 아랫줄의
