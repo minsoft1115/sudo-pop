@@ -130,10 +130,10 @@ enum Phase {
         close_at: Instant,
     },
     Fingerprint {
-        /// The last thing PAM said went wrong at the sensor, drawn in place
-        /// of the hint. We do not count these: pam_fprintd sends the same
-        /// kind of message for a bad swipe it does not charge a try for.
+        /// The last displayed sensor error, as before the animation change.
+        /// Informational PAM messages never replace it or restart its pulse.
         notice: Option<String>,
+        feedback_at: Option<Instant>,
     },
     Password {
         /// Our own 30s backstop, fresh with every prompt. `None` only while
@@ -161,6 +161,18 @@ enum Phase {
 /// polkitd then cancels the request, which closes this window on its own. This
 /// is only a backstop for a cancel that never arrives.
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A single neutral pulse per received response, never a sensor-progress loop.
+const FINGERPRINT_FEEDBACK_DURATION: Duration = Duration::from_millis(400);
+
+fn fingerprint_feedback_strength(started: Option<Instant>, now: Instant) -> f32 {
+    let Some(started) = started else {
+        return 0.0;
+    };
+    let progress = now.saturating_duration_since(started).as_secs_f32()
+        / FINGERPRINT_FEEDBACK_DURATION.as_secs_f32();
+    (1.0 - progress).clamp(0.0, 1.0).powi(2)
+}
 
 /// What the helper thread tells the window.
 pub enum ToUi {
@@ -321,7 +333,10 @@ impl Window {
     ) -> Self {
         let came_from_fingerprint = subject.fingerprint_wait;
         let phase = if subject.fingerprint_wait {
-            Phase::Fingerprint { notice: None }
+            Phase::Fingerprint {
+                notice: None,
+                feedback_at: None,
+            }
         } else {
             // A password window is armed from the moment it opens: a helper
             // that never gets round to asking must not leave it up forever.
@@ -411,9 +426,13 @@ impl Window {
                 }
                 Ok(ToUi::PamError(text)) => {
                     match &mut self.phase {
-                        Phase::Fingerprint { notice } => {
+                        Phase::Fingerprint {
+                            notice,
+                            feedback_at,
+                        } => {
                             Self::cover_with(&mut self.chain, ctx, &text);
                             *notice = Some(text);
+                            *feedback_at = Some(Instant::now());
                         }
                         Phase::Password {
                             notice, pam_muted, ..
@@ -434,7 +453,13 @@ impl Window {
                     let wrong = text == crate::attempts::WRONG_PASSWORD;
                     let from_fingerprint = self.came_from_fingerprint;
                     match &mut self.phase {
-                        Phase::Fingerprint { notice } => *notice = Some(text),
+                        Phase::Fingerprint {
+                            notice,
+                            feedback_at,
+                        } => {
+                            *notice = Some(text);
+                            *feedback_at = Some(Instant::now());
+                        }
                         Phase::Locked { .. } => {}
                         Phase::Password {
                             waiting,
@@ -542,24 +567,43 @@ impl Window {
     /// the hint's place. No field, no count -- pam_fprintd keeps its own tally
     /// and does not publish it, and the faillock line does not apply here.
     fn draw_fingerprint_phase(&self, ui: &mut egui::Ui) {
-        let Phase::Fingerprint { notice } = &self.phase else {
+        let Phase::Fingerprint {
+            notice,
+            feedback_at,
+        } = &self.phase
+        else {
             return;
         };
+        let strength = fingerprint_feedback_strength(*feedback_at, Instant::now());
         let color = if notice.is_some() {
             ui.visuals().error_fg_color
         } else {
             ui.visuals().hyperlink_color
         };
-        ui.add(egui::Label::new(
+        let icon = ui.add(egui::Label::new(
             egui::RichText::new(FINGERPRINT_GLYPH)
                 .size(28.0)
                 .family(egui::FontFamily::Monospace)
-                .color(color),
+                .color(color.gamma_multiply(1.0 + 0.35 * strength)),
         ));
+        if strength > 0.0 {
+            // Painting outside the glyph's rectangle never changes layout.
+            let radius = icon.rect.height() * 0.5 + 2.0 + 4.0 * (1.0 - strength);
+            ui.painter().circle_stroke(
+                icon.rect.center(),
+                radius,
+                egui::Stroke::new(1.25, color.gamma_multiply(0.65 * strength)),
+            );
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        }
         ui.add_space(6.0);
         match notice {
             Some(text) => {
-                ui.label(egui::RichText::new(text).size(11.0).color(color));
+                ui.label(
+                    egui::RichText::new(text)
+                        .size(11.0)
+                        .color(color.gamma_multiply(1.0 + 0.35 * strength)),
+                );
             }
             None => {
                 ui.label(egui::RichText::new(FINGERPRINT_HINT).size(11.0).weak());
@@ -808,6 +852,160 @@ impl eframe::App for Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identical_fingerprint_responses_restart_feedback_and_prompt_ends_it() {
+        let (tx, to_ui) = std::sync::mpsc::channel();
+        let (from_ui, _rx) = std::sync::mpsc::channel();
+        let subject = Subject {
+            command: None,
+            message: "test".into(),
+            purpose: None,
+            user: None,
+            attempts: None,
+            deadline: None,
+            fingerprint_wait: true,
+        };
+        let mut window = Window::new(subject, font::Chain::new(), to_ui, from_ui, MIN_WIDTH);
+        let ctx = egui::Context::default();
+        let Phase::Fingerprint { feedback_at, .. } = &window.phase else {
+            panic!()
+        };
+        assert!(feedback_at.is_none(), "waiting alone must not animate");
+        tx.send(ToUi::Info(
+            "PAM instruction that was never displayed".into(),
+        ))
+        .unwrap();
+        assert!(window.drain(&ctx));
+        let Phase::Fingerprint {
+            notice,
+            feedback_at,
+        } = &window.phase
+        else {
+            panic!()
+        };
+        assert!(
+            notice.is_none(),
+            "initial hint must remain Touch the sensor"
+        );
+        assert!(
+            feedback_at.is_none(),
+            "hidden info must not trigger feedback"
+        );
+        for event in [
+            ToUi::PamError("same response".into()),
+            ToUi::PamError("same response".into()),
+        ] {
+            let old = Instant::now() - FINGERPRINT_FEEDBACK_DURATION;
+            if let Phase::Fingerprint { feedback_at, .. } = &mut window.phase {
+                *feedback_at = Some(old);
+            }
+            tx.send(event).unwrap();
+            assert!(window.drain(&ctx));
+            let Phase::Fingerprint {
+                notice,
+                feedback_at,
+            } = &window.phase
+            else {
+                panic!()
+            };
+            assert_eq!(notice.as_deref(), Some("same response"));
+            let started = feedback_at.unwrap();
+            assert!(started > old);
+            assert_eq!(fingerprint_feedback_strength(*feedback_at, started), 1.0);
+            assert_eq!(
+                fingerprint_feedback_strength(
+                    *feedback_at,
+                    started + FINGERPRINT_FEEDBACK_DURATION
+                ),
+                0.0
+            );
+            tx.send(ToUi::Info("different instruction".into())).unwrap();
+            assert!(window.drain(&ctx));
+            let Phase::Fingerprint {
+                notice,
+                feedback_at,
+            } = &window.phase
+            else {
+                panic!()
+            };
+            assert_eq!(
+                *feedback_at,
+                Some(started),
+                "hidden info cannot restart feedback"
+            );
+            assert_eq!(
+                notice.as_deref(),
+                Some("same response"),
+                "hidden info cannot replace an error"
+            );
+        }
+        tx.send(ToUi::Prompt {
+            text: "Password:".into(),
+            echo: false,
+        })
+        .unwrap();
+        assert!(window.drain(&ctx));
+        assert!(matches!(window.phase, Phase::Password { .. }));
+    }
+
+    #[test]
+    fn fingerprint_pulse_does_not_change_layout_and_disappears_when_idle() {
+        let (_tx, to_ui) = std::sync::mpsc::channel();
+        let (from_ui, _rx) = std::sync::mpsc::channel();
+        let subject = Subject {
+            command: None,
+            message: "test".into(),
+            purpose: None,
+            user: None,
+            attempts: None,
+            deadline: None,
+            fingerprint_wait: true,
+        };
+        let mut window = Window::new(subject, font::Chain::new(), to_ui, from_ui, MIN_WIDTH);
+        let ctx = egui::Context::default();
+        let mut bounds = Vec::new();
+        for active in [true, false] {
+            window.phase = Phase::Fingerprint {
+                notice: Some("same response".into()),
+                feedback_at: Some(if active {
+                    Instant::now()
+                } else {
+                    Instant::now() - FINGERPRINT_FEEDBACK_DURATION
+                }),
+            };
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::Frame::central_panel(ui.style())
+                    .inner_margin(PANEL_MARGIN as i8)
+                    .show(ui, |ui| {
+                        ui.vertical_centered_justified(|ui| {
+                            window.draw_fingerprint_phase(ui);
+                            bounds.push(ui.min_rect());
+                        });
+                    });
+            });
+            output.textures_delta.clear();
+            let has_ring = output
+                .shapes
+                .iter()
+                .any(|s| matches!(s.shape, egui::epaint::Shape::Circle(_)));
+            assert_eq!(has_ring, active);
+            for shape in &output.shapes {
+                if let egui::epaint::Shape::Circle(circle) = &shape.shape {
+                    assert!(
+                        circle.radius < 30.0,
+                        "ring must follow glyph height, not the full row: {}",
+                        circle.radius
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            bounds.first(),
+            bounds.last(),
+            "feedback must not move the icon or text"
+        );
+    }
 
     /// Exercise the real input hook and field, without forcing focus each frame.
     fn input_frame(
