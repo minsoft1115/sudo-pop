@@ -10,7 +10,7 @@
 # mistake this tool should not make.
 #
 # --uninstall reverses it, in the order that matters: --uninit first, binary
-# second. The other way round leaves the shell alias pointing at nothing.
+# second. The other way round leaves the shell wiring pointing at nothing.
 #
 # What gets installed is the polkit authentication agent and the sudo router
 # in front of it; see docs/polkit-agent.md. The previous implementation is kept
@@ -66,7 +66,7 @@ done
 
 # --- preflight ---------------------------------------------------------------
 
-# --init writes a shell alias, Hyprland rules and a systemd user unit into
+# --init writes a PATH wrapper, Hyprland rules and a systemd user unit into
 # $HOME. As root those land in root's home, where they are useless at best.
 [ "$(id -u)" -eq 0 ] && die "do not run this as root — it installs into \$HOME and needs no privileges"
 [ -n "${HOME:-}" ] || die "HOME is unset"
@@ -76,11 +76,12 @@ done
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
 
 # What --init writes, removed without the binary's help. Needed when the binary
-# is already gone, which is exactly when the leftover alias hurts most.
+# is already gone, which is exactly when the leftover wrapper hurts most.
 remove_by_hand() {
   local f hypr="$CONFIG/hypr/hyprland.lua"
 
-  for f in "$CONFIG/minsoft1115/bash/sudo-pop.sh" \
+  for f in "$HOME/.local/lib/sudo-pop/bin/sudo" \
+           "$CONFIG/minsoft1115/bash/sudo-pop.sh" \
            "$CONFIG/minsoft1115/hypr/sudo-pop.lua" \
            "$CONFIG/systemd/user/sudo-pop-agent.service"; do
     if [ -e "$f" ]; then
@@ -144,9 +145,9 @@ on Omarchy that is:
 
   omarchy plugin enable omarchy.polkit
 
-This shell still has the alias until you drop it:
+Open a new shell to refresh PATH, or clear its command cache:
 
-  unalias sudo       or just open a new shell
+  hash -r
 DONE
 }
 
@@ -231,7 +232,7 @@ say "installed $PREFIX/sudo-pop"
 
 case ":$PATH:" in
   *":$PREFIX:"*) ;;
-  *) warn "$PREFIX is not on PATH — the sudo alias will not resolve.
+  *) warn "$PREFIX is not on PATH — the sudo-pop command will not resolve by name.
   add it, for example:  echo 'export PATH=\"$PREFIX:\$PATH\"' >> ~/.bashrc" ;;
 esac
 
@@ -251,9 +252,10 @@ cat <<DONE
 
 ${B}Done.${N} Open a new shell, or: source ~/.bashrc
 
-  sudo pacman -Syu     goes through run0, and the agent draws the prompt
-  sudo -E make         stays on sudo, with the same window supplying the password
-  /usr/bin/sudo ...    always the real sudo, alias or not
+  sudo pacman -Syu     uses run0/polkit with sudo-pop's authentication window
+  child scripts       inherit the same sudo wrapper through PATH
+  run0 ...            uses polkit and sudo-pop's fingerprint/password window
+  /usr/bin/sudo ...    always the real sudo, bypassing the PATH wrapper
 
 To remove it:
 

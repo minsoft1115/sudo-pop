@@ -124,7 +124,7 @@ impl Budget {
     /// "how much room is left" is worth knowing before it is nearly gone.
     ///
     /// `None` only when the account is already locked, which `refusal` speaks
-    /// to instead and which never reaches a window anyway.
+    /// to instead, without a password field.
     pub fn status(&self) -> Option<(String, bool)> {
         (self.remaining > 0).then(|| {
             (

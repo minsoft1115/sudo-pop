@@ -1,6 +1,6 @@
 [package]
 name = "sudo-pop"
-version = "0.2.0-spike"
+version = "0.2.1-spike"
 edition = "2024"
 description = "polkit authentication agent for Omarchy (in progress)"
 license = "MIT"

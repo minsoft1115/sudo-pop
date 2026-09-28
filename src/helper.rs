@@ -107,6 +107,11 @@ pub trait Conversation {
     /// Something on our side went wrong: the helper is unreachable, the
     /// answer was rejected, the account is locked.
     fn error(&mut self, text: &str);
+    /// Password entry is blocked by faillock. End authentication, but let the
+    /// window display the reason without offering another input field.
+    fn locked(&mut self, text: &str) {
+        self.error(text);
+    }
     /// A `PAM_ERROR_MSG` from a module -- PAM's own words, which the window
     /// may mute while a retry is back at the sensor. Ours never are.
     fn pam_error(&mut self, text: &str) {

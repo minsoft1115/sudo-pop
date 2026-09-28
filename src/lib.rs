@@ -18,6 +18,7 @@ pub mod pam;
 pub mod paths;
 pub mod prompt;
 pub mod secret;
+mod secure_input;
 pub mod sudo_args;
 pub mod theme;
 pub mod wrapper;

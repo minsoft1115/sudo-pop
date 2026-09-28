@@ -125,6 +125,10 @@ fn window_height(fingerprint: bool) -> f32 {
 
 /// Fingerprint and password do not share counters, clocks, or messages.
 enum Phase {
+    Locked {
+        reason: String,
+        close_at: Instant,
+    },
     Fingerprint {
         /// The last thing PAM said went wrong at the sensor, drawn in place
         /// of the hint. We do not count these: pam_fprintd sends the same
@@ -172,6 +176,9 @@ pub enum ToUi {
     /// phase in the hint's place; in the password phase unless muted.
     PamError(String),
     Attempts(Option<(String, bool)>),
+    /// Authentication has stopped. Show a notice without any input for five
+    /// seconds (or until Esc / caller cancellation), even after Done arrives.
+    Locked(String),
     /// The conversation is over; close.
     Done,
 }
@@ -298,6 +305,7 @@ struct Window {
     to_ui: Receiver<ToUi>,
     from_ui: Sender<FromUi>,
     password: Secret,
+    secure_input: crate::secure_input::SecureInput,
     width: f32,
     phase: Phase,
     came_from_fingerprint: bool,
@@ -333,6 +341,7 @@ impl Window {
             to_ui,
             from_ui,
             password: Secret::new(),
+            secure_input: Default::default(),
             width,
             phase,
             came_from_fingerprint,
@@ -363,6 +372,7 @@ impl Window {
                     self.cover(ctx, &text);
                     match &mut self.phase {
                         Phase::Fingerprint { .. } => self.enter_password(ctx, text, echo),
+                        Phase::Locked { .. } => {}
                         // The notice stays: a re-prompt follows `Wrong
                         // password` within milliseconds, and clearing it here
                         // would wipe the line before a frame draws it. It
@@ -376,6 +386,10 @@ impl Window {
                             pam_muted,
                             ..
                         } => {
+                            if *echo_slot != echo {
+                                self.password.wipe();
+                                self.secure_input.clear();
+                            }
                             *prompt = text;
                             *echo_slot = echo;
                             *waiting = false;
@@ -412,6 +426,7 @@ impl Window {
                                 *notice = Some((text, true));
                             }
                         }
+                        Phase::Locked { .. } => {}
                     }
                 }
                 Ok(ToUi::Error(text)) => {
@@ -420,6 +435,7 @@ impl Window {
                     let from_fingerprint = self.came_from_fingerprint;
                     match &mut self.phase {
                         Phase::Fingerprint { notice } => *notice = Some(text),
+                        Phase::Locked { .. } => {}
                         Phase::Password {
                             waiting,
                             focus_set,
@@ -447,7 +463,18 @@ impl Window {
                 Ok(ToUi::Attempts(attempts)) => {
                     self.subject.attempts = attempts;
                 }
-                Ok(ToUi::Done) | Err(TryRecvError::Disconnected) => return false,
+                Ok(ToUi::Locked(reason)) => {
+                    self.cover(ctx, &reason);
+                    self.password.wipe();
+                    self.subject.attempts = None;
+                    self.phase = Phase::Locked {
+                        reason,
+                        close_at: Instant::now() + Duration::from_secs(5),
+                    };
+                }
+                Ok(ToUi::Done) | Err(TryRecvError::Disconnected) => {
+                    return matches!(self.phase, Phase::Locked { .. }) && !self.backstop_hit();
+                }
                 Err(TryRecvError::Empty) => return true,
             }
         }
@@ -479,6 +506,9 @@ impl Window {
     }
 
     fn submit(&mut self) {
+        if !matches!(self.phase, Phase::Password { waiting: false, .. }) {
+            return;
+        }
         let password = std::mem::take(&mut self.password);
         let _ = self.from_ui.send(FromUi::Answer(password));
         self.password = Secret::new();
@@ -492,6 +522,7 @@ impl Window {
     }
 
     fn cancel(&mut self, ctx: &egui::Context) {
+        self.secure_input.clear();
         self.password.wipe();
         let _ = self.from_ui.send(FromUi::Cancel);
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -499,6 +530,7 @@ impl Window {
 
     fn backstop_hit(&self) -> bool {
         match self.phase {
+            Phase::Locked { close_at, .. } => Instant::now() >= close_at,
             Phase::Password {
                 backstop: Some(t), ..
             } => Instant::now() >= t,
@@ -545,7 +577,7 @@ impl Window {
                 notice,
                 ..
             } => (*waiting, *echo, prompt.clone(), notice.clone()),
-            Phase::Fingerprint { .. } => return false,
+            Phase::Fingerprint { .. } | Phase::Locked { .. } => return false,
         };
 
         if echo && !prompt.is_empty() {
@@ -572,15 +604,18 @@ impl Window {
                     ),
                 );
                 ui.add_space(LOCK_GAP);
+                let mut buffer = self.secure_input.buffer(&mut self.password, echo);
                 let field = ui.add_enabled(
                     !waiting,
-                    egui::TextEdit::singleline(self.password.buffer_mut())
+                    egui::TextEdit::singleline(&mut buffer)
+                        .id(egui::Id::new(crate::secure_input::FIELD_ID))
                         .password(!echo)
                         .char_limit(crate::secret::MAX_CHARS)
                         .font(egui::TextStyle::Monospace)
                         .margin(egui::Margin::symmetric(10, 8))
                         .desired_width(FIELD_ROW_WIDTH - LOCK_WIDTH - LOCK_GAP),
                 );
+                drop(buffer);
                 if let Phase::Password {
                     focus_set, waiting, ..
                 } = &mut self.phase
@@ -645,6 +680,15 @@ impl Window {
 }
 
 impl eframe::App for Window {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        let field_focused =
+            ctx.memory(|m| m.has_focus(egui::Id::new(crate::secure_input::FIELD_ID)));
+        let accept = raw.focused
+            && matches!(self.phase,
+            Phase::Password { waiting: false, focus_set, .. } if field_focused || !focus_set);
+        self.secure_input.protect(raw, accept);
+    }
+
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         visuals.panel_fill.to_normalized_gamma_f32()
     }
@@ -653,6 +697,7 @@ impl eframe::App for Window {
         let ctx = ui.ctx().clone();
 
         if !self.drain(&ctx) {
+            self.secure_input.clear();
             self.password.wipe();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -728,11 +773,21 @@ impl eframe::App for Window {
                     ui.add_space(if fingerprint { 10.0 } else { 18.0 });
                     if fingerprint {
                         self.draw_fingerprint_phase(ui);
+                    } else if let Phase::Locked { reason, .. } = &self.phase {
+                        ui.label(
+                            egui::RichText::new(reason)
+                                .size(11.0)
+                                .color(ui.visuals().error_fg_color),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Press Esc to close").size(11.0).weak());
                     } else if self.draw_password_phase(ui) {
                         self.submit();
                     }
                 });
             });
+
+        self.secure_input.clear();
 
         if let Some(left) = self.seconds_left() {
             let text = egui::RichText::new(format!("{left}s")).size(11.0);
@@ -753,6 +808,185 @@ impl eframe::App for Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise the real input hook and field, without forcing focus each frame.
+    fn input_frame(
+        window: &mut Window,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        focused: bool,
+    ) {
+        use eframe::App;
+        let mut raw = egui::RawInput {
+            events,
+            focused,
+            ..Default::default()
+        };
+        window.raw_input_hook(ctx, &mut raw);
+        let mut output = ctx.run_ui(raw, |ui| {
+            if window.drain(ctx) && window.draw_password_phase(ui) {
+                window.submit();
+            }
+            window.secure_input.clear();
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn real_input_hook_preserves_submission_and_rejects_unfocused_or_waiting_input() {
+        let (tx, to_ui) = std::sync::mpsc::channel();
+        let (from_ui, rx) = std::sync::mpsc::channel();
+        let subject = Subject {
+            command: None,
+            message: "test".into(),
+            purpose: None,
+            user: None,
+            attempts: None,
+            deadline: None,
+            fingerprint_wait: false,
+        };
+        let mut window = Window::new(subject, font::Chain::new(), to_ui, from_ui, MIN_WIDTH);
+        let ctx = egui::Context::default();
+        let enter = || egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        input_frame(&mut window, &ctx, vec![], true);
+        input_frame(
+            &mut window,
+            &ctx,
+            vec![
+                egui::Event::WindowFocused(false),
+                egui::Event::Text("discard".into()),
+            ],
+            false,
+        );
+        assert!(window.password.is_empty());
+        input_frame(
+            &mut window,
+            &ctx,
+            vec![egui::Event::WindowFocused(true)],
+            true,
+        );
+        input_frame(
+            &mut window,
+            &ctx,
+            vec![egui::Event::Paste("  한🔐  ".into()), enter()],
+            true,
+        );
+        let FromUi::Answer(answer) = rx.try_recv().expect("Enter must submit") else {
+            panic!()
+        };
+        assert_eq!(answer.as_bytes(), "  한🔐  ".as_bytes());
+        assert!(window.password.is_empty());
+        input_frame(
+            &mut window,
+            &ctx,
+            vec![egui::Event::Text("while checking".into()), enter()],
+            true,
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(window.password.is_empty());
+        tx.send(ToUi::Prompt {
+            text: "Password:".into(),
+            echo: false,
+        })
+        .unwrap();
+        input_frame(&mut window, &ctx, vec![], true);
+        input_frame(
+            &mut window,
+            &ctx,
+            vec![egui::Event::Text("retry".into()), enter()],
+            true,
+        );
+        let FromUi::Answer(answer) = rx.try_recv().expect("retry must submit") else {
+            panic!()
+        };
+        assert_eq!(answer.as_bytes(), b"retry");
+    }
+
+    #[test]
+    fn changing_to_an_echoed_prompt_discards_hidden_input_before_rendering() {
+        use eframe::App;
+        let (tx, to_ui) = std::sync::mpsc::channel();
+        let (from_ui, _rx) = std::sync::mpsc::channel();
+        let subject = Subject {
+            command: None,
+            message: "test".into(),
+            purpose: None,
+            user: None,
+            attempts: None,
+            deadline: None,
+            fingerprint_wait: false,
+        };
+        let mut window = Window::new(subject, font::Chain::new(), to_ui, from_ui, MIN_WIDTH);
+        window.password.buffer_mut().push_str("hidden password");
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput {
+            events: vec![egui::Event::Text("pending password".into())],
+            focused: true,
+            ..Default::default()
+        };
+        window.raw_input_hook(&ctx, &mut raw);
+        tx.send(ToUi::Prompt {
+            text: "Username:".into(),
+            echo: true,
+        })
+        .unwrap();
+        assert!(window.drain(&ctx));
+        assert!(window.password.is_empty());
+        let egui::Event::Text(token) = &raw.events[0] else {
+            panic!()
+        };
+        let mut buffer = window.secure_input.buffer(&mut window.password, true);
+        assert_eq!(
+            egui::TextBuffer::insert_text(&mut buffer, token, egui::text::CharIndex(0)),
+            0
+        );
+    }
+
+    #[test]
+    fn a_lock_notice_survives_helper_completion_and_never_accepts_input() {
+        for fingerprint_wait in [false, true] {
+            let (tx, to_ui) = std::sync::mpsc::channel();
+            let (from_ui, rx) = std::sync::mpsc::channel();
+            let subject = Subject {
+                command: None,
+                message: "test".into(),
+                purpose: None,
+                user: None,
+                attempts: None,
+                deadline: None,
+                fingerprint_wait,
+            };
+            let mut window = Window::new(subject, font::Chain::new(), to_ui, from_ui, MIN_WIDTH);
+            window.password.buffer_mut().push_str("discard me");
+            tx.send(ToUi::Locked("account locked, 60s to go".into()))
+                .unwrap();
+            tx.send(ToUi::Done).unwrap();
+            drop(tx);
+            let ctx = egui::Context::default();
+            assert!(
+                window.drain(&ctx),
+                "Done must not erase the notice before a frame"
+            );
+            assert!(
+                window.drain(&ctx),
+                "disconnection must also preserve the notice"
+            );
+            assert!(window.password.is_empty());
+            window.submit();
+            assert!(rx.try_recv().is_err(), "a locked window cannot submit");
+            let Phase::Locked { close_at, .. } = &mut window.phase else {
+                panic!("expected lock notice")
+            };
+            *close_at = Instant::now() - Duration::from_secs(1);
+            assert!(!window.drain(&ctx), "the notice eventually closes");
+        }
+    }
 
     /// The window is not unit-testable -- it owns an event loop -- but the
     /// countdown's arithmetic is, and getting it wrong is visible every second.

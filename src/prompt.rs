@@ -62,10 +62,24 @@ struct WindowConversation {
     /// Typed while PAM was still in `pam_fprintd` after a wrong password.
     /// `cancelled` must not wipe it — the next `ask` is that password.
     pending: std::sync::Mutex<Option<Secret>>,
+    get_budget: fn() -> Option<attempts::Budget>,
 }
 
 impl Conversation for WindowConversation {
     fn ask(&mut self, prompt: &str, echo: bool) -> Option<Secret> {
+        // PAM may authenticate a locked account by fingerprint before it ever
+        // asks a question. Gate input here, not the helper's startup. Re-read
+        // because another request may have locked the account during the wait.
+        if let Some(reason) = (self.get_budget)()
+            .as_ref()
+            .and_then(attempts::Budget::refusal)
+        {
+            if let Some(mut secret) = self.pending.lock().ok()?.take() {
+                secret.wipe();
+            }
+            self.locked(&reason);
+            return None;
+        }
         self.to_ui
             .send(ToUi::Prompt {
                 text: prompt.to_owned(),
@@ -82,10 +96,22 @@ impl Conversation for WindowConversation {
             }
             secret.wipe();
         }
-        match self.from_ui.recv() {
+        let mut answer = match self.from_ui.recv() {
             Ok(FromUi::Answer(secret)) => Some(secret),
             _ => None,
+        };
+        // The account may also have locked while the user was typing.
+        if let Some(reason) = (self.get_budget)()
+            .as_ref()
+            .and_then(attempts::Budget::refusal)
+        {
+            if let Some(ref mut secret) = answer {
+                secret.wipe();
+            }
+            self.locked(&reason);
+            return None;
         }
+        answer
     }
 
     fn info(&mut self, text: &str) {
@@ -94,6 +120,11 @@ impl Conversation for WindowConversation {
 
     fn error(&mut self, text: &str) {
         let _ = self.to_ui.send(ToUi::Error(text.to_owned()));
+    }
+
+    fn locked(&mut self, text: &str) {
+        eprintln!("sudo-pop: {text}");
+        let _ = self.to_ui.send(ToUi::Locked(text.to_owned()));
     }
 
     fn pam_error(&mut self, text: &str) {
@@ -155,7 +186,8 @@ fn run_attempts_with(
             Outcome::Failed if attempt < MAX_ATTEMPTS => {
                 let budget = get_budget();
                 if let Some(ref b) = budget {
-                    if b.is_locked() {
+                    if let Some(reason) = b.refusal() {
+                        conv.locked(&reason);
                         return Outcome::Cancelled;
                     }
                     conv.update_attempts(b.status());
@@ -170,6 +202,22 @@ fn run_attempts_with(
         }
     }
     last
+}
+
+/// A password lock does not preempt PAM's fingerprint opportunity. Without
+/// that opportunity, do not start a helper just to refuse its first question.
+fn begin_authentication(
+    conv: &mut dyn Conversation,
+    fingerprint_wait: bool,
+    locked: Option<String>,
+    authenticate: impl FnOnce(&mut dyn Conversation) -> Outcome,
+) -> Outcome {
+    if let Some(reason) = locked.filter(|_| !fingerprint_wait) {
+        conv.locked(&reason);
+        Outcome::Cancelled
+    } else {
+        authenticate(conv)
+    }
 }
 
 /// Entry point for prompt mode. Never returns.
@@ -201,19 +249,10 @@ pub fn run() -> ! {
         std::process::exit(EXIT_FAILED);
     }
 
-    // faillock is shared with sudo and login (deny=10), so a prompt spent on a
-    // locked account only burns everyone's budget. The live tally is also the
-    // cross-cookie cap: each request re-reads it, so repeated requests cannot
-    // hand out three fresh attempts each once the account is close to locking.
-    // None of that holds where the polkit-1 stack has no pam_faillock (Omarchy
-    // after a fingerprint setup); then there is no budget to show or enforce.
+    // A locked password must not preempt PAM's fingerprint opportunity.
+    // Stacks without pam_faillock have no budget to show or enforce.
     let budget = attempts::budget(attempts::POLKIT_SERVICE);
-    if let Some(reason) = budget.as_ref().and_then(attempts::Budget::refusal) {
-        // Report as cancelled, not failed: a failure has polkitd re-issue the
-        // request and the window would reopen forever (see helper.rs, §3-3).
-        eprintln!("sudo-pop: {reason}");
-        std::process::exit(EXIT_CANCELLED);
-    }
+    let locked = budget.as_ref().and_then(attempts::Budget::refusal);
     let attempts = budget.and_then(|budget| budget.status());
 
     // The agent measured this from the moment polkitd called it, so a request
@@ -241,10 +280,20 @@ pub fn run() -> ! {
             to_ui: to_ui_tx.clone(),
             from_ui: from_ui_rx,
             pending: std::sync::Mutex::new(None),
+            get_budget: || attempts::budget(attempts::POLKIT_SERVICE),
         };
-        let last = run_attempts(&mut conv, |conv| {
-            helper::authenticate(&username, &cookie, conv)
+        let last = begin_authentication(&mut conv, fingerprint_wait, locked, |conv| {
+            run_attempts(conv, |conv| helper::authenticate(&username, &cookie, conv))
         });
+        // Some PAM stacks refuse a locked account without asking a question.
+        // There was no ask() at which to show the lock notice in that case.
+        if matches!(last, Outcome::RefusedWithoutPrompt | Outcome::Failed)
+            && let Some(reason) = (conv.get_budget)()
+                .as_ref()
+                .and_then(attempts::Budget::refusal)
+        {
+            conv.locked(&reason);
+        }
         let _ = to_ui_tx.send(ToUi::Done);
         last
     });
@@ -291,6 +340,139 @@ fn exit_for(outcome: Outcome) -> i32 {
 mod tests {
     use super::*;
 
+    fn locked_budget() -> Option<attempts::Budget> {
+        Some(attempts::Budget {
+            remaining: 0,
+            unlock_in: Some(60),
+        })
+    }
+
+    #[test]
+    fn a_locked_account_can_authenticate_without_a_password_prompt() {
+        let (to_ui, rx) = channel();
+        let (_tx, from_ui) = channel();
+        let mut conv = WindowConversation {
+            to_ui,
+            from_ui,
+            pending: std::sync::Mutex::new(None),
+            get_budget: locked_budget,
+        };
+        let outcome = begin_authentication(
+            &mut conv,
+            true,
+            locked_budget().unwrap().refusal(),
+            |conv| {
+                conv.info("Place your finger");
+                // Like pam_fprintd sufficient: success without ask().
+                Outcome::Success
+            },
+        );
+        assert_eq!(outcome, Outcome::Success);
+        assert_eq!(exit_for(outcome), EXIT_SUCCESS);
+        assert!(matches!(rx.try_recv(), Ok(ToUi::Info(_))));
+        assert!(rx.try_recv().is_err(), "no lock refusal or password field");
+    }
+
+    #[test]
+    fn a_locked_account_without_a_sensor_opportunity_never_starts_a_helper() {
+        let mut rec = Rec {
+            errors: vec![],
+            attempts: vec![],
+        };
+        let outcome =
+            begin_authentication(&mut rec, false, locked_budget().unwrap().refusal(), |_| {
+                panic!("no helper when fingerprint is absent or the lid is closed")
+            });
+        assert_eq!(outcome, Outcome::Cancelled);
+        assert_eq!(rec.errors, vec!["account locked, 60s to go"]);
+    }
+
+    #[test]
+    fn fingerprint_fallback_never_sends_a_stashed_password_when_locked() {
+        for echo in [false, true] {
+            let (to_ui, rx) = channel();
+            let (_tx, from_ui) = channel();
+            let mut secret = Secret::new();
+            secret.buffer_mut().push_str("must not reach PAM");
+            let mut conv = WindowConversation {
+                to_ui,
+                from_ui,
+                pending: std::sync::Mutex::new(Some(secret)),
+                get_budget: locked_budget,
+            };
+            assert!(conv.ask("Password:", echo).is_none());
+            assert!(conv.pending.lock().unwrap().is_none());
+            assert!(
+                matches!(rx.try_recv(), Ok(ToUi::Locked(t)) if t == "account locked, 60s to go")
+            );
+            assert!(rx.try_recv().is_err(), "must not open an input field");
+        }
+    }
+
+    #[test]
+    fn a_lock_cleared_during_fingerprint_wait_allows_password_fallback() {
+        let (to_ui, rx) = channel();
+        let (tx, from_ui) = channel();
+        let mut secret = Secret::new();
+        secret.buffer_mut().push_str("password");
+        tx.send(FromUi::Answer(secret)).unwrap();
+        let mut conv = WindowConversation {
+            to_ui,
+            from_ui,
+            pending: std::sync::Mutex::new(None),
+            get_budget: || {
+                Some(attempts::Budget {
+                    remaining: 10,
+                    unlock_in: None,
+                })
+            },
+        };
+        let outcome = begin_authentication(
+            &mut conv,
+            true,
+            locked_budget().unwrap().refusal(),
+            |conv| {
+                assert_eq!(
+                    conv.ask("Password:", false).unwrap().as_bytes(),
+                    b"password"
+                );
+                Outcome::Success
+            },
+        );
+        assert_eq!(outcome, Outcome::Success);
+        assert!(matches!(rx.try_recv(), Ok(ToUi::Prompt { .. })));
+    }
+
+    #[test]
+    fn a_lock_while_typing_prevents_the_answer_from_reaching_pam() {
+        use std::sync::atomic::AtomicUsize;
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        READS.store(0, Ordering::Relaxed);
+        let (to_ui, rx) = channel();
+        let (tx, from_ui) = channel();
+        let mut secret = Secret::new();
+        secret.buffer_mut().push_str("do not send");
+        tx.send(FromUi::Answer(secret)).unwrap();
+        let mut conv = WindowConversation {
+            to_ui,
+            from_ui,
+            pending: std::sync::Mutex::new(None),
+            get_budget: || {
+                if READS.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Some(attempts::Budget {
+                        remaining: 1,
+                        unlock_in: None,
+                    })
+                } else {
+                    locked_budget()
+                }
+            },
+        };
+        assert!(conv.ask("Password:", false).is_none());
+        assert!(matches!(rx.try_recv(), Ok(ToUi::Prompt { .. })));
+        assert!(matches!(rx.try_recv(), Ok(ToUi::Locked(_))));
+    }
+
     #[test]
     fn a_helper_that_died_is_retried_without_a_wrong_password() {
         let mut budget_reads = 0;
@@ -325,6 +507,7 @@ mod tests {
             to_ui,
             from_ui,
             pending: std::sync::Mutex::new(None),
+            get_budget: || None,
         };
         conv.pam_error("Failed to match fingerprint");
         conv.error("helper went away");
@@ -340,6 +523,7 @@ mod tests {
             to_ui,
             from_ui,
             pending: std::sync::Mutex::new(None),
+            get_budget: || None,
         };
         assert!(!conv.cancelled(), "nothing has happened yet");
         TERMINATED.store(true, Ordering::Relaxed);
@@ -479,7 +663,7 @@ mod tests {
         // When the account locks mid-conversation, stop prompting immediately.
         assert_eq!(last, Outcome::Cancelled);
         assert_eq!(calls, 1, "must not attempt a second time when locked");
-        assert!(rec.errors.is_empty(), "no 'Wrong' when locked");
+        assert_eq!(rec.errors, vec!["account locked, 60s to go"]);
     }
 
     #[test]
@@ -490,6 +674,7 @@ mod tests {
             to_ui: to_ui_tx,
             from_ui: from_ui_rx,
             pending: std::sync::Mutex::new(None),
+            get_budget: || None,
         };
         let mut secret = Secret::new();
         secret.buffer_mut().push_str("hunter2");
@@ -508,6 +693,7 @@ mod tests {
             to_ui: to_ui_tx,
             from_ui: from_ui_rx,
             pending: std::sync::Mutex::new(None),
+            get_budget: || None,
         };
         let mut secret = Secret::new();
         secret.buffer_mut().push_str("hunter2");

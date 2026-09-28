@@ -50,25 +50,36 @@ pub fn run(prompt: Option<OsString>) -> ! {
         .filter(|p| !p.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_PROMPT.to_owned());
 
-    // Asking while the account is locked can only waste the attempt, and the
-    // terminal message saying so is hidden behind the dim-around rule.
+    // sudo's PAM already had its fingerprint opportunity before invoking
+    // askpass. We only gate password entry here, and show why it is blocked.
     let budget = attempts::budget(attempts::SUDO_SERVICE);
-    if let Some(reason) = budget.as_ref().and_then(attempts::Budget::refusal) {
-        eprintln!("sudo-pop: {reason}");
-        std::process::exit(1);
-    }
+    let locked = budget.as_ref().and_then(attempts::Budget::refusal);
     let attempts = budget.and_then(|budget| budget.status());
 
     let (to_ui_tx, to_ui_rx) = channel::<ToUi>();
     let (from_ui_tx, from_ui_rx) = channel::<FromUi>();
 
     let worker = std::thread::spawn(move || {
+        if let Some(reason) = locked {
+            let _ = to_ui_tx.send(ToUi::Locked(reason));
+            let _ = to_ui_tx.send(ToUi::Done);
+            return false;
+        }
         let _ = to_ui_tx.send(ToUi::Prompt {
             text: prompt,
             echo: false,
         });
         let written = match from_ui_rx.recv() {
             Ok(FromUi::Answer(mut secret)) => {
+                if let Some(reason) = attempts::budget(attempts::SUDO_SERVICE)
+                    .as_ref()
+                    .and_then(attempts::Budget::refusal)
+                {
+                    secret.wipe();
+                    let _ = to_ui_tx.send(ToUi::Locked(reason));
+                    let _ = to_ui_tx.send(ToUi::Done);
+                    return false;
+                }
                 attempts::record();
                 let sent = channel_out.send(&secret).is_ok();
                 secret.wipe();

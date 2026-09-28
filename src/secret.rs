@@ -9,8 +9,10 @@
 //! reading. Neither ever formats it into a `String` or a `println!` buffer that
 //! nothing zeroizes.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::os::unix::io::RawFd;
+use std::sync::Mutex;
 
 use zeroize::Zeroize;
 
@@ -29,27 +31,66 @@ pub const MAX_CHARS: usize = 256;
 ///
 /// `Drop` is not relied on: under `panic = "abort"` destructors never run, so
 /// the caller wipes this explicitly on the normal path.
-pub struct Secret(String);
+pub struct Secret(String, Vec<usize>);
+
+// Heap allocations may share a page. munlock is not reference counted by the
+// kernel, so dropping an input payload must not unlock the live password too.
+static LOCKED_PAGES: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+fn page_size() -> usize {
+    // SAFETY: sysconf has no pointer arguments. Fail rather than guess alignment.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    assert!(size > 0, "cannot determine memory page size");
+    size as usize
+}
+
+fn lock_buffer(ptr: *const u8) -> Vec<usize> {
+    let size = page_size();
+    let start = ptr as usize / size * size;
+    let last = (ptr as usize + CAPACITY - 1) / size * size;
+    let mut pages = LOCKED_PAGES.lock().unwrap();
+    let mut locked = Vec::new();
+    for page in (start..=last).step_by(size) {
+        let count = pages.entry(page).or_default();
+        // SAFETY: these are pages covering the live String allocation.
+        if *count > 0 || unsafe { libc::mlock(page as *const libc::c_void, size) } == 0 {
+            *count += 1;
+            locked.push(page);
+        } else {
+            eprintln!(
+                "sudo-pop: cannot lock password memory ({})",
+                io::Error::last_os_error()
+            );
+            pages.remove(&page);
+        }
+    }
+    locked
+}
+
+fn unlock_pages(locked: &[usize]) {
+    let mut pages = LOCKED_PAGES.lock().unwrap();
+    for page in locked {
+        let count = pages.get_mut(page).expect("registered locked page");
+        *count -= 1;
+        if *count == 0 {
+            // SAFETY: no other live Secret relies on this page's lock.
+            unsafe { libc::munlock(*page as *const libc::c_void, page_size()) };
+            pages.remove(page);
+        }
+    }
+}
 
 impl Secret {
     /// Allocate the buffer and pin it in RAM.
     ///
     /// This machine has a 15 GB swapfile, so an unlocked password can reach the
-    /// disk — and stays there verbatim in a hibernation image. Locking just
+    /// disk. This does not protect against hibernation images. Locking just
     /// this allocation keeps well inside RLIMIT_MEMLOCK, unlike locking the
     /// whole address space.
     pub fn new() -> Self {
         let buffer = String::with_capacity(CAPACITY);
-        // SAFETY: the allocation is live and CAPACITY bytes long. mlock rounds
-        // to page boundaries itself.
-        let locked = unsafe { libc::mlock(buffer.as_ptr().cast(), CAPACITY) } == 0;
-        if !locked {
-            eprintln!(
-                "sudo-pop: cannot lock the password buffer into RAM ({})",
-                io::Error::last_os_error()
-            );
-        }
-        Secret(buffer)
+        let locked = lock_buffer(buffer.as_ptr());
+        Secret(buffer, locked)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -59,6 +100,57 @@ impl Secret {
     /// Mutable access for the input widget to write into.
     pub fn buffer_mut(&mut self) -> &mut String {
         &mut self.0
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        &self.0
+    }
+
+    /// Edit within the locked allocation. Never reallocate or leave deleted bytes
+    /// beyond String::len, where ordinary String editing would retain them.
+    pub(crate) fn insert(&mut self, index: usize, text: &str, limit: usize) -> usize {
+        let count = self.0.chars().count();
+        let allowed = MAX_CHARS.saturating_sub(count).min(limit);
+        let end = text
+            .char_indices()
+            .nth(allowed)
+            .map_or(text.len(), |(i, _)| i);
+        let text = &text[..end];
+        let at = self
+            .0
+            .char_indices()
+            .nth(index)
+            .map_or(self.0.len(), |(i, _)| i);
+        let inserted = text.chars().count();
+        assert!(self.0.len() + text.len() <= CAPACITY);
+        self.0.insert_str(at, text);
+        inserted
+    }
+
+    pub(crate) fn delete(&mut self, range: std::ops::Range<usize>) {
+        let start = self
+            .0
+            .char_indices()
+            .nth(range.start)
+            .map_or(self.0.len(), |(i, _)| i);
+        let end = self
+            .0
+            .char_indices()
+            .nth(range.end)
+            .map_or(self.0.len(), |(i, _)| i);
+        if start >= end {
+            return;
+        }
+        // SAFETY: both boundaries are UTF-8 character boundaries. The retained
+        // prefix/suffix form valid UTF-8; zero the vacated tail before truncating.
+        unsafe {
+            let bytes = self.0.as_mut_vec();
+            let len = bytes.len();
+            bytes.copy_within(end..len, start);
+            let new_len = len - (end - start);
+            bytes[new_len..].zeroize();
+            bytes.truncate(new_len);
+        }
     }
 
     /// The bytes, for writing straight to a descriptor.
@@ -81,8 +173,7 @@ impl Default for Secret {
 impl Drop for Secret {
     fn drop(&mut self) {
         self.wipe();
-        // SAFETY: mirrors the mlock in `new`, on the same allocation.
-        unsafe { libc::munlock(self.0.as_ptr().cast(), CAPACITY) };
+        unlock_pages(&self.1);
     }
 }
 
@@ -153,6 +244,69 @@ fn write_all(fd: RawFd, mut buf: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_deletion_wipes_the_vacated_bytes_without_moving_the_buffer() {
+        let mut secret = Secret::new();
+        secret.insert(0, "a한🔐z", MAX_CHARS);
+        let ptr = secret.as_bytes().as_ptr();
+        let old_len = secret.as_bytes().len();
+        secret.delete(1..3);
+        assert_eq!(secret.text(), "az");
+        assert_eq!(ptr, secret.as_bytes().as_ptr());
+        // SAFETY: all old_len bytes were initialized and the allocation is live.
+        let tail = unsafe { std::slice::from_raw_parts(ptr.add(2), old_len - 2) };
+        assert!(tail.iter().all(|b| *b == 0));
+        secret.delete(0..2);
+        assert!(secret.is_empty());
+        let old = unsafe { std::slice::from_raw_parts(ptr, old_len) };
+        assert!(old.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn repeated_locks_keep_the_original_secret_pages_registered() {
+        let secret = Secret::new();
+        assert!(
+            !secret.1.is_empty(),
+            "test requires an available memlock allowance"
+        );
+        let extra = lock_buffer(secret.as_bytes().as_ptr());
+        unlock_pages(&extra);
+        let pages = LOCKED_PAGES.lock().unwrap();
+        for page in &secret.1 {
+            assert!(pages.get(page).is_some_and(|count| *count >= 1));
+        }
+    }
+
+    #[test]
+    fn kernel_keeps_password_pages_locked_after_other_buffers_drop() {
+        let secret = Secret::new();
+        let address = secret.as_bytes().as_ptr() as usize;
+        for _ in 0..100 {
+            drop(Secret::new());
+        }
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut contains_buffer = false;
+        for line in smaps.lines() {
+            if let Some((start, end)) = line.split_whitespace().next().unwrap_or("").split_once('-')
+            {
+                if let (Ok(start), Ok(end)) = (
+                    usize::from_str_radix(start, 16),
+                    usize::from_str_radix(end, 16),
+                ) {
+                    contains_buffer = start <= address && address < end;
+                }
+            }
+            if contains_buffer && line.starts_with("VmFlags:") {
+                assert!(
+                    line.split_whitespace().any(|flag| flag == "lo"),
+                    "kernel mapping is not locked"
+                );
+                return;
+            }
+        }
+        panic!("password mapping missing from smaps");
+    }
 
     #[test]
     fn wipe_clears_the_buffer() {

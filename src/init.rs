@@ -1,11 +1,12 @@
 //! Install mode: wiring the agent into the session.
 //!
-//! Three things get written, all under $HOME and all inside markers so they can
+//! Owned files and loader blocks are written under $HOME so they can
 //! be found and taken back out exactly:
 //!
 //!   ~/.config/minsoft1115/hypr/sudo-pop.lua        window rules for the prompt
 //!   ~/.config/systemd/user/sudo-pop-agent.service  what starts the agent
-//!   ~/.config/minsoft1115/bash/sudo-pop.sh         alias sudo='sudo-pop'
+//!   ~/.config/minsoft1115/bash/sudo-pop.sh         terminal PATH snippet
+//!   ~/.local/lib/sudo-pop/bin/sudo                 sudo-preserving wrapper
 //!
 //! The snippet directory is shared with other tools, and so is the loader block
 //! that sources it. --uninit removes our file and leaves the loader alone.
@@ -16,7 +17,7 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -31,6 +32,15 @@ const UNIT_NAME: &str = "sudo-pop-agent.service";
 
 /// Shell snippet, compiled in so one binary is the whole installer.
 const SHELL_SNIPPET: &str = include_str!("../assets/sudo-pop.sh");
+const SUDO_WRAPPER: &str = include_str!("../assets/sudo-wrapper.sh");
+
+fn wrapper_body(exe: &Path) -> io::Result<String> {
+    let exe = exe
+        .to_str()
+        .ok_or_else(|| io::Error::other("binary path is not UTF-8"))?;
+    let quoted = format!("'{}'", exe.replace('\'', "'\\''"));
+    Ok(SUDO_WRAPPER.replace("@SUDO_POP_EXE@", &quoted))
+}
 
 /// Marker for the loader that sources every snippet in the bash directory.
 /// Shared with the other tools in this config, so --uninit leaves it alone.
@@ -95,6 +105,9 @@ impl Layout {
     fn shell_snippet(&self) -> PathBuf {
         self.config.join("minsoft1115/bash/sudo-pop.sh")
     }
+    fn sudo_wrapper(&self) -> PathBuf {
+        self.home.join(".local/lib/sudo-pop/bin/sudo")
+    }
     fn rc_files(&self) -> [PathBuf; 2] {
         [self.home.join(".bashrc"), self.home.join(".zshrc")]
     }
@@ -126,9 +139,8 @@ pub fn run(uninstall: bool) -> ! {
 }
 
 fn install_all(layout: &Layout) -> io::Result<()> {
-    // The alias, so `sudo` reaches the router (plain commands go to run0, the
-    // rest keep sudo's meaning and get their password from our own window).
-    write_snippet(&layout.shell_snippet(), SHELL_SNIPPET)?;
+    let exe = std::env::current_exe()?;
+    install_shell(layout, &exe)?;
     install_loader(layout)?;
 
     // Window rules: the agent may be asked to draw the moment it starts.
@@ -148,7 +160,6 @@ fn install_all(layout: &Layout) -> io::Result<()> {
         );
     }
 
-    let exe = std::env::current_exe()?;
     let unit = layout.unit();
     if let Some(parent) = unit.parent() {
         fs::create_dir_all(parent)?;
@@ -194,6 +205,25 @@ fn install_all(layout: &Layout) -> io::Result<()> {
     Ok(())
 }
 
+fn install_shell(layout: &Layout, exe: &Path) -> io::Result<()> {
+    let wrapper = layout.sudo_wrapper();
+    write_snippet(&wrapper, &wrapper_body(exe)?)?;
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))?;
+    // Replaces the former alias snippet, including on upgrades.
+    write_snippet(&layout.shell_snippet(), SHELL_SNIPPET)
+}
+
+fn uninstall_shell(layout: &Layout) -> io::Result<()> {
+    for path in [layout.shell_snippet(), layout.sudo_wrapper()] {
+        match fs::remove_file(&path) {
+            Ok(()) => println!("removed {}", path.display()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Make sure some shell sources the snippet directory.
 ///
 /// The loader block is usually already there from another tool, in which case
@@ -213,7 +243,7 @@ fn install_loader(layout: &Layout) -> io::Result<()> {
     }
     if !wired {
         println!("note: no ~/.bashrc or ~/.zshrc found — add this to your shell config:");
-        println!("  alias sudo='sudo-pop'");
+        println!("  . \"{}\"", layout.shell_snippet().display());
     }
     Ok(())
 }
@@ -226,12 +256,7 @@ fn unit_active() -> bool {
 }
 
 fn uninstall_all(layout: &Layout) -> io::Result<()> {
-    let snippet = layout.shell_snippet();
-    match fs::remove_file(&snippet) {
-        Ok(()) => println!("removed {}", snippet.display()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
+    uninstall_shell(layout)?;
 
     systemctl(&["disable", "--now", UNIT_NAME]);
     let unit = layout.unit();
@@ -538,6 +563,86 @@ fn reload_hyprland() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_install_migrates_alias_and_children_preserve_routing_preference() {
+        let home =
+            std::env::temp_dir().join(format!("sudo-pop-shell-install-{}", std::process::id()));
+        let layout = Layout {
+            config: home.join("config"),
+            home: home.clone(),
+        };
+        let exe = home.join("custom prefix ' $(false)/sudo-pop");
+        write_snippet(
+            &exe,
+            "#!/bin/sh\nprintf '%s\\0' \"$SUDO_POP_RUN0\" \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        write_snippet(&layout.shell_snippet(), "alias sudo='sudo-pop'\n").unwrap();
+        install_shell(&layout, &exe).unwrap();
+        install_shell(&layout, &exe).unwrap();
+        let script = r#"
+            alias sudo='sudo-pop'
+            . "$1"
+            . "$1"
+            if alias sudo >/dev/null 2>&1; then exit 91; fi
+            [ "$PATH" = "$HOME/.local/lib/sudo-pop/bin:/usr/bin:/bin" ] || exit 92
+            # A package guard function continues to dispatch through PATH.
+            sudo() { command sudo "$@"; }
+            sudo 'first argument' '*.txt' ''
+            /bin/sh -c 'sudo "$@"' child 'second argument' '-E' 'VAR=value'
+            [ "$SUDO_POP_RUN0" = 1 ] || exit 93
+        "#;
+        let output = Command::new("/bin/bash")
+            .args(["--noprofile", "--norc", "-c", script, "test"])
+            .arg(layout.shell_snippet())
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "/usr/bin:{}:/bin:{}",
+                    layout.sudo_wrapper().parent().unwrap().display(),
+                    layout.sudo_wrapper().parent().unwrap().display()
+                ),
+            )
+            .env("SUDO_POP_RUN0", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout,
+            b"1\0first argument\0*.txt\0\01\0second argument\0-E\0VAR=value\0"
+        );
+        uninstall_shell(&layout).unwrap();
+        uninstall_shell(&layout).unwrap();
+        assert!(!layout.sudo_wrapper().exists());
+        assert!(!layout.shell_snippet().exists());
+        assert!(exe.exists(), "shell removal must leave the binary alone");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn shell_snippet_keeps_an_unrelated_sudo_alias() {
+        let output = Command::new("/bin/bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-c",
+                &format!("alias sudo='my-sudo'\n{SHELL_SNIPPET}\nalias sudo"),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "alias sudo='my-sudo'"
+        );
+    }
 
     /// The comm the kernel would report for a binary of this name.
     fn comm(binary: &str) -> String {

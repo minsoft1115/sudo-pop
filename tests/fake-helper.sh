@@ -14,7 +14,7 @@ user="${1:-}"
 read -r cookie || cookie=""
 [ -n "${FAKE_HELPER_LOG:-}" ] && printf 'user=%s cookie=%s\n' "$user" "$cookie" >>"$FAKE_HELPER_LOG"
 
-ask() { printf 'PAM_PROMPT_ECHO_OFF %s\n' "$1"; read -r answer || answer=""; }
+ask() { printf 'PAM_PROMPT_ECHO_OFF %s\n' "$1"; IFS= read -r answer || answer=""; }
 
 case "$mode" in
   success)      ask "Password:"; echo SUCCESS ;;
@@ -23,7 +23,7 @@ case "$mode" in
   no-prompt)    echo FAILURE ;;
   # The socket helper on a kernel without SO_PEERPIDFD: closes, says nothing.
   silent)       exit 0 ;;
-  echo-on)      printf 'PAM_PROMPT_ECHO_ON Username:\n'; read -r answer || true; echo SUCCESS ;;
+  echo-on)      printf 'PAM_PROMPT_ECHO_ON Username:\n'; IFS= read -r answer || true; echo SUCCESS ;;
   info)         printf 'PAM_TEXT_INFO Place your finger\n'; ask "Password:"; echo SUCCESS ;;
   error-then-ok) printf 'PAM_ERROR_MSG Try again\n'; ask "Password:"; echo SUCCESS ;;
   # Fingerprint success: a notice, then SUCCESS, never a password prompt.
@@ -54,13 +54,19 @@ case "$mode" in
   # Two lines in one write, then a wait for the answer. The reader must not
   # poll the descriptor for a line it already holds in its buffer.
   burst)        printf 'PAM_TEXT_INFO Place your finger\nPAM_PROMPT_ECHO_OFF Password:\n'
-                read -r answer || answer=""; echo SUCCESS ;;
+                IFS= read -r answer || answer=""; echo SUCCESS ;;
   # Closes its stdin before asking, then lingers: the answer has nowhere to
   # go (EPIPE). That is a helper dying mid-conversation, not a wrong password.
   prompt-then-die) exec 0<&-
                 printf 'PAM_PROMPT_ECHO_OFF Password:\n'; sleep 5 ;;
   # Answers only to one specific password, so a test can drive both outcomes.
   check)        ask "Password:"
-                if [ "$answer" = "${FAKE_HELPER_PASSWORD:-open-sesame}" ]; then echo SUCCESS; else echo FAILURE; fi ;;
+                if [ "$answer" = "${FAKE_HELPER_PASSWORD:-open-sesame}" ]; then
+                  [ -z "${FAKE_HELPER_RESULT:-}" ] || printf 'MATCH\n' >>"$FAKE_HELPER_RESULT"
+                  echo SUCCESS
+                else
+                  [ -z "${FAKE_HELPER_RESULT:-}" ] || printf 'MISMATCH\n' >>"$FAKE_HELPER_RESULT"
+                  echo FAILURE
+                fi ;;
   *)            echo "FAILURE"; exit 1 ;;
 esac

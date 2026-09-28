@@ -3,7 +3,8 @@
 # The scenarios that cannot be a cargo test: they need polkitd, a session bus,
 # a compositor, or all three. Everything here runs without a password.
 #
-#   ./tests/scenarios.sh                  run them
+#   ./tests/scenarios.sh --input-only     isolated GUI input test (no real PAM)
+#   ./tests/scenarios.sh                  run full desktop scenarios
 #   ./tests/scenarios.sh --keep           leave the agent registered at the end
 #   ./tests/scenarios.sh --with-password  also open a foot window for the one
 #                                         case that needs a human (password or
@@ -21,12 +22,12 @@ unset SYSTEMD_BUS_TIMEOUT
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/target/release/sudo-pop"
-WORK="$(mktemp -d)"
 KEEP=0
 WITH_PASSWORD=0
 RESTART_POLKITD=0
 for arg in "$@"; do
   case "$arg" in
+    --input-only) exec "$ROOT/tests/input-scenario.sh" ;;
     --keep) KEEP=1 ;;
     # foot 창을 띄워 사람이 비밀번호를 넣는 케이스까지 돌린다
     --with-password) WITH_PASSWORD=1 ;;
@@ -37,6 +38,12 @@ for arg in "$@"; do
   esac
 done
 
+# Build both executables before touching the desktop or installing cleanup traps.
+# CARGO_TARGET_DIR cannot redirect the outputs away from the paths used below.
+cargo build --manifest-path "$ROOT/Cargo.toml" --target-dir "$ROOT/target" --locked --offline --release || exit 1
+cargo build --manifest-path "$ROOT/Cargo.toml" --target-dir "$ROOT/target" --locked --offline || exit 1
+WORK="$(mktemp -d)" || exit 1
+
 POLKIT_NAME="org.freedesktop.PolicyKit1"
 
 # 되돌릴 때는 설치된 바이너리로 --init 한다. $BIN 으로 되돌리면 유닛의 ExecStart 가
@@ -45,9 +52,10 @@ POLKIT_NAME="org.freedesktop.PolicyKit1"
 INSTALLED="$(command -v sudo-pop 2>/dev/null || true)"
 [ -z "$INSTALLED" ] && INSTALLED="$BIN"
 
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 ok()   { printf '  \033[1;32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[1;31mFAIL\033[0m %s\n' "$1"; [ $# -gt 1 ] && printf '       %s\n' "$2"; FAIL=$((FAIL+1)); }
+skip() { printf '  SKIP %s\n' "$1"; SKIP=$((SKIP+1)); }
 head_() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 # --- state we must give back -------------------------------------------------
@@ -84,14 +92,14 @@ cleanup() {
     fi
     printf '  omarchy.polkit: %s\n' \
       "$(omarchy-plugin-list --json 2>/dev/null | jq -r '.[]|select(.id=="omarchy.polkit")|.enabled')"
-    # 시나리오가 태운 실패는 시나리오가 치운다. 공유 카운터라 남겨 두면
-    # 다음에 진짜로 필요할 때의 여유가 줄어든다.
-    before=$(faillock 2>/dev/null | grep -c "^20" || echo 0)
-    faillock --reset 2>/dev/null && printf '  faillock: %s건 정리\n' "$before"
+    # Never reset account-wide failure records: they may predate this test.
+    printf '  faillock: 기존 실패 기록 유지 (초기화하지 않음)\n'
   fi
   rm -rf "$WORK"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 windows() { hyprctl clients -j 2>/dev/null | jq '[.[]|select(.class=="sudo-askpass")]|length'; }
 wait_window() { local i; for i in $(seq 1 40); do [ "$(windows)" -gt 0 ] && return 0; sleep 0.25; done; return 1; }
@@ -181,7 +189,6 @@ start_agent() {
   return 1
 }
 
-[ -x "$BIN" ] || { echo "build first: cargo build --release"; exit 1; }
 systemctl --user stop sudo-pop-agent.service 2>/dev/null
 
 # =============================================================================
@@ -383,7 +390,7 @@ head_ "6. 잠긴 계정 게이팅 (C1)"
 # 태우면 sudo·로그인까지 잠기므로, tally 만 10 건으로 흉내 내는 가짜 faillock 을
 # 쓴다. 자식은 faillock 을 절대 경로로만 찾으므로 (rationale §22-8) PATH 로는 끼울 수
 # 없고, 디버그 빌드만 읽는 SUDO_POP_FAILLOCK_BIN 으로 debug 바이너리에 넘긴다 —
-# 12번이 가짜 헬퍼를 넘기는 것과 같은 문이다. 실제 카운터는 건드리지 않는다.
+# 가짜 헬퍼도 함께 써서 지문 실패 → 비밀번호 요청을 재현한다. 실제 PAM 은 건드리지 않는다.
 #
 # 게이트는 polkit-1 PAM 스택이 pam_faillock 을 실제로 돌릴 때만 선다 (rationale §24).
 # Omarchy 의 지문 설정이 만든 /etc/pam.d/polkit-1 은 system-auth 를 include 하지
@@ -424,7 +431,6 @@ chmod +x "$WORK/bin/faillock"
 
 # 릴리스에는 그 문이 아예 없어야 한다 — 문자열조차 컴파일되지 않는다.
 DBG6="$ROOT/target/debug/sudo-pop"
-[ -x "$DBG6" ] || cargo build -q
 if grep -q SUDO_POP_FAILLOCK_BIN "$BIN"; then
   bad "릴리스 바이너리에 SUDO_POP_FAILLOCK_BIN 이 들어 있다"
 elif grep -q SUDO_POP_FAILLOCK_BIN "$DBG6"; then
@@ -434,10 +440,15 @@ else
 fi
 
 sleep 60 & LSUBJECT=$!
-( echo test-cookie | SUDO_POP_FAILLOCK_BIN="$WORK/bin/faillock" SUDO_POP_USER="$USER"     SUDO_POP_SUBJECT_PID=$LSUBJECT SUDO_POP_MESSAGE=locked     "$DBG6" --agent-prompt >"$WORK/locked.log" 2>&1; echo "exit=$?" >>"$WORK/locked.log" ) &
+( echo test-cookie | SUDO_POP_FAILLOCK_BIN="$WORK/bin/faillock" SUDO_POP_USER="$USER"     SUDO_POP_SUBJECT_PID=$LSUBJECT SUDO_POP_MESSAGE=locked \
+    SUDO_POP_HELPER_BIN="$ROOT/tests/fake-helper.sh" SUDO_POP_HELPER_SOCKET="$WORK/no-helper.socket" \
+    FAKE_HELPER_MODE=finger-then-pw "$DBG6" --agent-prompt >"$WORK/locked.log" 2>&1; echo "exit=$?" >>"$WORK/locked.log" ) &
 sleep 2
 if [ "$POLKIT_COUNTS" = yes ]; then
-  [ "$(windows)" = 0 ] && ok "잠긴 계정이면 창을 띄우지 않는다" || bad "창이 떴다"
+  [ "$(windows)" = 1 ] && ok "잠긴 계정이면 잠금 안내 창을 띄운다" || bad "잠금 안내 창이 없다"
+  for i in $(seq 1 24); do [ "$(windows)" = 0 ] && break; sleep 0.25; done
+  [ "$(windows)" = 0 ] && ok "잠금 안내가 자동으로 닫힌다" || bad "잠금 안내가 남았다"
+  for i in $(seq 1 10); do grep -q "exit=2" "$WORK/locked.log" && break; sleep 0.1; done
   # 종료 코드 2(취소)여야 polkitd 가 요청을 되던지지 않는다. 1 이면 빈 창이 반복된다.
   grep -q "exit=2" "$WORK/locked.log" && ok "잠긴 계정은 종료 코드 2 (요청 정상 종료)"   || bad "종료 코드가 2 가 아니다" "$(cat "$WORK/locked.log")"
   grep -qi "lock" "$WORK/locked.log" && ok "잠긴 계정 안내를 남긴다" || bad "안내 메시지가 없다"
@@ -462,6 +473,7 @@ grep -q "already current" "$WORK/init2.log" && ok "--init 은 멱등하다" || b
 [ -e ~/.config/systemd/user/sudo-pop-agent.service ] && bad "유닛이 남았다" || ok "--uninit 이 유닛을 지운다"
 [ -e ~/.config/minsoft1115/hypr/sudo-pop.lua ] && bad "창 규칙이 남았다" || ok "--uninit 이 창 규칙을 지운다"
 [ -e ~/.config/minsoft1115/bash/sudo-pop.sh ] && bad "셸 스니펫이 남았다" || ok "--uninit 이 셸 스니펫을 지운다"
+[ -e ~/.local/lib/sudo-pop/bin/sudo ] && bad "PATH 래퍼가 남았다" || ok "--uninit 이 PATH 래퍼를 지운다"
 grep -q "minsoft1115-bash:begin" ~/.bashrc 2>/dev/null && ok "공유 로더 블록은 남긴다" || bad "남의 로더 블록을 지웠다"
 if [ -f "$WORK/hl.before" ]; then
   strip() { grep -v 'sudo-pop' "$1" | grep -v '^[[:space:]]*$'; }
@@ -623,7 +635,7 @@ if start_agent; then
   # ~30초 뒤에 비밀번호로 넘긴 다음에야 30초가 시작되므로, 여기서 1분을
   # 기다리지 않는다.
   if [ "$FPRINT_WAIT" = yes ]; then
-    ok "지문 대기 중이라 창 백스톱 시험을 건너뜀 (Prompt 전에 안 돔)"
+    skip "지문 대기 중이라 창 백스톱 시험을 건너뜀 (Prompt 전에 안 돔)"
   else
     pkcheck --action-id "$MOUNT" --process $$ --allow-user-interaction >/dev/null 2>&1 &
     PKC2=$!
@@ -738,11 +750,10 @@ head_ "12. 비밀번호 한도 — 창이 지문으로 다시 안 뜬다"
 DBG="$ROOT/target/debug/sudo-pop"
 FAKE="$ROOT/tests/fake-helper.sh"
 if ! command -v wtype >/dev/null; then
-  ok "wtype 이 없어 비밀번호 한도 재발행 시험을 건너뜀"
+  skip "wtype 이 없어 비밀번호 한도 재발행 시험을 건너뜀"
 elif [ ! -x "$FAKE" ]; then
   bad "tests/fake-helper.sh 가 없다"
 else
-  [ -x "$DBG" ] || cargo build -q
   omarchy-plugin-disable omarchy.polkit >/dev/null 2>&1; sleep 1
   systemctl --user stop sudo-pop-agent.service 2>/dev/null
   SUDO_POP_DEBUG=1 \
@@ -760,7 +771,7 @@ else
     sleep 2
     typed=0
     for i in 1 2 3; do
-      hyprctl dispatch focuswindow class:sudo-askpass >/dev/null 2>&1
+      hyprctl dispatch 'hl.dsp.focus({ window = "class:sudo-askpass" })' >/dev/null 2>&1
       sleep 0.3
       wtype -s 40 'not-the-password'
       wtype -k Return
@@ -794,6 +805,16 @@ else
 fi
 
 # =============================================================================
+head_ "12b. GUI 입력을 가짜 helper에 정확히 전달"
+"$ROOT/tests/input-scenario.sh"
+input_rc=$?
+case "$input_rc" in
+  0) ok "GUI → helper 정확한 입력 전달 및 재시도" ;;
+  77) skip "GUI 입력 시나리오 실행 환경이 없음" ;;
+  *) bad "GUI 입력 전달 시나리오 실패" ;;
+esac
+
+# =============================================================================
 # 비밀번호가 필요한 케이스. 사람이 있어야 하므로 foot 창을 띄워 맡긴다.
 # 지문이 켜져 있으면 센서가 먼저다 — 맞으면 칸이 안 뜨고, 안 되면 칸으로 바뀐다.
 if [ "$WITH_PASSWORD" = 1 ]; then
@@ -820,6 +841,9 @@ if [ "$WITH_PASSWORD" = 1 ]; then
   fi
 fi
 
+[ "$WITH_PASSWORD" = 1 ] || skip "직접 인증 성공 시험 (--with-password 미지정)"
+[ "$RESTART_POLKITD" = 1 ] || skip "polkitd 재시작 시험 (--restart-polkitd 미지정)"
+
 # =============================================================================
-printf '\n\033[1m결과: %d 통과, %d 실패\033[0m\n' "$PASS" "$FAIL"
+printf '\n\033[1m결과: %d 통과, %d 실패, %d 건너뜀\033[0m\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ]
