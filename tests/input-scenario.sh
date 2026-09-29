@@ -61,18 +61,35 @@ wait_result() {
   done
   [ "$(tail -n 1 "$WORK/result" 2>/dev/null)" = "$expected" ]
 }
-for case_name in edited_unicode retry; do
+for case_name in edited_unicode retry details; do
   : >"$WORK/result"
   expected='  sudo-pop 한🔐 test  '
   SUDO_POP_USER="$(id -un)" SUDO_POP_MESSAGE='sudo-pop input test (fake password only)' \
+    SUDO_POP_ACTION=org.freedesktop.systemd1.manage-units SUDO_POP_SUBJECT_PID="$$" \
     SUDO_POP_HELPER_BIN="$ROOT/tests/fake-helper.sh" \
     SUDO_POP_HELPER_SOCKET="$WORK/no-helper.socket" \
     SUDO_POP_FAILLOCK_BIN="$WORK/faillock" \
     FAKE_HELPER_MODE=check FAKE_HELPER_PASSWORD="$expected" FAKE_HELPER_RESULT="$WORK/result" \
-    "$ROOT/target/debug/sudo-pop" --agent-prompt <"$WORK/cookie" >"$WORK/prompt.log" 2>&1 &
+    python3 "$ROOT/tests/prompt-driver.py" "$ROOT/target/debug/sudo-pop" --agent-prompt <"$WORK/cookie" >"$WORK/prompt.log" 2>&1 &
   PROMPT_PID=$!
   focus_prompt || fail "$case_name: test window did not acquire focus"
   sleep 0.3
+  if [ "$case_name" = details ]; then
+    height_before=$(hyprctl clients -j | jq -r --argjson pid "$PROMPT_PID" '.[] | select(.pid == $pid) | .size[1]')
+    wtype -M shift -k Tab -m shift || fail 'details focus failed'
+    sleep 0.15
+    wtype -k Return || fail 'details opening failed'
+    sleep 0.4
+    height_open=$(hyprctl clients -j | jq -r --argjson pid "$PROMPT_PID" '.[] | select(.pid == $pid) | .size[1]')
+    [ "$height_open" -gt "$height_before" ] || fail 'details did not expand'
+    [ ! -s "$WORK/result" ] || fail 'opening details submitted an answer'
+    wtype -k Return || fail 'details closing failed'
+    sleep 0.4
+    height_closed=$(hyprctl clients -j | jq -r --argjson pid "$PROMPT_PID" '.[] | select(.pid == $pid) | .size[1]')
+    [ "$height_closed" -eq "$height_before" ] || fail 'details did not collapse'
+    wtype -k Tab || fail 'password focus restoration failed'
+    sleep 0.15
+  fi
   if [ "$case_name" = retry ]; then
     wtype -s 20 'deliberately-wrong-test-input' || fail 'typing failed'
     wtype -k Return || fail 'Enter failed'

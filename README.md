@@ -7,12 +7,12 @@ mounts, NetworkManager, systemctl — in a window designed to reduce password ex
 screen sharing, and logs.
 
 It is a **polkit authentication agent** with a **sudo router** in front of it, so
-every path ends at the same window:
+the default wrapper uses run0 and the agent draws authentication prompts:
 
 ```
 sudo pacman -Syu   →  run0 pacman -Syu    ─┐
-sudo -E make       →  sudo -A -E make    ─┤→  one window
-disk mounts · NetworkManager · systemctl ─┘
+sudo -E make       →  unsupported (use /usr/bin/sudo explicitly)
+disk mounts · NetworkManager · systemctl ─┘→ one window
 ```
 
 <p align="center">
@@ -21,12 +21,18 @@ disk mounts · NetworkManager · systemctl ─┘
             the seconds left in the corner, and the remaining lockout budget below">
 </p>
 
-The installed terminal PATH wrapper forwards to sudo-pop: plain commands use run0
-and polkit, while sudo-specific options retain the existing real-sudo fallback.
-Agents and child scripts inherit that PATH. The polkit agent provides fingerprint
-and password UI. On the real-sudo path, sudo's PAM tries fingerprints before
-askpass, so that path may wait at the sensor without a window.
-The window shows the requesting command when it can be determined.
+The installed terminal PATH wrapper uses **run0 only by default**. Unsupported
+sudo options and leading environment assignments fail explicitly; missing run0
+never falls back to sudo. Agents and child scripts inherit that PATH.
+Use `/usr/bin/sudo` explicitly for sudo semantics, or select the legacy router with
+`SUDO_POP_MODE=compat`. This default changes compatibility with scripts using
+`sudo -v`, including the installed Omarchy update path. See
+[execution policy and compatibility](docs/request-display-and-run0.md).
+
+The window shows the requesting process's command line as reference information.
+Request details provide the full collected command, escaped argument boundaries,
+and polkit action and description. This does not verify the actual execution or
+script contents. Fingerprint/password authentication continues while details are open.
 
 ---
 
@@ -40,7 +46,7 @@ all of it measured on this machine, not asserted:
 |---|---|---|
 | Password hardening — dump prevention, RAM locking, buffer wiping | ✓ | ✗ — the password lives in the long-lived shell process |
 | Excluded from screen sharing and recording | ✓ | ✗ — a layer surface can't carry the rule |
-| Shows the **actual command** that is asking | ✓ `pacman -Syu` | a random unit name (`run-p1592…service`) |
+| Shows the **requesting process command line** | ✓ `pacman -Syu` | a random unit name (`run-p1592…service`) |
 | …and what a desktop request will do | ✓ `mount the filesystem` | ✓ |
 | Refuses callers that aren't polkit | ✓ | ✗ — neither reference agent checks |
 | Shows the shared lockout budget at all times · blocks passwords while locked | ✓ | ✗ |
@@ -135,10 +141,9 @@ omarchy plugin enable omarchy.polkit
 
 A few things that follow from being a polkit agent rather than a plain askpass:
 
-- **The installed `sudo` wrapper preserves sudo-pop routing.** Plain commands use
-  run0 and polkit policy, not sudoers. Sudo-specific options retain the existing
-  real-sudo path; explicit `-A`, `-n` and `-S` are passed through. The wrapper
-  does not override the caller's `SUDO_POP_RUN0` preference.
+- **The installed `sudo` wrapper defaults to run0 only.** It uses polkit policy,
+  not sudoers. Unsupported sudo options fail; no automatic sudo fallback occurs.
+  `SUDO_POP_RUN0=0` is an error unless `SUDO_POP_MODE=compat` is selected explicitly.
 - **On the run0 path, answer within 25 seconds** — the caller's D-Bus timeout, not
   ours. The window counts it down in the corner, in the error colour for the last
   five seconds. The sudo path has no limit, so nothing counts down there.

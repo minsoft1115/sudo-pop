@@ -7,14 +7,16 @@
 //!
 //! The password is not in this file, and not in this process. Every request is
 //! handed to a child (`--agent-prompt`) and the only thing that comes back is
-//! an exit code.
+//! an exit code plus ownership of helper sockets for background cleanup.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_process::{Command, Stdio};
-use futures_lite::io::AsyncWriteExt;
+use std::io::Write;
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use zbus::interface;
 use zbus::zvariant::OwnedValue;
 
@@ -32,6 +34,7 @@ pub struct Agent {
     /// One request at a time. A second one waits here rather than putting a
     /// second window on screen.
     pub turn: async_lock::Mutex<()>,
+    cleanup: crate::cleanup::Gate,
     /// Cookie -> pidfd of the child asking about it, so a cancel can signal the
     /// exact process. A pidfd, not a bare pid: once the child exits the pid can
     /// be recycled, and a stale kill would land on a stranger.
@@ -47,6 +50,7 @@ impl Agent {
             polkitd: Mutex::new(polkitd),
             once,
             turn: async_lock::Mutex::new(()),
+            cleanup: Arc::new(Mutex::new(false)),
             running: Arc::new(Mutex::new(HashMap::new())),
             cancelled: Mutex::new(HashSet::new()),
         }
@@ -274,6 +278,9 @@ impl Agent {
                 timeout.as_millis()
             );
         }
+        if left.is_zero() {
+            return Ok(());
+        }
         let code = self
             .ask(&name, &cookie, subject_pid, &message, &action_id, left)
             .await;
@@ -366,6 +373,9 @@ impl Agent {
             return prompt::EXIT_FAILED;
         };
 
+        let Ok((mut control, prompt_control)) = UnixStream::pair() else {
+            return prompt::EXIT_FAILED;
+        };
         let child = Command::new(exe)
             .arg("--agent-prompt")
             .env("SUDO_POP_USER", username)
@@ -373,7 +383,7 @@ impl Agent {
             .env("SUDO_POP_MESSAGE", message)
             .env("SUDO_POP_ACTION", action_id)
             .env("SUDO_POP_LEFT_MS", left.as_millis().to_string())
-            .stdin(Stdio::piped())
+            .stdin(Stdio::from(OwnedFd::from(prompt_control)))
             .spawn();
 
         let mut child = match child {
@@ -413,12 +423,13 @@ impl Agent {
             eprintln!("sudo-pop: cannot open pidfd for the prompt child");
         }
 
-        // The cookie goes down a pipe, not through argv or the environment:
-        // both are readable by anything that can see the process.
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(format!("{cookie}\n").as_bytes()).await;
-            let _ = stdin.flush().await;
+        // This private socket carries the cookie and helper fd transfers,
+        // never passwords. Start tracking before the prompt can send PAM data.
+        if writeln!(control, "{cookie}").is_err() {
+            let _ = child.kill();
         }
+        let cleanup = Arc::clone(&self.cleanup);
+        std::thread::spawn(move || crate::cleanup::serve(control, cleanup));
 
         let code = match child.status().await {
             Ok(status) => status.code().unwrap_or(prompt::EXIT_CANCELLED),

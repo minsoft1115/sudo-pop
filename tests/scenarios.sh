@@ -330,13 +330,15 @@ fi
 
 # =============================================================================
 head_ "4. 라우팅"
-out=$(SUDO_POP_DEBUG=1 "$BIN" -n true 2>&1)
-echo "$out" | grep -q "leaving arguments untouched" \
-  && ok "-n 은 손대지 않고 sudo 로" || bad "-n 처리가 다르다" "$out"
+out=$(SUDO_POP_MODE=run0 SUDO_POP_RUN0=1 "$BIN" -n true 2>&1)
+status=$?
+[ "$status" -eq 2 ] && echo "$out" | grep -q 'sudo options are unsupported' \
+  && ok "run0 전용 모드는 -n 을 거절한다" || bad "-n 거절 실패" "$out"
 
-out=$(SUDO_POP_DEBUG=1 SUDO_POP_RUN0=0 timeout 3 "$BIN" -n true 2>&1)
-echo "$out" | grep -q "routing to run0" \
-  && bad "SUDO_POP_RUN0=0 인데 run0 로 보냈다" || ok "SUDO_POP_RUN0=0 이면 run0 로 안 보낸다"
+out=$(SUDO_POP_MODE=run0 SUDO_POP_RUN0=0 "$BIN" true 2>&1)
+status=$?
+[ "$status" -eq 2 ] && echo "$out" | grep -q 'conflicts with run0-only mode' \
+  && ok "SUDO_POP_RUN0=0 은 명시적인 설정 충돌" || bad "설정 충돌 검사 실패" "$out"
 
 # =============================================================================
 head_ "5. 창 — 규칙과 Esc 취소"
@@ -344,7 +346,7 @@ head_ "5. 창 — 규칙과 Esc 취소"
 wait_sensor_free || bad "앞 절의 헬퍼가 센서를 놓지 않는다 (30초 초과)"
 sleep 60 & SUBJECT=$!
 ( echo test-cookie | SUDO_POP_USER="$USER" SUDO_POP_SUBJECT_PID=$SUBJECT SUDO_POP_MESSAGE=scenario \
-    "$BIN" --agent-prompt >"$WORK/prompt.log" 2>&1; echo "exit=$?" >>"$WORK/prompt.log" ) &
+    python3 "$ROOT/tests/prompt-driver.py" "$BIN" --agent-prompt >"$WORK/prompt.log" 2>&1; echo "exit=$?" >>"$WORK/prompt.log" ) &
 if wait_window; then
   win=$(hyprctl clients -j | jq '.[]|select(.class=="sudo-askpass")')
   [ "$(echo "$win" | jq -r .floating)" = "true" ] && ok "창이 떠 있다 (floating)" || bad "floating 이 아니다"
@@ -442,7 +444,7 @@ fi
 sleep 60 & LSUBJECT=$!
 ( echo test-cookie | SUDO_POP_FAILLOCK_BIN="$WORK/bin/faillock" SUDO_POP_USER="$USER"     SUDO_POP_SUBJECT_PID=$LSUBJECT SUDO_POP_MESSAGE=locked \
     SUDO_POP_HELPER_BIN="$ROOT/tests/fake-helper.sh" SUDO_POP_HELPER_SOCKET="$WORK/no-helper.socket" \
-    FAKE_HELPER_MODE=finger-then-pw "$DBG6" --agent-prompt >"$WORK/locked.log" 2>&1; echo "exit=$?" >>"$WORK/locked.log" ) &
+    FAKE_HELPER_MODE=finger-then-pw python3 "$ROOT/tests/prompt-driver.py" "$DBG6" --agent-prompt >"$WORK/locked.log" 2>&1; echo "exit=$?" >>"$WORK/locked.log" ) &
 sleep 2
 if [ "$POLKIT_COUNTS" = yes ]; then
   [ "$(windows)" = 1 ] && ok "잠긴 계정이면 잠금 안내 창을 띄운다" || bad "잠금 안내 창이 없다"
@@ -680,7 +682,7 @@ sleep 60 & FPSUB=$!
 rm -f "$WORK/fp-prompt.log"
 ( echo test-cookie | SUDO_POP_DEBUG=1 SUDO_POP_USER="$USER" \
     SUDO_POP_SUBJECT_PID=$FPSUB SUDO_POP_MESSAGE=fingerprint \
-    "$BIN" --agent-prompt >"$WORK/fp-prompt.log" 2>&1; echo "exit=$?" >>"$WORK/fp-prompt.log" ) &
+    python3 "$ROOT/tests/prompt-driver.py" "$BIN" --agent-prompt >"$WORK/fp-prompt.log" 2>&1; echo "exit=$?" >>"$WORK/fp-prompt.log" ) &
 if wait_window; then
   if [ "$FPRINT_WAIT" = yes ]; then
     grep -q "fingerprint_wait=true" "$WORK/fp-prompt.log" \

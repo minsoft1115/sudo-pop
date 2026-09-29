@@ -29,6 +29,9 @@ use crate::theme;
 pub const APP_ID: &str = "sudo-askpass";
 
 const WINDOW_HEIGHT: f32 = 200.0;
+// The fixed 18pt command row is 4pt taller than the previous text-only label.
+const HEADLINE_EXTRA_HEIGHT: f32 = 4.0;
+const DETAILS_EXTRA_HEIGHT: f32 = 200.0; // Scroll area, separator and authentication spacing.
 
 /// Fingerprint wait has no field. Shorter than the password layout, but tall
 /// enough for the glyph and the sensor hint.
@@ -38,8 +41,7 @@ const FINGERPRINT_HEIGHT: f32 = 168.0;
 ///
 /// The command line is why. `run0 pacman -Syu` fits in 400 with room to spare,
 /// but a systemd unit path, a desktop app's argv, or `sudo` on a long
-/// invocation does not -- and a truncated command is the one thing this window
-/// must not do, because that line is what tells you whether to type at all.
+/// invocation does not. Long summaries have a separate full-details view.
 /// 800 rather than "as wide as it takes": past that the eye stops reading a
 /// line and starts scanning it, and a password box has no business filling a
 /// screen.
@@ -176,6 +178,8 @@ fn fingerprint_feedback_strength(started: Option<Instant>, now: Instant) -> f32 
 
 /// What the helper thread tells the window.
 pub enum ToUi {
+    /// Wait for the previous helper without offering fingerprint/password input.
+    CleanupWait(bool),
     Prompt {
         text: String,
         echo: bool,
@@ -203,13 +207,14 @@ pub enum FromUi {
 
 /// What the request is about, shown above the field.
 pub struct Subject {
-    /// The command behind the request, if it could be established.
-    pub command: Option<String>,
+    /// Collected process command line; reference information, not verified execution.
+    pub command: Option<crate::invocation::CommandInfo>,
+    /// Full action identifier, available only for polkit requests.
+    pub action: Option<String>,
     /// polkit's own wording, the last thing tried when nothing better exists.
     pub message: String,
     /// What the request will do, from `invocation::purpose`: the second line
-    /// under the command, and the headline when there is no command. `None`
-    /// where polkit's sentence would add nothing (the `run0` path).
+    /// under the command, and the headline when there is no command.
     pub purpose: Option<String>,
     /// Whose password is being asked. The helper's prompt never says.
     pub user: Option<String>,
@@ -235,9 +240,10 @@ impl Subject {
     /// request will do, else its raw wording.
     fn headline(&self) -> String {
         self.command
-            .clone()
+            .as_ref()
+            .map(|c| c.summary())
             .or_else(|| self.purpose.clone())
-            .unwrap_or_else(|| self.message.clone())
+            .unwrap_or_else(|| crate::invocation::metadata(&self.message))
     }
 
     /// The second line, which exists only when the first one is a command and
@@ -274,11 +280,14 @@ pub fn run(subject: Subject, to_ui: Receiver<ToUi>, from_ui: Sender<FromUi>) -> 
     let mut chain = font::Chain::new();
     // The command line and polkit's wording are the only text here we did not
     // write; either can be in any script.
-    chain.cover(subject.command.as_deref().unwrap_or_default());
+    if let Some(command) = &subject.command {
+        chain.cover(&command.full());
+    }
+    chain.cover(subject.action.as_deref().unwrap_or_default());
     chain.cover(subject.purpose.as_deref().unwrap_or_default());
     chain.cover(&subject.message);
     let width = fitted_width(&chain, &subject);
-    let height = window_height(subject.fingerprint_wait);
+    let height = window_height(subject.fingerprint_wait) + HEADLINE_EXTRA_HEIGHT;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -321,6 +330,9 @@ struct Window {
     width: f32,
     phase: Phase,
     came_from_fingerprint: bool,
+    cleanup_wait: bool,
+    details_open: bool,
+    requested_height: f32,
 }
 
 impl Window {
@@ -360,6 +372,9 @@ impl Window {
             width,
             phase,
             came_from_fingerprint,
+            cleanup_wait: false,
+            details_open: false,
+            requested_height: window_height(came_from_fingerprint) + HEADLINE_EXTRA_HEIGHT,
         }
     }
 
@@ -374,7 +389,7 @@ impl Window {
             pam_muted: false,
         };
         if self.came_from_fingerprint {
-            self.resize(ctx, WINDOW_HEIGHT);
+            self.resize(ctx, self.desired_height());
         }
     }
 
@@ -383,6 +398,13 @@ impl Window {
     fn drain(&mut self, ctx: &egui::Context) -> bool {
         loop {
             match self.to_ui.try_recv() {
+                Ok(ToUi::CleanupWait(waiting)) => {
+                    self.cleanup_wait = waiting;
+                    if waiting {
+                        self.password.wipe();
+                        self.secure_input.clear();
+                    }
+                }
                 Ok(ToUi::Prompt { text, echo }) => {
                     self.cover(ctx, &text);
                     match &mut self.phase {
@@ -492,6 +514,7 @@ impl Window {
                     self.cover(ctx, &reason);
                     self.password.wipe();
                     self.subject.attempts = None;
+                    self.cleanup_wait = false;
                     self.phase = Phase::Locked {
                         reason,
                         close_at: Instant::now() + Duration::from_secs(5),
@@ -531,7 +554,7 @@ impl Window {
     }
 
     fn submit(&mut self) {
-        if !matches!(self.phase, Phase::Password { waiting: false, .. }) {
+        if self.cleanup_wait || !matches!(self.phase, Phase::Password { waiting: false, .. }) {
             return;
         }
         let password = std::mem::take(&mut self.password);
@@ -554,6 +577,9 @@ impl Window {
     }
 
     fn backstop_hit(&self) -> bool {
+        if self.cleanup_wait && self.subject.deadline.is_some_and(|t| Instant::now() >= t) {
+            return true;
+        }
         match self.phase {
             Phase::Locked { close_at, .. } => Instant::now() >= close_at,
             Phase::Password {
@@ -561,6 +587,12 @@ impl Window {
             } => Instant::now() >= t,
             _ => false,
         }
+    }
+
+    /// Supporting descriptions sit between active guidance and muted labels.
+    /// Share the same tone in the collapsed and expanded request views.
+    fn description_color(visuals: &egui::Visuals) -> egui::Color32 {
+        visuals.text_color().gamma_multiply(0.8)
     }
 
     /// The sensor wait: a glyph and a short hint, or PAM's last complaint in
@@ -602,11 +634,11 @@ impl Window {
                 ui.label(
                     egui::RichText::new(text)
                         .size(11.0)
-                        .color(color.gamma_multiply(1.0 + 0.35 * strength)),
+                        .color(color.gamma_multiply(1.0 + 0.12 * strength)),
                 );
             }
             None => {
-                ui.label(egui::RichText::new(FINGERPRINT_HINT).size(11.0).weak());
+                ui.label(egui::RichText::new(FINGERPRINT_HINT).size(11.0));
             }
         }
     }
@@ -628,7 +660,7 @@ impl Window {
             ui.label(
                 egui::RichText::new(&prompt)
                     .size(11.5)
-                    .color(ui.visuals().text_color().gamma_multiply(0.5)),
+                    .color(ui.visuals().text_color()),
             );
             ui.add_space(8.0);
         }
@@ -692,7 +724,7 @@ impl Window {
                 );
             }
             Some((text, false)) => {
-                ui.label(egui::RichText::new(text).size(11.0).weak());
+                ui.label(egui::RichText::new(text).size(11.0));
             }
             None => {
                 ui.label(egui::RichText::new(" ").size(11.0));
@@ -715,7 +747,253 @@ impl Window {
         entered && !waiting && !self.password.is_empty()
     }
 
-    fn resize(&self, ctx: &egui::Context, height: f32) {
+    fn draw_body(&mut self, ui: &mut egui::Ui) -> egui::Rect {
+        egui::Frame::central_panel(ui.style())
+            .inner_margin(PANEL_MARGIN as i8)
+            .show(ui, |ui| {
+                ui.vertical_centered_justified(|ui| {
+                    self.draw_headline(ui);
+
+                    if self.details_open {
+                        self.draw_request_details(ui);
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+                    } else if let Some(detail) = self.subject.detail() {
+                        ui.add_space(3.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(detail)
+                                    .size(DETAIL_SIZE)
+                                    .color(Self::description_color(ui.visuals())),
+                            )
+                            .truncate(),
+                        );
+                    }
+
+                    // Whose password this is. The helper's prompt is a bare
+                    // "Password:" and never says, so the window does.
+                    if let Some(user) = &self.subject.user {
+                        ui.add_space(3.0);
+                        ui.label(
+                            egui::RichText::new(format!("for {user}"))
+                                .size(11.0)
+                                .color(ui.visuals().text_color()),
+                        );
+                    }
+                    let fingerprint = matches!(self.phase, Phase::Fingerprint { .. });
+                    ui.add_space(if fingerprint { 10.0 } else { 18.0 });
+                    if self.cleanup_wait {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new("Finishing previous authentication…").size(11.0),
+                        );
+                        ui.label(egui::RichText::new("Press Esc to cancel").size(11.0).weak());
+                    } else if fingerprint {
+                        self.draw_fingerprint_phase(ui);
+                    } else if let Phase::Locked { reason, .. } = &self.phase {
+                        ui.label(
+                            egui::RichText::new(reason)
+                                .size(11.0)
+                                .color(ui.visuals().error_fg_color),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Press Esc to close").size(11.0).weak());
+                    } else if self.draw_password_phase(ui) {
+                        self.submit();
+                    }
+                });
+            })
+            .response
+            .rect
+    }
+
+    fn desired_height(&self) -> f32 {
+        window_height(matches!(self.phase, Phase::Fingerprint { .. }))
+            + HEADLINE_EXTRA_HEIGHT
+            + if self.details_open {
+                DETAILS_EXTRA_HEIGHT
+            } else {
+                0.0
+            }
+    }
+
+    fn sync_size(&mut self, ctx: &egui::Context) {
+        // Request only logical state changes. Compositor rounding/animations must
+        // not cause a stream of slightly different configure requests on hover.
+        self.resize(ctx, self.desired_height());
+    }
+
+    fn draw_headline(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        const ICON_SPACE: f32 = 20.0;
+        let headline = if self.details_open {
+            "Request command".to_owned()
+        } else {
+            self.subject.headline()
+        };
+        let font = if self.details_open {
+            egui::FontId::proportional(10.0)
+        } else {
+            egui::FontId::monospace(HEADLINE_SIZE)
+        };
+        let base_color = if self.details_open {
+            ui.visuals().weak_text_color()
+        } else {
+            ui.visuals().strong_text_color()
+        };
+        let natural = ui
+            .painter()
+            .layout_no_wrap(headline.clone(), font.clone(), base_color);
+        let width = ui.available_width();
+        let shortened = self
+            .subject
+            .command
+            .as_ref()
+            .is_some_and(|command| command.truncated || command.full() != headline);
+        let show_icon = self.details_open || shortened || natural.size().x > width;
+        // A single fixed row, with no button padding, hover expansion or tooltip.
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Request details")
+        });
+        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let color = base_color;
+        let icon_color = if response.hovered() || response.has_focus() {
+            ui.visuals().strong_text_color()
+        } else {
+            ui.visuals().hyperlink_color
+        };
+        let text_width = (rect.width() - if show_icon { ICON_SPACE } else { 0.0 }).max(0.0);
+        let mut job = egui::text::LayoutJob::simple(headline, font, color, text_width);
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        let galley = ui.painter().layout_job(job);
+        let position = egui::pos2(
+            rect.left()
+                + if self.details_open {
+                    0.0
+                } else {
+                    (text_width - galley.size().x).max(0.0) * 0.5
+                },
+            rect.center().y - galley.size().y * 0.5,
+        );
+        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+        painter.galley(position, galley, color);
+        if show_icon {
+            // Vector magnifier: no font-dependent glyph metrics or hover geometry.
+            let center = egui::pos2(rect.right() - 11.0, rect.center().y - 1.0);
+            let stroke = egui::Stroke::new(1.2, icon_color);
+            if self.details_open {
+                // A fixed-position collapse chevron, outside the scroll area.
+                painter.line_segment(
+                    [
+                        center + egui::vec2(-3.5, 2.0),
+                        center + egui::vec2(0.0, -1.5),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        center + egui::vec2(0.0, -1.5),
+                        center + egui::vec2(3.5, 2.0),
+                    ],
+                    stroke,
+                );
+            } else {
+                painter.circle_stroke(center, 3.5, stroke);
+                painter.line_segment(
+                    [center + egui::vec2(2.5, 2.5), center + egui::vec2(6.0, 6.0)],
+                    stroke,
+                );
+            }
+        }
+        if response.clicked() {
+            self.details_open = !self.details_open;
+            self.resize(ui.ctx(), self.desired_height());
+        }
+        response
+    }
+
+    fn draw_request_details(&self, ui: &mut egui::Ui) {
+        if !self.details_open {
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("request-details")
+            .max_height(180.0)
+            .min_scrolled_height(180.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                    let strong = ui.visuals().strong_text_color();
+                    let description = Self::description_color(ui.visuals());
+                    let muted = ui.visuals().weak_text_color();
+                    if let Some(command) = &self.subject.command {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(command.full())
+                                    .monospace()
+                                    .size(13.0)
+                                    .color(strong),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "Process command line; execution is not verified.",
+                                )
+                                .size(10.0)
+                                .color(muted),
+                            )
+                            .wrap(),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Command line unavailable")
+                                .size(13.0)
+                                .color(strong),
+                        );
+                    }
+                    if let Some(action) = &self.subject.action {
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new("Permission request")
+                                .size(10.0)
+                                .color(muted),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(crate::invocation::metadata(
+                                    &self.subject.message,
+                                ))
+                                .size(12.0)
+                                .color(description),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(crate::invocation::metadata(action))
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(muted),
+                            )
+                            .wrap(),
+                        );
+                    }
+                });
+            });
+    }
+
+    fn resize(&mut self, ctx: &egui::Context, height: f32) {
+        if (self.requested_height - height).abs() < 0.5 {
+            return;
+        }
+        self.requested_height = height;
         let size = egui::vec2(self.width, height);
         ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
         ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(size));
@@ -727,7 +1005,8 @@ impl eframe::App for Window {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         let field_focused =
             ctx.memory(|m| m.has_focus(egui::Id::new(crate::secure_input::FIELD_ID)));
-        let accept = raw.focused
+        let accept = !self.cleanup_wait
+            && raw.focused
             && matches!(self.phase,
             Phase::Password { waiting: false, focus_set, .. } if field_focused || !focus_set);
         self.secure_input.protect(raw, accept);
@@ -746,15 +1025,7 @@ impl eframe::App for Window {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        // The switch from the sensor layout to the field asked for 200 once;
-        // ask again only while the compositor still reports the old height,
-        // not every frame for the rest of the window's life.
-        if matches!(self.phase, Phase::Password { .. }) && self.came_from_fingerprint {
-            let shown = ctx.input(|i| i.viewport().inner_rect.map(|r| r.height()));
-            if shown.is_some_and(|h| (h - WINDOW_HEIGHT).abs() > 1.0) {
-                self.resize(&ctx, WINDOW_HEIGHT);
-            }
-        }
+        self.sync_size(&ctx);
         // Nothing wakes this loop when the helper speaks, so look often.
         ctx.request_repaint_after(Duration::from_millis(50));
 
@@ -774,62 +1045,7 @@ impl eframe::App for Window {
         // headline must not be able to collide with it.
         let panel = ui.max_rect();
 
-        egui::Frame::central_panel(ui.style())
-            .inner_margin(PANEL_MARGIN as i8)
-            .show(ui, |ui| {
-                ui.vertical_centered_justified(|ui| {
-                    // The command leads: the one cue that something unexpected is
-                    // asking. polkit's own message says nothing useful for run0, so
-                    // it is the fallback rather than the headline.
-                    let headline = self.subject.headline();
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(headline)
-                                .size(HEADLINE_SIZE)
-                                .family(egui::FontFamily::Monospace)
-                                .color(ui.visuals().hyperlink_color),
-                        )
-                        .truncate(),
-                    );
-
-                    // What it will do, when the command line does not already
-                    // say. A desktop app's line names the binary and nothing
-                    // else; this is where "mount the filesystem" appears.
-                    if let Some(detail) = self.subject.detail() {
-                        ui.add_space(3.0);
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(detail).size(DETAIL_SIZE))
-                                .truncate(),
-                        );
-                    }
-
-                    // Whose password this is. The helper's prompt is a bare
-                    // "Password:" and never says, so the window does.
-                    if let Some(user) = &self.subject.user {
-                        ui.add_space(3.0);
-                        ui.label(
-                            egui::RichText::new(format!("for {user}"))
-                                .size(11.0)
-                                .color(ui.visuals().text_color().gamma_multiply(0.5)),
-                        );
-                    }
-                    let fingerprint = matches!(self.phase, Phase::Fingerprint { .. });
-                    ui.add_space(if fingerprint { 10.0 } else { 18.0 });
-                    if fingerprint {
-                        self.draw_fingerprint_phase(ui);
-                    } else if let Phase::Locked { reason, .. } = &self.phase {
-                        ui.label(
-                            egui::RichText::new(reason)
-                                .size(11.0)
-                                .color(ui.visuals().error_fg_color),
-                        );
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new("Press Esc to close").size(11.0).weak());
-                    } else if self.draw_password_phase(ui) {
-                        self.submit();
-                    }
-                });
-            });
+        self.draw_body(ui);
 
         self.secure_input.clear();
 
@@ -854,11 +1070,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cleanup_wait_hides_input_preserves_phase_and_blocks_submission() {
+        let (tx, to_ui) = std::sync::mpsc::channel();
+        let (from_ui, rx) = std::sync::mpsc::channel();
+        let subject = Subject {
+            command: None,
+            action: None,
+            message: "test".into(),
+            purpose: None,
+            user: None,
+            attempts: None,
+            deadline: None,
+            fingerprint_wait: false,
+        };
+        let mut window = Window::new(subject, font::Chain::new(), to_ui, from_ui, MIN_WIDTH);
+        let ctx = egui::Context::default();
+        window
+            .password
+            .buffer_mut()
+            .push_str("discard while waiting");
+        tx.send(ToUi::CleanupWait(true)).unwrap();
+        assert!(window.drain(&ctx));
+        assert!(window.cleanup_wait);
+        assert!(window.password.is_empty());
+        assert!(matches!(window.phase, Phase::Password { .. }));
+        window.submit();
+        assert!(
+            rx.try_recv().is_err(),
+            "waiting cannot submit even an empty password"
+        );
+        tx.send(ToUi::CleanupWait(false)).unwrap();
+        tx.send(ToUi::Prompt {
+            text: "Password:".into(),
+            echo: false,
+        })
+        .unwrap();
+        assert!(window.drain(&ctx));
+        assert!(!window.cleanup_wait);
+        window.password.buffer_mut().push_str("now allowed");
+        window.submit();
+        assert!(matches!(rx.try_recv(), Ok(FromUi::Answer(_))));
+    }
+
+    #[test]
+    fn cleanup_wait_obeys_the_existing_request_deadline() {
+        let (tx, to_ui) = std::sync::mpsc::channel();
+        let (from_ui, _rx) = std::sync::mpsc::channel();
+        let subject = Subject {
+            command: None,
+            action: None,
+            message: "test".into(),
+            purpose: None,
+            user: None,
+            attempts: None,
+            deadline: Some(Instant::now()),
+            fingerprint_wait: true,
+        };
+        let mut window = Window::new(subject, font::Chain::new(), to_ui, from_ui, MIN_WIDTH);
+        tx.send(ToUi::CleanupWait(true)).unwrap();
+        assert!(window.drain(&egui::Context::default()));
+        assert!(window.backstop_hit());
+    }
+
+    #[test]
     fn identical_fingerprint_responses_restart_feedback_and_prompt_ends_it() {
         let (tx, to_ui) = std::sync::mpsc::channel();
         let (from_ui, _rx) = std::sync::mpsc::channel();
         let subject = Subject {
             command: None,
+            action: None,
             message: "test".into(),
             purpose: None,
             user: None,
@@ -955,6 +1235,7 @@ mod tests {
         let (from_ui, _rx) = std::sync::mpsc::channel();
         let subject = Subject {
             command: None,
+            action: None,
             message: "test".into(),
             purpose: None,
             user: None,
@@ -1036,6 +1317,7 @@ mod tests {
         let (from_ui, rx) = std::sync::mpsc::channel();
         let subject = Subject {
             command: None,
+            action: None,
             message: "test".into(),
             purpose: None,
             user: None,
@@ -1113,6 +1395,7 @@ mod tests {
         let (from_ui, _rx) = std::sync::mpsc::channel();
         let subject = Subject {
             command: None,
+            action: None,
             message: "test".into(),
             purpose: None,
             user: None,
@@ -1153,6 +1436,7 @@ mod tests {
             let (from_ui, rx) = std::sync::mpsc::channel();
             let subject = Subject {
                 command: None,
+                action: None,
                 message: "test".into(),
                 purpose: None,
                 user: None,
@@ -1183,6 +1467,283 @@ mod tests {
             };
             *close_at = Instant::now() - Duration::from_secs(1);
             assert!(!window.drain(&ctx), "the notice eventually closes");
+        }
+    }
+
+    #[test]
+    fn request_details_retain_full_text_and_follow_authentication_layout() {
+        let (_tx, to_ui) = std::sync::mpsc::channel();
+        let (from_ui, _rx) = std::sync::mpsc::channel();
+        let full = format!("{} IMPORTANT_TAIL", "x".repeat(500));
+        let subject = Subject {
+            command: Some(crate::invocation::CommandInfo {
+                arguments: vec!["run0".into(), full.clone()],
+                truncated: false,
+            }),
+            action: Some("org.freedesktop.systemd1.manage-units".into()),
+            message: "Start a service".into(),
+            purpose: Some("Start a service".into()),
+            user: None,
+            attempts: None,
+            deadline: None,
+            fingerprint_wait: true,
+        };
+        assert!(!subject.headline().contains("IMPORTANT_TAIL"));
+        let mut window = Window::new(subject, font::Chain::new(), to_ui, from_ui, MIN_WIDTH);
+        let ctx = egui::Context::default();
+        let render = |window: &mut Window, events| {
+            let mut button = egui::Rect::NOTHING;
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(MIN_WIDTH, 500.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    button = window.draw_headline(ui).rect;
+                    window.draw_request_details(ui);
+                },
+            );
+            out.textures_delta.clear();
+            (button, out)
+        };
+        let (button, _) = render(&mut window, vec![]);
+        let position = button.center();
+        render(
+            &mut window,
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        render(
+            &mut window,
+            vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert!(window.details_open);
+        let (_, output) = render(&mut window, vec![]);
+        assert_eq!(
+            window.desired_height(),
+            FINGERPRINT_HEIGHT + HEADLINE_EXTRA_HEIGHT + DETAILS_EXTRA_HEIGHT
+        );
+        let texts: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => Some(t.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| text.contains("IMPORTANT_TAIL"))
+                .count(),
+            1
+        );
+        assert!(
+            !texts.contains(&window.subject.headline().as_str()),
+            "expanded view must replace the summary"
+        );
+        assert!(
+            !texts.contains(&"Technical information") && !texts.contains(&"Action ID"),
+            "the action ID has no redundant label or nested disclosure"
+        );
+        let command_format = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text.contains("IMPORTANT_TAIL") => {
+                    Some(&t.galley.job.sections[0].format)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let label_format = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == "Request command" => {
+                    Some(&t.galley.job.sections[0].format)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(command_format.font_id.size > label_format.font_id.size);
+        assert_ne!(command_format.color, label_format.color);
+        window.enter_password(&ctx, "Password:".into(), false);
+        assert!(window.details_open);
+        assert_eq!(
+            window.desired_height(),
+            WINDOW_HEIGHT + HEADLINE_EXTRA_HEIGHT + DETAILS_EXTRA_HEIGHT
+        );
+        assert!(window.password.is_empty());
+        render(
+            &mut window,
+            vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }],
+        );
+        render(
+            &mut window,
+            vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert!(!window.details_open);
+        assert_eq!(
+            window.desired_height(),
+            WINDOW_HEIGHT + HEADLINE_EXTRA_HEIGHT
+        );
+    }
+
+    #[test]
+    fn magnifier_tracks_elision_and_hover_never_resizes_the_window() {
+        for (command, width, open, truncated, icon) in [
+            ("true".to_owned(), 400.0, false, false, false),
+            ("true".to_owned(), 400.0, true, false, true),
+            ("x".repeat(150), 400.0, false, false, true),
+            ("wide-command".to_owned(), 55.0, false, false, true),
+            ("true".to_owned(), 400.0, false, true, true),
+        ] {
+            let (_tx, to_ui) = std::sync::mpsc::channel();
+            let (from_ui, _rx) = std::sync::mpsc::channel();
+            let subject = Subject {
+                command: Some(crate::invocation::CommandInfo {
+                    arguments: vec![command],
+                    truncated,
+                }),
+                action: None,
+                message: "test".into(),
+                purpose: None,
+                user: None,
+                attempts: None,
+                deadline: None,
+                fingerprint_wait: false,
+            };
+            let mut window = Window::new(subject, font::Chain::new(), to_ui, from_ui, width);
+            window.details_open = open;
+            window.requested_height = window.desired_height();
+            let ctx = egui::Context::default();
+            let mut previous = None;
+            for hovered in [false, true, true, false] {
+                let mut raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 500.0),
+                    )),
+                    events: vec![egui::Event::PointerMoved(if hovered {
+                        egui::pos2(width - 10.0, 9.0)
+                    } else {
+                        egui::pos2(width + 10.0, 100.0)
+                    })],
+                    ..Default::default()
+                };
+                // Simulate a compositor-reported fractional/rounded size difference.
+                raw.viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .inner_rect = Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, window.desired_height() + 2.0),
+                ));
+                let mut bounds = egui::Rect::NOTHING;
+                let mut output = ctx.run_ui(raw, |ui| {
+                    window.sync_size(ui.ctx());
+                    bounds = window.draw_headline(ui).rect;
+                });
+                output.textures_delta.clear();
+                assert_eq!(
+                    output.shapes.iter().any(|s| matches!(
+                        s.shape,
+                        egui::Shape::Circle(_) | egui::Shape::LineSegment { .. }
+                    )),
+                    icon
+                );
+                if let Some(previous) = previous {
+                    assert_eq!(bounds, previous);
+                }
+                previous = Some(bounds);
+                assert!(
+                    output
+                        .viewport_output
+                        .values()
+                        .all(|v| v.commands.iter().all(|c| !matches!(
+                            c,
+                            egui::ViewportCommand::InnerSize(_)
+                                | egui::ViewportCommand::MinInnerSize(_)
+                                | egui::ViewportCommand::MaxInnerSize(_)
+                        )))
+                );
+                assert_eq!(window.details_open, open);
+            }
+        }
+    }
+
+    #[test]
+    fn request_details_fit_with_user_purpose_and_authentication_feedback() {
+        let (_tx, to_ui) = std::sync::mpsc::channel();
+        let (from_ui, _rx) = std::sync::mpsc::channel();
+        let subject = Subject {
+            command: Some(crate::invocation::CommandInfo {
+                arguments: vec!["run0".into(), "x".repeat(500)],
+                truncated: false,
+            }),
+            action: Some("org.freedesktop.systemd1.manage-units".into()),
+            message: "Start a service".into(),
+            purpose: Some("Start a service".into()),
+            user: Some("test-user".into()),
+            attempts: Some(("3 attempts remaining".into(), true)),
+            deadline: None,
+            fingerprint_wait: true,
+        };
+        let mut window = Window::new(subject, font::Chain::new(), to_ui, from_ui, MIN_WIDTH);
+        let ctx = egui::Context::default();
+        for fingerprint in [true, false] {
+            if !fingerprint {
+                window.enter_password(&ctx, "Password:".into(), false);
+            }
+            for open in [false, true] {
+                window.details_open = open;
+                let height = window.desired_height();
+                let mut bounds = egui::Rect::NOTHING;
+                let mut out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(MIN_WIDTH, height),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        bounds = window.draw_body(ui);
+                    },
+                );
+                out.textures_delta.clear();
+                assert!(
+                    bounds.bottom() <= height + 1.0,
+                    "fingerprint={fingerprint}, open={open}: {bounds:?}, height={height}"
+                );
+            }
         }
     }
 

@@ -119,6 +119,8 @@ pub trait Conversation {
     }
     /// Updates the standing budget / remaining attempts shown on the prompt.
     fn update_attempts(&mut self, _attempts: Option<(String, bool)>) {}
+    /// A previous socket helper is still being cleaned up.
+    fn cleanup_wait(&mut self, _waiting: bool) {}
     /// True when the window has closed. Polled between helper reads so a
     /// fingerprint wait (no `ask` yet) can still end as a cancel.
     fn cancelled(&self) -> bool {
@@ -138,8 +140,15 @@ struct Channel {
 }
 
 impl Channel {
-    fn socket(username: &str, cookie: &str) -> std::io::Result<Self> {
+    fn socket(
+        username: &str,
+        cookie: &str,
+        ticket: Option<&mut crate::cleanup::Ticket>,
+    ) -> std::io::Result<Self> {
         let stream = UnixStream::connect(socket_path())?;
+        if let Some(ticket) = ticket {
+            ticket.track(&stream)?;
+        }
         let reader = stream.try_clone()?;
         let read_fd = reader.as_raw_fd();
         let mut writer = stream;
@@ -251,9 +260,9 @@ fn attempt(channel: std::io::Result<Channel>, conv: &mut dyn Conversation) -> Ou
     let mut saw_prompt = false;
     let mut line = String::new();
     loop {
-        // Returning here drops `channel`: the socket closes, or the forked
-        // helper is killed. Either way PAM stops listening to the sensor, so a
-        // finger placed after Esc cannot authorise what was just cancelled.
+        // The prompt exits on cancel, ending its polkit request. A socket
+        // helper may still be inside PAM: the agent retains its connection
+        // and gates subsequent attempts until cleanup reaches EOF.
         if conv.cancelled() {
             return Outcome::Cancelled;
         }
@@ -322,22 +331,137 @@ fn attempt(channel: std::io::Result<Channel>, conv: &mut dyn Conversation) -> Ou
 /// another door: that is exactly how the socket helper fails on a kernel that
 /// cannot pass a pidfd.
 pub fn authenticate(username: &str, cookie: &str, conv: &mut dyn Conversation) -> Outcome {
+    authenticate_with_monitor(username, cookie, conv, None)
+}
+
+pub fn authenticate_with_monitor(
+    username: &str,
+    cookie: &str,
+    conv: &mut dyn Conversation,
+    mut monitor: Option<&mut crate::cleanup::Monitor>,
+) -> Outcome {
+    let mut ticket = match monitor.as_deref_mut() {
+        Some(monitor) => match monitor.begin(conv) {
+            Ok(Some(ticket)) => Some(ticket),
+            Ok(None) => return Outcome::Cancelled,
+            Err(e) => {
+                conv.locked(&format!("Cannot start authentication: {e}"));
+                return Outcome::Cancelled;
+            }
+        },
+        None => None,
+    };
+    if conv.cancelled() {
+        return Outcome::Cancelled;
+    }
     let socket_reachable = std::path::Path::new(&socket_path()).exists();
 
     if socket_reachable {
-        match attempt(Channel::socket(username, cookie), conv) {
+        let channel = Channel::socket(username, cookie, ticket.as_mut());
+        if ticket.is_some()
+            && let Err(e) = &channel
+        {
+            // A failed transfer/ack must never fall through to an untracked
+            // authentication or reuse a desynchronised control connection.
+            conv.locked(&format!("Cannot track authentication helper: {e}"));
+            return Outcome::Cancelled;
+        }
+        match attempt(channel, conv) {
             Outcome::RefusedWithoutPrompt => {
                 conv.info("socket helper closed without asking; trying the setuid helper");
+                // The socket can outlive FAILURE. Release and reacquire the
+                // gate before starting a setuid helper against the same PAM stack.
+                drop(ticket.take());
+                if let Some(monitor) = monitor {
+                    ticket = match monitor.begin(conv) {
+                        Ok(Some(ticket)) => Some(ticket),
+                        _ => return Outcome::Cancelled,
+                    };
+                }
             }
             other => return other,
         }
     }
-    attempt(Channel::fork(username, cookie), conv)
+    let outcome = attempt(Channel::fork(username, cookie), conv);
+    drop(ticket);
+    outcome
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cancelled_socket_attempt_returns_while_agent_retains_cleanup() {
+        use std::os::unix::net::UnixListener;
+        use std::sync::{Arc, Mutex};
+        let _env = crate::TEST_ENV_LOCK.lock().unwrap();
+        let path = format!("/tmp/sudo-pop-helper-test-{}.sock", std::process::id());
+        let listener = UnixListener::bind(&path).unwrap();
+        let old_path = std::env::var_os("SUDO_POP_HELPER_SOCKET");
+        unsafe {
+            std::env::set_var("SUDO_POP_HELPER_SOCKET", &path);
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let fake = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut input = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            input.read_line(&mut line).unwrap();
+            assert_eq!(line, "tester\n");
+            line.clear();
+            input.read_line(&mut line).unwrap();
+            assert_eq!(line, "diagnostic-cookie\n");
+            socket.write_all(b"PAM_TEXT_INFO Touch sensor\n").unwrap();
+            assert_eq!(input.read_line(&mut String::new()).unwrap(), 0);
+            done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        });
+        struct CancelOnInfo(bool);
+        impl Conversation for CancelOnInfo {
+            fn ask(&mut self, _: &str, _: bool) -> Option<Secret> {
+                panic!("no password");
+            }
+            fn info(&mut self, _: &str) {
+                self.0 = true;
+            }
+            fn error(&mut self, _: &str) {
+                panic!("no error");
+            }
+            fn cancelled(&self) -> bool {
+                self.0
+            }
+        }
+        let gate = Arc::new(Mutex::new(false));
+        let (client, server) = UnixStream::pair().unwrap();
+        let server_gate = gate.clone();
+        let observer = std::thread::spawn(move || crate::cleanup::serve(server, server_gate));
+        let mut monitor = crate::cleanup::Monitor::new(client);
+        assert_eq!(
+            authenticate_with_monitor(
+                "tester",
+                "diagnostic-cookie",
+                &mut CancelOnInfo(false),
+                Some(&mut monitor)
+            ),
+            Outcome::Cancelled
+        );
+        assert!(
+            gate.try_lock().is_err(),
+            "helper still owns the sensor after prompt cancellation"
+        );
+        drop(monitor);
+        done_tx.send(()).unwrap();
+        fake.join().unwrap();
+        observer.join().unwrap();
+        assert!(!*gate.lock().unwrap());
+        unsafe {
+            match old_path {
+                Some(path) => std::env::set_var("SUDO_POP_HELPER_SOCKET", path),
+                None => std::env::remove_var("SUDO_POP_HELPER_SOCKET"),
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn a_tag_splits_off_its_body_on_the_first_space() {

@@ -1,86 +1,141 @@
-//! Which command is asking for the password.
-//!
-//! polkit's own `message` does not say. For run0 it reads "Authentication is
-//! required to start transient unit 'run-p1630183-i1624710.service'." -- a
-//! random unit name and nothing about what will run. A password box that says
-//! only that gives no way to notice that something unexpected is asking.
-//!
-//! `details` carries `polkit.subject-pid`, the process that wanted the
-//! privilege, and `/proc/<pid>/cmdline` is right there. This is the same job
-//! the sudo wrapper did by reading its parent; only the pid comes from
-//! somewhere else now.
+//! Bounded, escaped request metadata for display. A process command line is
+//! caller-controlled reference information, not proof of what will execute.
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::os::unix::ffi::OsStringExt;
 
-/// Longest command shown before it is cut short.
 const MAX_DISPLAY_CHARS: usize = 120;
-
-/// Longest purpose line shown before it is cut short. Shorter than the command
-/// because it is the second line and a whole sentence, not an invocation.
 const MAX_PURPOSE_CHARS: usize = 64;
-
-/// polkit writes every message as "Authentication is required to <do a thing>."
-/// The window has already said it is asking for a password, so the wrapper is
-/// dead weight. Stripped only when it matches: we register with a locale and
-/// the sentence comes back translated, and a translation we do not recognise is
-/// shown whole rather than mangled.
+const MAX_COMMAND_BYTES: usize = 16 * 1024;
+const MAX_ARGUMENTS: usize = 256;
+const MAX_METADATA_BYTES: usize = 8192;
 const MESSAGE_PREFIX: &str = "Authentication is required to ";
 
-/// Actions whose message says less than the command line already does.
-///
-/// `manage-units` is how `run0` runs everything, and its message names a
-/// transient unit -- `run-p1592228-i1586931.service`, a number generated for
-/// that one invocation. Measured: the window's first line already reads
-/// `run0 pacman -Syu`, so the sentence adds a random name and nothing else.
-const UNINFORMATIVE_ACTIONS: [&str; 1] = ["org.freedesktop.systemd1.manage-units"];
+#[derive(Clone, Debug)]
+pub struct CommandInfo {
+    /// Escaped arguments, preserving empty arguments and their boundaries.
+    pub arguments: Vec<String>,
+    pub truncated: bool,
+}
 
-/// The command sudo is about to run, read from our parent.
-///
-/// The askpass path has no polkit details to consult: sudo forks us and its own
-/// command line is `sudo -A <command>`. `/proc/<pid>/cmdline` stays world
-/// readable even for a setuid process, so no extra channel is needed.
-pub fn command_from_sudo() -> Option<String> {
-    // SAFETY: getppid cannot fail.
-    let parent = unsafe { libc::getppid() } as u32;
-    let raw = std::fs::read(format!("/proc/{parent}/cmdline")).ok()?;
-    let argv: Vec<OsString> = raw
-        .split(|&b| b == 0)
-        .filter(|part| !part.is_empty())
+impl CommandInfo {
+    pub fn full(&self) -> String {
+        let mut text = self.arguments.join(" ");
+        if self.truncated {
+            text.push_str(" [command data truncated]");
+        }
+        text
+    }
+
+    pub fn summary(&self) -> String {
+        cut(&self.full(), MAX_DISPLAY_CHARS)
+    }
+}
+
+/// Byte-preserving display, not a shell command to copy and execute.
+fn argument(bytes: &[u8]) -> String {
+    if !bytes.is_empty()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b"_./:@%+=,-".contains(b))
+    {
+        return String::from_utf8(bytes.to_vec()).unwrap();
+    }
+    let mut result = String::from("\"");
+    for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            result.extend(c.escape_debug());
+        }
+        for b in chunk.invalid() {
+            use std::fmt::Write;
+            write!(result, "\\x{b:02x}").unwrap();
+        }
+    }
+    result.push('"');
+    result
+}
+
+/// Escape untrusted metadata too; never render control/bidi bytes as UI syntax.
+pub fn metadata(text: &str) -> String {
+    let mut end = text.len().min(MAX_METADATA_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut shown: String = text[..end]
+        .chars()
+        .map(|c| {
+            if c == '\'' || c == '"' {
+                c.to_string()
+            } else {
+                c.escape_debug().to_string()
+            }
+        })
+        .collect();
+    if end < text.len() {
+        shown.push_str(" [metadata truncated]");
+    }
+    shown
+}
+
+fn read_command(pid: u32) -> Option<Vec<u8>> {
+    let mut raw = Vec::new();
+    std::fs::File::open(format!("/proc/{pid}/cmdline"))
+        .ok()?
+        .take((MAX_COMMAND_BYTES + 1) as u64)
+        .read_to_end(&mut raw)
+        .ok()?;
+    Some(raw)
+}
+
+fn parse(raw: &[u8]) -> (Vec<OsString>, bool) {
+    let truncated_bytes = raw.len() > MAX_COMMAND_BYTES;
+    let raw = &raw[..raw.len().min(MAX_COMMAND_BYTES)];
+    if raw.is_empty() {
+        return (vec![], truncated_bytes);
+    }
+    // Remove the terminator only. Interior and final empty arguments matter.
+    let raw = raw.strip_suffix(&[0]).unwrap_or(raw);
+    let mut parts = raw.split(|&b| b == 0);
+    let argv = parts
+        .by_ref()
+        .take(MAX_ARGUMENTS)
         .map(|part| OsString::from_vec(part.to_vec()))
         .collect();
+    (argv, truncated_bytes || parts.next().is_some())
+}
 
-    // Only trust a parent that really is sudo; anything else means we are not
-    // in the flow this is meant to describe.
+fn from_args(argv: &[OsString], truncated: bool) -> Option<CommandInfo> {
+    (!argv.is_empty()).then(|| CommandInfo {
+        arguments: argv
+            .iter()
+            .map(|a| argument(a.as_encoded_bytes()))
+            .collect(),
+        truncated,
+    })
+}
+
+/// Askpass metadata has no polkit action. Even the parent's argv is only a hint.
+pub fn command_from_sudo() -> Option<CommandInfo> {
+    // SAFETY: getppid cannot fail.
+    let raw = read_command(unsafe { libc::getppid() } as u32)?;
+    let (argv, truncated) = parse(&raw);
     let program = argv.first()?;
     if std::path::Path::new(program).file_name()? != std::ffi::OsStr::new("sudo") {
         return None;
     }
-
     let start = crate::sudo_args::command_start(&argv[1..])? + 1;
-    let command = argv[start..]
-        .iter()
-        .map(|a| a.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(" ");
-    (!command.is_empty()).then(|| shorten(&command))
+    from_args(&argv[start..], truncated)
 }
 
-/// The command behind an authentication request, or `None` when it cannot be
-/// established. Showing nothing is better than showing a guess.
-pub fn command_of(pid: u32) -> Option<String> {
+pub fn command_of(pid: u32) -> Option<CommandInfo> {
     if !owned_by_us(pid) {
         return None;
     }
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    describe(&raw)
+    describe(&read_command(pid)?)
 }
 
-/// Only describe a process running as us.
-///
-/// The pid arrives over D-Bus and the process may have exited and been
-/// replaced by the time we look, so this is a check against describing
-/// somebody else's command, not a security boundary of its own.
+// This UID check limits accidental disclosure; it is not an execution guarantee.
 fn owned_by_us(pid: u32) -> bool {
     let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
         return false;
@@ -94,56 +149,17 @@ fn owned_by_us(pid: u32) -> bool {
         .is_some_and(|uid| uid == me)
 }
 
-/// Render a NUL-separated `/proc/<pid>/cmdline` as one line.
-fn describe(raw: &[u8]) -> Option<String> {
-    let argv: Vec<OsString> = raw
-        .split(|&b| b == 0)
-        .filter(|part| !part.is_empty())
-        .map(|part| OsString::from_vec(part.to_vec()))
-        .collect();
-
-    if argv.is_empty() {
-        return None;
-    }
-
-    let command = argv
-        .iter()
-        .map(|a| a.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if command.is_empty() {
-        return None;
-    }
-    Some(shorten(&command))
+fn describe(raw: &[u8]) -> Option<CommandInfo> {
+    let (argv, truncated) = parse(raw);
+    from_args(&argv, truncated)
 }
 
-/// What the request will do, from polkit's own wording, or `None` when that
-/// wording would add nothing.
-///
-/// The two paths need opposite things. On `run0` the command line is the whole
-/// story and polkit's sentence is noise (see `UNINFORMATIVE_ACTIONS`). A
-/// request from a desktop app is the other way round: the command line is
-/// whatever binary happens to be running -- `quickshell -n -p ...` -- which
-/// says who is asking but not what for, and the sentence is the only place
-/// "mount the filesystem" appears.
-///
-/// `have_command` decides which of those we are in: with no command to lead
-/// with, the sentence is all there is and is never suppressed.
-pub fn purpose(message: &str, action_id: &str, have_command: bool) -> Option<String> {
+/// Compact purpose line. The full polkit message and action remain in details.
+pub fn purpose(message: &str, _action_id: &str, _have_command: bool) -> Option<String> {
     let message = message.trim();
-    if message.is_empty() {
-        return None;
-    }
-    if have_command && UNINFORMATIVE_ACTIONS.contains(&action_id) {
-        return None;
-    }
     let text = message.strip_prefix(MESSAGE_PREFIX).unwrap_or(message);
     let text = text.trim().trim_end_matches('.').trim();
-    (!text.is_empty()).then(|| cut(text, MAX_PURPOSE_CHARS))
-}
-
-fn shorten(command: &str) -> String {
-    cut(command, MAX_DISPLAY_CHARS)
+    (!text.is_empty()).then(|| cut(&metadata(text), MAX_PURPOSE_CHARS))
 }
 
 fn cut(text: &str, limit: usize) -> String {
@@ -170,20 +186,22 @@ mod tests {
     #[test]
     fn shows_the_whole_invocation() {
         assert_eq!(
-            describe(&cmdline(&["run0", "pacman", "-Syu"])),
+            describe(&cmdline(&["run0", "pacman", "-Syu"])).map(|c| c.full()),
             Some("run0 pacman -Syu".into())
         );
     }
 
     #[test]
     fn an_empty_cmdline_says_nothing() {
-        assert_eq!(describe(&[]), None);
-        assert_eq!(describe(&cmdline(&[])), None);
+        assert!(describe(&[]).is_none());
+        assert!(describe(&cmdline(&[])).is_none());
     }
 
     #[test]
     fn long_commands_are_cut_short() {
-        let shown = describe(&cmdline(&["run0", "sh", "-c", &"x".repeat(300)])).unwrap();
+        let command = describe(&cmdline(&["run0", "sh", "-c", &"x".repeat(300)])).unwrap();
+        assert!(command.full().ends_with(&"x".repeat(300)));
+        let shown = command.summary();
         assert!(shown.chars().count() <= MAX_DISPLAY_CHARS, "{shown}");
         assert!(shown.ends_with('…'));
     }
@@ -207,12 +225,12 @@ mod tests {
     }
 
     #[test]
-    fn run0s_transient_unit_name_is_not_worth_a_line() {
+    fn run0_purpose_is_retained_even_with_a_command() {
         // Measured wording. The window's first line already says `run0 ...`.
         let message =
             "Authentication is required to start transient unit 'run-p1592228-i1586931.service'.";
-        assert_eq!(purpose(message, RUN0, true), None);
-        // ... unless there is no command line, when it is all we have.
+        assert_eq!(purpose(message, RUN0, true), purpose(message, RUN0, false));
+        // The purpose is retained whether or not a command line is available.
         assert_eq!(
             purpose(message, RUN0, false).as_deref(),
             Some("start transient unit 'run-p1592228-i1586931.service'")
@@ -264,6 +282,43 @@ mod tests {
         .unwrap();
         assert!(shown.chars().count() <= MAX_PURPOSE_CHARS, "{shown}");
         assert!(shown.ends_with('…'));
+    }
+
+    #[test]
+    fn argument_boundaries_empty_values_and_invalid_bytes_are_preserved() {
+        let info = describe(b"echo\0a b\0\0bad\xff\0").unwrap();
+        assert_eq!(info.arguments, ["echo", "\"a b\"", "\"\"", "\"bad\\xff\""]);
+        assert_ne!(info.full(), describe(b"echo\0a\0b\0").unwrap().full());
+        assert_ne!(argument(b"bad\xff"), argument(b"bad\\xff"));
+    }
+
+    #[test]
+    fn controls_and_direction_overrides_cannot_spoof_the_display() {
+        let text = "a\n\t\r\u{1b}\u{202e}\u{2066}\u{200b}b";
+        for shown in [argument(text.as_bytes()), metadata(text)] {
+            for c in [
+                '\n', '\t', '\r', '\u{1b}', '\u{202e}', '\u{2066}', '\u{200b}',
+            ] {
+                assert!(!shown.contains(c), "{shown:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn collection_limits_are_explicit() {
+        let raw = vec![b'x'; MAX_COMMAND_BYTES + 1];
+        let info = describe(&raw).unwrap();
+        assert!(info.truncated);
+        assert!(info.full().ends_with("[command data truncated]"));
+        let info = describe(&cmdline(&vec![""; MAX_ARGUMENTS + 1])).unwrap();
+        assert_eq!(info.arguments.len(), MAX_ARGUMENTS);
+        assert!(info.truncated);
+        assert!(metadata(&"가".repeat(MAX_METADATA_BYTES)).ends_with("[metadata truncated]"));
+    }
+
+    #[test]
+    fn vanished_process_is_unavailable() {
+        assert!(command_of(u32::MAX).is_none());
     }
 
     #[test]

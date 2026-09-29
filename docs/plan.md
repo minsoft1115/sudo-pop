@@ -1,4 +1,8 @@
-> 2026-09-28 설치 변경: `sudo` alias 대신 터미널 PATH 래퍼를 설치한다.
+> 2026-09-28 업데이트: 기본 래퍼는 run0 전용이며 sudo 자동 전환을 하지 않는다.
+> 아래의 기존 혼합 라우팅 설명은 `SUDO_POP_MODE=compat`에 해당한다.
+> 현재 동작과 호환성은 [요청 표시와 실행 정책](request-display-and-run0.md)을 참고한다.
+
+> 이전 설치 변경 기록: `sudo` alias 대신 터미널 PATH 래퍼를 설치한다.
 > 래퍼는 기존 sudo-pop 실행 분기를 유지한다. 일반 명령은 run0 로, sudo 전용 옵션은
 > 실제 sudo 로 전달하며, `SUDO_POP_RUN0` 값을 강제하지 않는다.
 

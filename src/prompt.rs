@@ -9,6 +9,8 @@
 //! The helper conversation runs on a second thread because the window owns the
 //! main one (winit allows a single event loop per process).
 
+use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
@@ -27,9 +29,9 @@ pub const EXIT_CANCELLED: i32 = 2;
 
 /// Set by the SIGTERM handler. polkitd's cancel reaches this process as a
 /// SIGTERM from the agent (`agent.rs`), and dying on the spot would skip
-/// `Channel`'s drop: the socket helper would notice only at its next write,
-/// and a forked setuid helper would not be killed at all, leaving PAM at the
-/// sensor for the rest of its timeout. So the signal only raises this flag;
+/// `Channel`'s drop, including killing/reaping a forked helper. Socket
+/// helpers are tracked separately by the agent until their connection ends.
+/// The signal only raises this flag;
 /// the window and the helper loop both poll it and take the same road as Esc.
 pub static TERMINATED: AtomicBool = AtomicBool::new(false);
 
@@ -112,6 +114,15 @@ impl Conversation for WindowConversation {
             return None;
         }
         answer
+    }
+
+    fn cleanup_wait(&mut self, waiting: bool) {
+        if waiting && let Ok(mut pending) = self.pending.lock() {
+            // An answer entered before the waiting notice appeared must not
+            // silently survive after the UI clears its password field.
+            pending.take();
+        }
+        let _ = self.to_ui.send(ToUi::CleanupWait(waiting));
     }
 
     fn info(&mut self, text: &str) {
@@ -242,6 +253,20 @@ pub fn run() -> ! {
         eprintln!("sudo-pop: no cookie on stdin");
         std::process::exit(EXIT_FAILED);
     }
+    // stdin is the private agent socket. Keep a CLOEXEC duplicate for the
+    // helper worker; it must never leak into the fork helper or lid probe.
+    // SAFETY: fcntl duplicates our open stdin; OwnedFd takes the new fd only.
+    let control_fd = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    if control_fd < 0 {
+        eprintln!("sudo-pop: cannot open helper cleanup channel");
+        std::process::exit(EXIT_CANCELLED);
+    }
+    let control = UnixStream::from(unsafe { OwnedFd::from_raw_fd(control_fd) });
+    if control.peer_addr().is_err() {
+        eprintln!("sudo-pop: agent prompt requires a private cleanup socket");
+        std::process::exit(EXIT_CANCELLED);
+    }
+    let mut monitor = crate::cleanup::Monitor::new(control);
     let cookie = cookie.trim_end_matches('\n').to_owned();
 
     if username.is_empty() {
@@ -283,7 +308,9 @@ pub fn run() -> ! {
             get_budget: || attempts::budget(attempts::POLKIT_SERVICE),
         };
         let last = begin_authentication(&mut conv, fingerprint_wait, locked, |conv| {
-            run_attempts(conv, |conv| helper::authenticate(&username, &cookie, conv))
+            run_attempts(conv, |conv| {
+                helper::authenticate_with_monitor(&username, &cookie, conv, Some(&mut monitor))
+            })
         });
         // Some PAM stacks refuse a locked account without asking a question.
         // There was no ask() at which to show the lock notice in that case.
@@ -305,6 +332,7 @@ pub fn run() -> ! {
     let subject = Subject {
         purpose: invocation::purpose(&message, &action, command.is_some()),
         command,
+        action: Some(action),
         message,
         user: (!user_display.is_empty()).then_some(user_display),
         attempts,
@@ -345,6 +373,25 @@ mod tests {
             remaining: 0,
             unlock_in: Some(60),
         })
+    }
+
+    #[test]
+    fn cleanup_wait_discards_a_password_queued_before_the_notice() {
+        let (to_ui, rx) = channel();
+        let (_tx, from_ui) = channel();
+        let mut secret = Secret::new();
+        secret.buffer_mut().push_str("must be discarded");
+        let mut conv = WindowConversation {
+            to_ui,
+            from_ui,
+            pending: std::sync::Mutex::new(Some(secret)),
+            get_budget: || None,
+        };
+        conv.cleanup_wait(true);
+        assert!(conv.pending.lock().unwrap().is_none());
+        assert!(matches!(rx.try_recv(), Ok(ToUi::CleanupWait(true))));
+        conv.cleanup_wait(false);
+        assert!(matches!(rx.try_recv(), Ok(ToUi::CleanupWait(false))));
     }
 
     #[test]

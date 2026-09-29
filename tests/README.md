@@ -58,3 +58,31 @@ Hyprland 세션에서 `cargo`, `hyprctl`, `jq`, `wtype`이 필요하다. 실행 
 ## 2026-09-28 보완 검증
 
 전체 Cargo 테스트 169개와 격리 GUI 시나리오 2개가 통과했다. 전체 데스크톱 시나리오는 셸 문법과 코드를 점검했으며 이번 보완 과정에서 실행하지 않았다. 실제 비밀번호·지문 인증과 실제 IME 조합에 대한 수동 검증은 별도로 남는다.
+
+## 요청 표시와 run0 전용 실행 회귀 테스트
+
+`cargo test --offline`은 명령 인자 표시·상한·특수문자·없는 PID, egui 상세 보기 클릭·닫기·
+인증 단계 전환, run0 기본 정책과 실제 CLI 거절 동작을 포함한다. 가짜 run0로 바이트 보존,
+종료 코드, 시그널, 시작 실패를 검사한다. 이 테스트는 실제 권한 상승을 하지 않는다.
+Unix 소켓 테스트는 소켓 생성이 가능한 환경이 필요하다.
+
+실제 GUI 입력은 `./tests/input-scenario.sh`로 확인한다. 실제 지문·polkit 캐시·Omarchy
+업데이트 동작은 자동 테스트와 별개다. 실행 정책과 명시적 호환 선택은
+[요청 표시와 실행 정책](../docs/request-display-and-run0.md)을 참고한다.
+
+상세 보기 시나리오는 Shift+Tab/Enter로 명령줄에 포커스를 옮겨 영역을 열고 닫아 실제 창 높이 변화와 답변 미전송을
+확인한 뒤, 입력칸으로 돌아와 테스트 문자열이 정확히 전달되는지 검사한다. 총 3개 시나리오다.
+
+### Socket helper cancellation and cleanup
+
+`cargo test` includes the socket lifecycle tests in `src/cleanup.rs` and
+`src/helper.rs`: a cancelled helper holds the gate until EOF, a late success
+message does not release it, prompt death without a release is handled, and a
+waiting request can be cancelled without starting another helper. GUI tests
+check waiting/input/deadline behavior. Unix socket fd passing must be permitted
+by the test environment; sandbox permission errors are not application failures.
+
+Standalone `--agent-prompt` scenarios now use `tests/prompt-driver.py` to provide
+the private agent socket protocol. A plain `echo cookie | sudo-pop --agent-prompt`
+is no longer a valid harness. The driver preserves the prompt PID for GUI tests.
+See [helper cleanup](../docs/helper-cleanup.md) for behavior and manual checks.

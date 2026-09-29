@@ -6,12 +6,12 @@ Omarchy 에서 권한이 필요한 모든 순간 — `sudo`·`run0`·디스크 �
 systemctl — 의 비밀번호를 한 창에서 받는다. 그 창은 메모리·코어덤프·화면 공유·로그를 통한
 비밀번호 노출을 줄이도록 설계했다.
 
-**polkit 인증 에이전트**와 **sudo 인증창 연결**을 제공한다. 모든 길이 같은 창으로 모인다:
+**polkit 인증 에이전트**와 **sudo 인증창 연결**을 제공한다. 기본 래퍼는 run0 를 실행하고 에이전트가 인증 창을 표시한다:
 
 ```
 sudo pacman -Syu   →  run0 pacman -Syu   ─┐
-sudo -E make       →  sudo -A -E make    ─┤→  같은 창
-디스크 마운트 · NetworkManager · systemctl ─┘
+sudo -E make       →  지원하지 않음 (/usr/bin/sudo 명시 호출)
+디스크 마운트 · NetworkManager · systemctl ─┘→ 같은 창
 ```
 
 <p align="center">
@@ -20,11 +20,17 @@ sudo -E make       →  sudo -A -E make    ─┤→  같은 창
             아래에 잠금까지 남은 횟수">
 </p>
 
-설치하면 터미널의 PATH 에 전용 `sudo` 래퍼를 추가한다. 일반 명령은 기존처럼 run0 와
-polkit 으로 실행하고, sudo 전용 옵션은 기존 실제 sudo 경로로 전달한다. 터미널에서 시작한
-CLI 에이전트와 스크립트도 PATH 를 상속한다. polkit 경로는 지문 대기부터 같은 창을 사용한다.
-실제 sudo 경로에서는 sudo PAM 이 지문을 먼저 처리하므로 지문 대기에 창이 없을 수 있다.
-창에는 확인 가능한 요청 명령을 표시한다.
+설치하면 터미널의 PATH 에 전용 `sudo` 래퍼를 추가한다. **기본값은 run0 전용**이다.
+sudo 전용 옵션·선행 환경변수 할당은 거절하며, run0 시작 실패 시 sudo 로 전환하지 않는다.
+터미널에서 시작한 CLI 에이전트와 스크립트도 PATH 를 상속한다.
+실제 sudo 가 필요하면 `/usr/bin/sudo` 를 명시적으로 호출하거나,
+`SUDO_POP_MODE=compat` 으로 기존 혼합 라우팅을 선택한다.
+`sudo -v` 를 사용하는 스크립트와 현재 Omarchy 업데이트 경로에 호환성 영향이 있다.
+자세한 선택 방법은 [요청 표시와 실행 정책](docs/request-display-and-run0.md)을 참고한다.
+
+창의 명령은 요청 프로세스의 명령행을 참고용으로 표시한다. 상세 보기에서 전체 수집 명령,
+구분된 인자, polkit 작업과 설명을 확인한다. 실제 실행이나 스크립트 내용을 보증하지 않는다.
+상세 보기를 펼쳐도 지문·비밀번호 인증 및 요청 제한 시간은 계속 진행된다.
 
 ---
 
@@ -38,7 +44,7 @@ QML 서비스다. 그걸 교체하는 건 실제 선택이니, 무엇이 달라�
 |---|---|---|
 | 비밀번호 하드닝 — 덤프 방지, RAM 잠금, 버퍼 삭제 | ✓ | ✗ — 비밀번호가 오래 사는 셸 프로세스 안에 있다 |
 | 화면 공유·녹화에서 제외 | ✓ | ✗ — 레이어 서피스엔 규칙을 못 건다 |
-| **실제로 무엇이 묻는지** 명령을 보여줌 | ✓ `pacman -Syu` | 난수 유닛 이름 (`run-p1592…service`) |
+| **요청 프로세스의 명령행**을 보여줌 | ✓ `pacman -Syu` | 난수 유닛 이름 (`run-p1592…service`) |
 | 데스크톱 요청은 무엇을 할지까지 | ✓ `mount the filesystem` | ✓ |
 | 폴킷이 아닌 호출자를 거절 | ✓ | ✗ — 참고 구현 둘 다 안 한다 |
 | 공유 잠금 예산을 상시 표시 · 잠금 중 비밀번호 차단 | ✓ | ✗ |
@@ -97,7 +103,7 @@ curl -fsSL https://raw.githubusercontent.com/minsoft1115/sudo-pop/main/install.s
 
 `--init` 은 `~/.local/lib/sudo-pop/bin/sudo` 래퍼, 이를 PATH 에 넣는 셸 스니펫,
 Hyprland 창 규칙과 require 블록, systemd user 유닛을 설치한다. 기존 sudo-pop alias 스니펫은
-새 PATH 설정으로 교체한다. 래퍼는 기존 sudo-pop 실행 분기를 유지하며 `SUDO_POP_RUN0` 값을 강제하지 않는다.
+새 PATH 설정으로 교체한다. 래퍼는 실행 정책을 강제하지 않으며, 새 바이너리는 기본적으로 run0 전용 정책을 사용한다.
 
 새 터미널을 열거나 `source ~/.bashrc` 한 뒤 에이전트를 다시 시작한다. 메뉴에서 직접 시작한
 앱이나 별도 서비스의 PATH 는 바꾸지 않는다. 기존의 다른 `sudo` alias·함수는 보존한다.
@@ -130,10 +136,9 @@ omarchy plugin enable omarchy.polkit
 
 askpass 가 아니라 polkit 에이전트라서 따라 나오는 것들이다:
 
-- **설치된 `sudo` 래퍼는 기존 sudo-pop 실행 분기를 유지한다.** 일반 명령은 run0 와
-  polkit 정책을 사용하므로 sudoers 가 적용되지 않는다. sudo 전용 옵션은 기존 실제 sudo
-  경로로 전달하며, 명시적인 `-A`·`-n`·`-S` 도 그대로 전달한다.
-  호출자가 지정한 `SUDO_POP_RUN0` 값은 래퍼가 덮어쓰지 않는다.
+- **설치된 `sudo` 래퍼는 기본적으로 run0 전용이다.** polkit 정책을 사용하므로 sudoers 가
+  적용되지 않는다. sudo 전용 옵션은 거절하며 자동 sudo fallback 은 없다.
+  `SUDO_POP_RUN0=0` 은 `SUDO_POP_MODE=compat` 을 명시한 경우에만 허용한다.
 - **run0 경로에서는 25초 안에 입력한다** — 우리 창이 아니라 **호출자**의 D-Bus 타임아웃이다.
   창이 구석에서 1초 단위로 세어 주고, 마지막 5초는 경고색이다. sudo 경로에는 이 제한이
   없어서 아무것도 세지 않는다.

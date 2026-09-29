@@ -1,9 +1,9 @@
 # run0 사용 의도와 실제 sudo 실행 경로의 불일치
 
 - 조사일: 2026-09-28
-- 상태: 일부 해결 — PATH 래퍼의 강제 설정 제거. 기존 sudo 호환 분기는 검토 대상으로 유지
+- 상태: 기본 run0 전용 모드 구현 완료 — 기존 sudo 분기는 명시적 compat 모드에 한정
 
-## 확인한 사실
+## 수정 전 확인한 사실
 
 최초 조사 당시 [`assets/sudo-wrapper.sh`](../assets/sudo-wrapper.sh)는 `SUDO_POP_RUN0=0`을 설정해 일반 명령도 실제 sudo로 실행했다. 이후 사용자 요청으로 강제 설정을 제거했다. 현재 래퍼는 기존 sudo-pop 분기를 사용하며 호출자가 명시한 환경변수는 그대로 전달한다. 이는 alias를 PATH 래퍼로 교체하는 요청에 구현 과정에서 추가된 동작이며, 사용자는 run0 사용이 목적이라고 명확히 밝혔다.
 
@@ -38,3 +38,18 @@
 - [`src/wrapper.rs`](../src/wrapper.rs): `plain_command`, `exec_run0`, `run`
 - [`assets/sudo-wrapper.sh`](../assets/sudo-wrapper.sh)
 - [systemd run0 공식 설명](https://github.com/systemd/systemd/blob/main/man/run0.xml)
+
+## 2026-09-28 적용한 개선
+
+- 기본값을 `SUDO_POP_MODE=run0`로 명확히 했다. run0 전용 분기는 실제 sudo를 실행하지 않는다.
+- sudo 옵션과 선행 환경변수 할당은 종료 코드 2로 거절한다. `-v`에 가짜 성공을 반환하지 않는다.
+- 인자 없음은 자체 사용법, `--help`는 자체 도움말로 처리한다. `-- COMMAND`를 지원한다.
+- run0를 고정된 시스템 경로에서만 찾고, 시작 실패 시 PATH 검색이나 sudo 재시도를 하지 않는다.
+- 기존 `SUDO_POP_RUN0=0`은 전용 모드에서 설정 충돌이다. 기존 혼합 라우팅을 원하면
+  `SUDO_POP_MODE=compat`를 명시해야 한다. 실제 sudo 직접 호출과 기존 askpass 기능은 유지한다.
+- 가짜 실행 파일 테스트로 인자 바이트·종료 코드·시그널·시작 실패를 확인하며,
+  실제 CLI 테스트는 unsupported 옵션과 설정 충돌이 인증 없이 거절되는지 확인한다.
+
+설치하면 기존 PATH 래퍼에도 새 기본값이 적용된다. 현재 Omarchy 업데이트의 `sudo -v`와
+호환되지 않으므로 [실행 정책 문서](../docs/request-display-and-run0.md)의 명시적 호환 선택을 참고한다.
+실제 시스템 업데이트는 테스트하지 않았다. 시스템 sudo 제거·setuid 변경·PAM/polkit 정책 변경은 하지 않는다.
